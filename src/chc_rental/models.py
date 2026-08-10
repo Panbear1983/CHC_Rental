@@ -86,6 +86,7 @@ class PreferenceProfileBase(BaseModel):
     active: bool = True
     delivery_time: str = DEFAULT_DELIVERY_TIME
     timezone: str = DEFAULT_TIMEZONE
+    notify_on_no_results: bool = False
 
     @field_validator("delivery_time")
     @classmethod
@@ -205,6 +206,7 @@ class PreferenceProfileUpdate(BaseModel):
     active: Optional[bool] = None
     delivery_time: Optional[str] = None
     timezone: Optional[str] = None
+    notify_on_no_results: Optional[bool] = None
 
     @field_validator("delivery_time")
     @classmethod

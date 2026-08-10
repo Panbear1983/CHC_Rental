@@ -28,10 +28,11 @@ def make_profile(**overrides):
     return PreferenceProfileCreate(**defaults)
 
 
-def test_delivery_time_and_timezone_default_when_omitted():
+def test_delivery_time_timezone_and_no_results_default_when_omitted():
     profile = make_profile()
     assert profile.delivery_time == "09:00"
     assert profile.timezone == "America/New_York"
+    assert profile.notify_on_no_results is False
 
 
 def test_delivery_time_accepts_strict_24_hour_format():
@@ -93,10 +94,12 @@ def test_created_profile_persists_default_delivery_fields(profiles):
     created = profiles.create_profile(111, make_profile(profile_name="Downtown"))
     assert created.delivery_time == "09:00"
     assert created.timezone == "America/New_York"
+    assert created.notify_on_no_results is False
 
     fetched = profiles.get_profile(111, created.id)
     assert fetched.delivery_time == "09:00"
     assert fetched.timezone == "America/New_York"
+    assert fetched.notify_on_no_results is False
 
 
 def test_created_profile_persists_custom_delivery_fields(profiles):

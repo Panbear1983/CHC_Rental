@@ -36,6 +36,7 @@ CREATE TABLE IF NOT EXISTS preference_profiles (
     active INTEGER NOT NULL DEFAULT 1,
     delivery_time TEXT NOT NULL DEFAULT '09:00',
     timezone TEXT NOT NULL DEFAULT 'America/New_York',
+    notify_on_no_results INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     UNIQUE (telegram_user_id, profile_name),
@@ -79,6 +80,7 @@ CREATE TABLE IF NOT EXISTS daily_budget_ledger (
 _PREFERENCE_PROFILE_COLUMN_MIGRATIONS = (
     ("delivery_time", "TEXT NOT NULL DEFAULT '09:00'"),
     ("timezone", "TEXT NOT NULL DEFAULT 'America/New_York'"),
+    ("notify_on_no_results", "INTEGER NOT NULL DEFAULT 0"),
     ("sqft_min", "INTEGER"),
     ("sqft_max", "INTEGER"),
 )

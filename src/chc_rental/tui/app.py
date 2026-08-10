@@ -52,6 +52,7 @@ PROFILE_FIELDS = (
     "daily_cap",
     "delivery_time",
     "timezone",
+    "notify_on_no_results",
 )
 
 PROFILE_FORM_ERRORS = (
@@ -93,6 +94,7 @@ def _profile_to_form(profile) -> dict:
         "daily_cap": str(profile.daily_cap),
         "delivery_time": profile.delivery_time,
         "timezone": profile.timezone,
+        "notify_on_no_results": profile.notify_on_no_results,
         "active": profile.active,
     }
 
@@ -182,6 +184,9 @@ class ProfileFormScreen(ModalScreen[Optional[dict]]):
         yield Label("Timezone (IANA, e.g. America/New_York)")
         yield Input(value=self._initial.get("timezone", "America/New_York"), id="timezone")
         with Horizontal():
+            yield Label("Notify when no listings match")
+            yield Switch(value=self._initial.get("notify_on_no_results", False), id="notify_on_no_results")
+        with Horizontal():
             yield Label("Active")
             yield Switch(value=self._initial.get("active", True), id="active")
 
@@ -191,7 +196,12 @@ class ProfileFormScreen(ModalScreen[Optional[dict]]):
 
     @on(Button.Pressed, "#submit")
     def _submit(self) -> None:
-        data = {field: self.query_one(f"#{field}", Input).value for field in PROFILE_FIELDS}
+        data = {
+            field: self.query_one(f"#{field}", Input).value
+            for field in PROFILE_FIELDS
+            if field != "notify_on_no_results"
+        }
+        data["notify_on_no_results"] = self.query_one("#notify_on_no_results", Switch).value
         data["active"] = self.query_one("#active", Switch).value
         self.dismiss(data)
 

@@ -122,6 +122,7 @@ def _row_to_profile(row: sqlite3.Row) -> PreferenceProfile:
     data["required_features"] = json.loads(data["required_features"])
     data["excluded_features"] = json.loads(data["excluded_features"])
     data["active"] = bool(data["active"])
+    data["notify_on_no_results"] = bool(data["notify_on_no_results"])
     return PreferenceProfile(**data)
 
 
@@ -163,8 +164,8 @@ class ProfileRepository:
                 telegram_user_id, profile_name, city, district,
                 price_min, price_max, property_types,
                 bed_min, bed_max, bath_min, bath_max, sqft_min, sqft_max,
-                required_features, excluded_features, daily_cap, delivery_time, timezone, active
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                required_features, excluded_features, daily_cap, delivery_time, timezone, notify_on_no_results, active
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 telegram_user_id,
@@ -185,6 +186,7 @@ class ProfileRepository:
                 profile.daily_cap,
                 profile.delivery_time,
                 profile.timezone,
+                int(profile.notify_on_no_results),
                 int(profile.active),
             ),
         )
@@ -246,7 +248,8 @@ class ProfileRepository:
                 price_min = ?, price_max = ?, property_types = ?,
                 bed_min = ?, bed_max = ?, bath_min = ?, bath_max = ?,
                 sqft_min = ?, sqft_max = ?,
-                required_features = ?, excluded_features = ?, daily_cap = ?, delivery_time = ?, timezone = ?, active = ?,
+                required_features = ?, excluded_features = ?, daily_cap = ?, delivery_time = ?, timezone = ?,
+                notify_on_no_results = ?, active = ?,
                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
             WHERE id = ?
             """,
@@ -268,6 +271,7 @@ class ProfileRepository:
                 validated.daily_cap,
                 validated.delivery_time,
                 validated.timezone,
+                int(validated.notify_on_no_results),
                 int(validated.active),
                 profile_id,
             ),

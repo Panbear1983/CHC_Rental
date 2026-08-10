@@ -15,8 +15,8 @@ decisions: `docs/DECISIONS.md`):
 - Phase 3 — licensed listing-source adapter: **not built** (blocked on
   `docs/DECISIONS.md` pending items)
 - Phase 4 — matching, dedup, fair scheduler, budgets: **built**
-- Phase 5 — outbound Telegram notifier: **partial** (pure schedule
-  calculation only; no transport)
+- Phase 5 — outbound Telegram notifier: **offline transport seam built**;
+  no credential loading, network transport, or live send is enabled.
 - Phase 6 — market context: not built
 
 ## Architecture note: one-way notification, no inbound poller
@@ -53,6 +53,12 @@ interaction of any kind.
   retries.
 - `src/chc_rental/notification_schedule.py` — per-profile local-time due
   calculation (no transport, no daemon).
+- `src/chc_rental/dry_run.py` — fixture-only, read-only daily pipeline preview:
+  validate → match → dedupe → allocate → schedule → delivery-ledger eligibility.
+- `src/chc_rental/db_recovery.py` — explicit local SQLite health check, backup,
+  reviewed legacy migration, and refusal/audit report for unknown or corrupt DBs.
+- `src/chc_rental/outbound.py` — typed, recipient-free notification renderer and
+  disabled-by-default dedicated-Buddy transport seam; no HTTP/credentials/live send.
 - `src/chc_rental/status.py` — read-only operator status snapshot.
 - `src/chc_rental/errors.py` — domain exceptions.
 - `src/chc_rental/tui/` — Textual owner dashboard (`app.py`), service layer
@@ -73,6 +79,8 @@ interaction of any kind.
   in both lists at once.
 - `daily_cap` must be a positive integer.
 - `delivery_time` strict 24-hour `HH:MM`; `timezone` a valid IANA zone.
+- `notify_on_no_results` defaults to `False`; when enabled, a due profile may
+  receive an explicit no-match message in a later authorized delivery run.
 - `active` toggle, defaults to `True`.
 - One allowlisted Telegram user ID may own multiple profiles, distinguished
   by unique `profile_name` per user.
@@ -100,6 +108,33 @@ pip install -e ".[dev]"
 (Or `source .venv/bin/activate && chc-rental-tui`.) The dashboard manages the
 allowlist, per-user preference profiles, and a read-only status screen
 (budget/circuit-breaker state, delivery counts, per-profile caps).
+
+## Offline operational scripts
+
+### Fixture-only daily preview
+
+This is read-only: it cannot fetch listings, consume a budget, mutate the
+ledger, or send a message. Supply only a local JSON fixture whose records fit
+the `Listing` model.
+
+```bash
+.venv/bin/python -m chc_rental.dry_run \
+  --db data/chc_rental.sqlite3 \
+  --fixture fixtures/listings.json \
+  --now 2026-08-10T12:00:00Z \
+  --global-daily-budget 20
+```
+
+### Database health and bounded recovery
+
+Check is read-only. `repair` first creates a timestamped SQLite backup and
+only applies an exactly-recognized legacy schema migration. Unknown schemas or
+integrity failures refuse repair and produce an owner-action-needed JSON report.
+
+```bash
+.venv/bin/python -m chc_rental.db_recovery check data/chc_rental.sqlite3
+.venv/bin/python -m chc_rental.db_recovery repair path/to/known-legacy.sqlite3
+```
 
 ## Run tests
 

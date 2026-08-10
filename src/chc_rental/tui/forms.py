@@ -75,6 +75,7 @@ def parse_profile_create_form(data: dict) -> PreferenceProfileCreate:
         "required_features": _parse_csv(data.get("required_features")),
         "excluded_features": _parse_csv(data.get("excluded_features")),
         "active": _parse_bool(data.get("active", True)),
+        "notify_on_no_results": _parse_bool(data.get("notify_on_no_results", False)),
         "delivery_time": str(data.get("delivery_time") or "09:00").strip(),
         "timezone": str(data.get("timezone") or "America/New_York").strip(),
     }
@@ -115,6 +116,8 @@ def parse_profile_update_form(data: dict) -> PreferenceProfileUpdate:
         payload["excluded_features"] = _parse_csv(data["excluded_features"])
     if "active" in data and data["active"] is not None:
         payload["active"] = _parse_bool(data["active"])
+    if "notify_on_no_results" in data and data["notify_on_no_results"] is not None:
+        payload["notify_on_no_results"] = _parse_bool(data["notify_on_no_results"])
     for field in ("delivery_time", "timezone"):
         if field in data and not _is_blank(data[field]):
             payload[field] = str(data[field]).strip()

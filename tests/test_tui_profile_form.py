@@ -117,6 +117,11 @@ def test_active_toggle_accepts_bool_from_switch_widget():
     assert profile.active is False
 
 
+def test_no_results_toggle_accepts_bool_from_switch_widget():
+    profile = parse_profile_create_form(make_form(notify_on_no_results=True))
+    assert profile.notify_on_no_results is True
+
+
 def test_active_toggle_accepts_string_values():
     profile = parse_profile_create_form(make_form(active="no"))
     assert profile.active is False
