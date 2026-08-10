@@ -1,0 +1,27 @@
+[project]
+name = "chc-rental"
+version = "0.1.0"
+description = "CHC Rental — offline rental-notifier foundation: allowlist/profiles, owner TUI, deterministic matching and fair daily scheduling"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "pydantic>=2,<3",
+    "textual>=8,<9",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+]
+
+[project.scripts]
+chc-rental-tui = "chc_rental.tui.app:run"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
