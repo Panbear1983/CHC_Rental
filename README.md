@@ -28,8 +28,8 @@ interaction of any kind.
 | 2 — matching, dedup, seen ledger | **built** |
 | 3 — source adapters and fetch budget | **not built** — gated on Phase 0 |
 | 4 — TUI dashboard | **built** |
-| 5 — Telegram push | **seam built**, no sender wired |
-| 6 — daily automation | **not built** |
+| 5 — Telegram push | **built** — @Panbear_Buddy_bot, outbound only |
+| 6 — daily automation | **built** — hourly launchd job via tmux |
 
 Until Phase 3 lands, listings come from a local JSON fixture. Everything
 downstream of the fetch is real.
@@ -83,6 +83,7 @@ and view a read-only status screen (quota used today, last run, rejected records
 
 ```bash
 .venv/bin/chc-rental init
+.venv/bin/chc-rental check          # bot identity + can it reach each person
 .venv/bin/chc-rental run --fixture examples/listings.sample.json
 .venv/bin/chc-rental run --fixture examples/listings.sample.json --now 2026-01-15T05:00:00Z
 .venv/bin/chc-rental prune
@@ -121,8 +122,27 @@ once, check the output, then delete the script.
 pytest -q
 ```
 
+## Scheduled runs
+
+`scripts/com.chcrental.daily.plist` fires hourly and lets each person's own
+local delivery time decide whether they are due — a fixed clock time would need
+a UTC offset that breaks at every DST transition and cannot serve two people in
+different timezones.
+
+The command is wrapped in `tmux` deliberately: a launchd job invoking the repo
+venv directly is denied by TCC because the repo lives under `~/Desktop`, failing
+with `PermissionError` on `pyvenv.cfg`. tmux already holds that grant.
+
+```bash
+cp scripts/com.chcrental.daily.plist ~/Library/LaunchAgents/
+launchctl load ~/Library/LaunchAgents/com.chcrental.daily.plist
+```
+
+With no source configured the run logs "no listing source configured" and does
+nothing, rather than inventing listings.
+
 ## Not built yet
 
-- No source adapters and no network calls (Phase 3, gated on Phase 0 vetting).
-- No Telegram sender; `pipeline.PushSender` is the seam it will plug into.
-- No scheduled automation; the daily run is manual for now.
+- **No source adapter, so nothing is fetched.** Gated on Phase 0 vetting. The
+  RentCast key in `.env` returns HTTP 403 `billing/subscription-inactive`, so
+  that route needs an active subscription before it can be used.

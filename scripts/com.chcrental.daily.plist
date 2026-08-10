@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.chcrental.daily</string>
+  <!-- Fires hourly; each person's own local delivery time decides whether they
+       are due. A fixed clock time would need a UTC offset that breaks at every
+       DST transition and cannot serve two people in different timezones.
+
+       The command is wrapped in tmux on purpose. A launchd job invoking the
+       repo venv directly is denied by TCC because the repo lives under
+       ~/Desktop, and fails with PermissionError on pyvenv.cfg. tmux already
+       holds the necessary grant on this machine. -->
+  <key>StartInterval</key><integer>3600</integer>
+  <key>RunAtLoad</key><false/>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/tmux</string>
+    <string>new-session</string><string>-d</string>
+    <string>-s</string><string>chcrental-daily</string>
+    <string>cd /Users/peter/Desktop/Old_Projects/GitHub/CHC_Rental && .venv/bin/chc-rental --root /Users/peter/Desktop/Old_Projects/GitHub/CHC_Rental run --live >> state/daily.log 2>&1</string>
+  </array>
+  <key>StandardOutPath</key><string>/Users/peter/Desktop/Old_Projects/GitHub/CHC_Rental/state/launchd.out.log</string>
+  <key>StandardErrorPath</key><string>/Users/peter/Desktop/Old_Projects/GitHub/CHC_Rental/state/launchd.err.log</string>
+</dict>
+</plist>
