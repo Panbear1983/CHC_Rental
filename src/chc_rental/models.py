@@ -1,4 +1,9 @@
-"""Pydantic models for allowlisted users, preference profiles, and audit events."""
+"""Typed shapes for the file-based build.
+
+The nesting is person -> one profile -> many searches.  Every rule about ranges,
+vocabularies and overlaps lives here so that the store, the pipeline and the TUI
+all inherit the same validation from a single place.
+"""
 
 from __future__ import annotations
 
@@ -8,12 +13,13 @@ from enum import Enum
 from typing import Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import BaseModel, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
 _DELIVERY_TIME_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
 
 DEFAULT_DELIVERY_TIME = "09:00"
 DEFAULT_TIMEZONE = "America/New_York"
+SCHEMA_VERSION = 1
 
 
 def _validate_delivery_time(value: str) -> str:
@@ -37,6 +43,8 @@ class PropertyType(str, Enum):
     TOWNHOUSE = "townhouse"
     STUDIO = "studio"
     ROOM = "room"
+    SINGLE_FAMILY = "single_family"
+    MULTI_FAMILY = "multi_family"
 
 
 def _normalize_feature_list(values: list[str]) -> list[str]:
@@ -52,23 +60,11 @@ def _normalize_feature_list(values: list[str]) -> list[str]:
     return normalized
 
 
-class AllowlistedUser(BaseModel):
-    id: Optional[int] = None
-    telegram_user_id: int
-    display_name: str
+class Search(BaseModel):
+    """One saved search. A profile owns several of these, matched independently."""
+
+    name: str
     active: bool = True
-    created_at: Optional[datetime] = None
-
-    @field_validator("telegram_user_id")
-    @classmethod
-    def telegram_user_id_must_be_positive(cls, value: int) -> int:
-        if value <= 0:
-            raise ValueError("telegram_user_id must be a positive integer")
-        return value
-
-
-class PreferenceProfileBase(BaseModel):
-    profile_name: str
     city: str
     district: Optional[str] = None
     price_min: int
@@ -83,22 +79,8 @@ class PreferenceProfileBase(BaseModel):
     required_features: list[str] = []
     excluded_features: list[str] = []
     daily_cap: int
-    active: bool = True
-    delivery_time: str = DEFAULT_DELIVERY_TIME
-    timezone: str = DEFAULT_TIMEZONE
-    notify_on_no_results: bool = False
 
-    @field_validator("delivery_time")
-    @classmethod
-    def delivery_time_must_be_strict_24h(cls, value: str) -> str:
-        return _validate_delivery_time(value)
-
-    @field_validator("timezone")
-    @classmethod
-    def timezone_must_be_valid_iana_zone(cls, value: str) -> str:
-        return _validate_timezone(value)
-
-    @field_validator("profile_name", "city")
+    @field_validator("name", "city")
     @classmethod
     def must_not_be_blank(cls, value: str) -> str:
         cleaned = value.strip()
@@ -111,8 +93,7 @@ class PreferenceProfileBase(BaseModel):
     def normalize_district(cls, value: Optional[str]) -> Optional[str]:
         if value is None:
             return None
-        cleaned = value.strip()
-        return cleaned or None
+        return value.strip() or None
 
     @field_validator("property_types", mode="before")
     @classmethod
@@ -168,7 +149,7 @@ class PreferenceProfileBase(BaseModel):
         return value
 
     @model_validator(mode="after")
-    def check_ranges_and_feature_overlap(self) -> "PreferenceProfileBase":
+    def check_ranges_and_feature_overlap(self) -> "Search":
         if self.price_min > self.price_max:
             raise ValueError("price_min must be <= price_max")
         if self.bed_min > self.bed_max:
@@ -183,61 +164,135 @@ class PreferenceProfileBase(BaseModel):
         return self
 
 
-class PreferenceProfileCreate(PreferenceProfileBase):
-    pass
+class Profile(BaseModel):
+    """One person's delivery settings plus every search they have saved."""
 
-
-class PreferenceProfileUpdate(BaseModel):
-    profile_name: Optional[str] = None
-    city: Optional[str] = None
-    district: Optional[str] = None
-    price_min: Optional[int] = None
-    price_max: Optional[int] = None
-    property_types: Optional[list[PropertyType]] = None
-    bed_min: Optional[int] = None
-    bed_max: Optional[int] = None
-    bath_min: Optional[float] = None
-    bath_max: Optional[float] = None
-    sqft_min: Optional[int] = None
-    sqft_max: Optional[int] = None
-    required_features: Optional[list[str]] = None
-    excluded_features: Optional[list[str]] = None
-    daily_cap: Optional[int] = None
-    active: Optional[bool] = None
-    delivery_time: Optional[str] = None
-    timezone: Optional[str] = None
-    notify_on_no_results: Optional[bool] = None
+    delivery_time: str = DEFAULT_DELIVERY_TIME
+    timezone: str = DEFAULT_TIMEZONE
+    notify_on_no_results: bool = False
+    searches: list[Search] = []
 
     @field_validator("delivery_time")
     @classmethod
-    def delivery_time_must_be_strict_24h(cls, value: Optional[str]) -> Optional[str]:
-        if value is None:
-            return None
+    def delivery_time_must_be_strict_24h(cls, value: str) -> str:
         return _validate_delivery_time(value)
 
     @field_validator("timezone")
     @classmethod
-    def timezone_must_be_valid_iana_zone(cls, value: Optional[str]) -> Optional[str]:
-        if value is None:
-            return None
+    def timezone_must_be_valid_iana_zone(cls, value: str) -> str:
         return _validate_timezone(value)
 
+    @model_validator(mode="after")
+    def search_names_must_be_unique(self) -> "Profile":
+        names = [search.name.lower() for search in self.searches]
+        duplicates = sorted({name for name in names if names.count(name) > 1})
+        if duplicates:
+            raise ValueError(f"search names must be unique within a profile: {duplicates}")
+        return self
 
-class PreferenceProfile(PreferenceProfileBase):
-    id: int
-    telegram_user_id: int
-    created_at: Optional[datetime] = None
-    updated_at: Optional[datetime] = None
+    def active_searches(self) -> list[Search]:
+        return [search for search in self.searches if search.active]
+
+
+class AllowlistEntry(BaseModel):
+    """An allowlisted Telegram recipient and their profile."""
+
+    telegram_id: int
+    display_name: str
+    active: bool = True
+    profile: Profile = Profile()
+
+    @field_validator("telegram_id")
+    @classmethod
+    def telegram_id_must_be_positive(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("telegram_id must be a positive integer")
+        return value
+
+    @field_validator("display_name")
+    @classmethod
+    def display_name_must_not_be_blank(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("display_name must not be blank")
+        return cleaned
+
+
+class Allowlist(BaseModel):
+    """The whole config file: everyone who may receive a push."""
+
+    schema_version: int = SCHEMA_VERSION
+    people: list[AllowlistEntry] = []
+
+    @model_validator(mode="after")
+    def telegram_ids_must_be_unique(self) -> "Allowlist":
+        ids = [person.telegram_id for person in self.people]
+        duplicates = sorted({i for i in ids if ids.count(i) > 1})
+        if duplicates:
+            raise ValueError(f"telegram_id must be unique: {duplicates}")
+        return self
+
+    def get(self, telegram_id: int) -> Optional[AllowlistEntry]:
+        return next((p for p in self.people if p.telegram_id == telegram_id), None)
+
+    def is_allowlisted(self, telegram_id: int) -> bool:
+        """Membership means present AND active. The single source of truth."""
+        person = self.get(telegram_id)
+        return person is not None and person.active
+
+    def active_people(self) -> list[AllowlistEntry]:
+        return [person for person in self.people if person.active]
+
+
+class Settings(BaseModel):
+    """Global run policy. Ceilings here are hard stops, not suggestions."""
+
+    schema_version: int = SCHEMA_VERSION
+    scrape_time: str = "08:00"
+    scrape_timezone: str = DEFAULT_TIMEZONE
+    global_daily_request_budget: int = 100
+    per_source_daily_request_budget: int = 50
+    live_push_enabled: bool = False
+    seen_retention_days: int = 90
+    cache_retention_days: int = 7
+    rejected_retention_days: int = 30
+    backup_retention_days: int = 30
+
+    @field_validator("scrape_time")
+    @classmethod
+    def scrape_time_must_be_strict_24h(cls, value: str) -> str:
+        return _validate_delivery_time(value)
+
+    @field_validator("scrape_timezone")
+    @classmethod
+    def scrape_timezone_must_be_valid(cls, value: str) -> str:
+        return _validate_timezone(value)
+
+    @field_validator(
+        "global_daily_request_budget",
+        "per_source_daily_request_budget",
+        "seen_retention_days",
+        "cache_retention_days",
+        "rejected_retention_days",
+        "backup_retention_days",
+    )
+    @classmethod
+    def must_be_non_negative_int(cls, value: int) -> int:
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise ValueError("value must be a whole number")
+        if value < 0:
+            raise ValueError("value must not be negative")
+        return value
 
 
 class Listing(BaseModel):
-    """Canonical rental-listing record used by matching/dedup/scheduling.
+    """A canonical rental listing. ``url`` is the payload the push delivers."""
 
-    Purely a data shape: nothing here fetches, scrapes, or sends anything.
-    """
+    model_config = ConfigDict(extra="ignore")
 
     source: str
     source_listing_id: Optional[str] = None
+    url: str
     address: str
     unit: Optional[str] = None
     city: str
@@ -248,8 +303,9 @@ class Listing(BaseModel):
     baths: float
     sqft: Optional[int] = None
     features: list[str] = []
+    first_seen_at: Optional[datetime] = None
 
-    @field_validator("source", "address")
+    @field_validator("source", "address", "city")
     @classmethod
     def must_not_be_blank(cls, value: str) -> str:
         cleaned = value.strip()
@@ -257,19 +313,26 @@ class Listing(BaseModel):
             raise ValueError("value must not be blank")
         return cleaned
 
+    @field_validator("url")
+    @classmethod
+    def url_must_be_http(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned.startswith(("http://", "https://")):
+            raise ValueError("url must be an http(s) link")
+        return cleaned
+
     @field_validator("source_listing_id", "unit", "district")
     @classmethod
     def normalize_optional_text(cls, value: Optional[str]) -> Optional[str]:
         if value is None:
             return None
-        cleaned = value.strip()
-        return cleaned or None
+        return value.strip() or None
 
     @field_validator("property_type", mode="before")
     @classmethod
     def normalize_property_type_string(cls, value: object) -> object:
         if isinstance(value, str):
-            return value.strip().lower()
+            return value.strip().lower().replace(" ", "_").replace("-", "_")
         return value
 
     @field_validator("features")
@@ -297,50 +360,3 @@ class Listing(BaseModel):
         if value is not None and value < 0:
             raise ValueError("value must not be negative")
         return value
-
-
-class AuditEvent(BaseModel):
-    id: Optional[int] = None
-    event_type: str
-    telegram_user_id: Optional[int] = None
-    profile_id: Optional[int] = None
-    detail: str = ""
-    created_at: Optional[datetime] = None
-
-
-class DeliveryStatus(str, Enum):
-    PENDING = "pending"
-    SENT = "sent"
-    FAILED = "failed"
-
-
-class DeliveryRecord(BaseModel):
-    """One row per (telegram_user_id, listing_key): the delivery ledger's
-    unit of state. `attempt_count`/`max_attempts` bound retries for failed
-    sends; a `sent` record is terminal and never retried."""
-
-    id: Optional[int] = None
-    telegram_user_id: int
-    profile_id: Optional[int] = None
-    listing_key: str
-    status: DeliveryStatus = DeliveryStatus.PENDING
-    attempt_count: int = 0
-    max_attempts: int = 3
-    last_error: Optional[str] = None
-    created_at: Optional[datetime] = None
-    updated_at: Optional[datetime] = None
-
-
-class BudgetState(BaseModel):
-    """Global daily source/candidate budget for one calendar `budget_date`.
-    `allocated` never exceeds `daily_limit`; the circuit breaker trips once
-    it reaches the limit."""
-
-    budget_date: str
-    daily_limit: int
-    allocated: int = 0
-    circuit_breaker_tripped: bool = False
-
-    @property
-    def remaining(self) -> int:
-        return max(0, self.daily_limit - self.allocated)

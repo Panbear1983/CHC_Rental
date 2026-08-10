@@ -1,0 +1,37 @@
+schema_version: 1
+people:
+  - telegram_id: 12345
+    display_name: Example Person
+    active: true
+    profile:
+      delivery_time: "09:00"
+      timezone: Asia/Taipei
+      notify_on_no_results: false
+      searches:
+        - name: Downtown 2BR
+          active: true
+          city: Taipei
+          district: Da'an
+          price_min: 20000
+          price_max: 35000
+          property_types: [apartment, condo]
+          bed_min: 2
+          bed_max: 3
+          bath_min: 1.0
+          bath_max: 2.0
+          required_features: [elevator]
+          excluded_features: []
+          daily_cap: 5
+        - name: Cheap studio
+          active: true
+          city: Taipei
+          price_min: 8000
+          price_max: 20000
+          property_types: [studio, room]
+          bed_min: 0
+          bed_max: 1
+          bath_min: 1.0
+          bath_max: 1.0
+          required_features: []
+          excluded_features: []
+          daily_cap: 3

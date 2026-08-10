@@ -9,33 +9,18 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from chc_rental.models import PreferenceProfile, PropertyType
+from chc_rental.models import Profile
 from chc_rental.notification_schedule import is_profile_due
 
 
-def make_profile(**overrides) -> PreferenceProfile:
+def make_profile(**overrides) -> Profile:
     defaults = dict(
-        id=1,
-        telegram_user_id=111,
-        profile_name="Downtown",
-        city="Austin",
-        district=None,
-        price_min=1000,
-        price_max=2000,
-        property_types=[PropertyType.APARTMENT],
-        bed_min=1,
-        bed_max=2,
-        bath_min=1.0,
-        bath_max=2.0,
-        required_features=[],
-        excluded_features=[],
-        daily_cap=5,
-        active=True,
         delivery_time="09:00",
         timezone="America/New_York",
+        searches=[],
     )
     defaults.update(overrides)
-    return PreferenceProfile(**defaults)
+    return Profile(**defaults)
 
 
 def test_not_due_before_local_delivery_time():

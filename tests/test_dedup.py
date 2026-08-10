@@ -1,73 +1,53 @@
+"""Dedup identity, including direct regressions for the collisions the
+2026-08-10 audit found in the SQLite build.
+"""
+
 from chc_rental.dedup import dedup_key
 from chc_rental.models import Listing
 
-
-def make_listing(**overrides):
-    defaults = dict(
-        source="rentcast",
-        source_listing_id=None,
-        address="123 Main St",
-        unit=None,
-        city="Austin",
-        district=None,
-        price=1500,
-        property_type="apartment",
-        beds=2,
-        baths=1.0,
-        features=[],
-    )
-    defaults.update(overrides)
-    return Listing(**defaults)
+from tests.conftest import make_listing
 
 
-def test_same_source_listing_id_yields_same_key_regardless_of_other_fields():
-    a = make_listing(source_listing_id="ABC123", address="123 Main St", price=1500)
-    b = make_listing(source_listing_id="ABC123", address="999 Other Ave", price=1800)
-    assert dedup_key(a) == dedup_key(b)
+def key(**overrides) -> str:
+    return dedup_key(Listing.model_validate(make_listing(**overrides)))
 
 
-def test_source_listing_id_is_normalized_case_and_whitespace_insensitive():
-    a = make_listing(source_listing_id="ABC123")
-    b = make_listing(source_listing_id=" abc123 ")
-    assert dedup_key(a) == dedup_key(b)
+def test_same_listing_yields_the_same_key():
+    assert key() == key()
 
 
-def test_different_source_listing_ids_yield_different_keys():
-    a = make_listing(source_listing_id="ABC123")
-    b = make_listing(source_listing_id="XYZ999")
-    assert dedup_key(a) != dedup_key(b)
+def test_case_and_whitespace_are_folded():
+    assert key(address="  100   MAIN st ") == key(address="100 Main St")
 
 
-def test_falls_back_to_address_unit_source_when_no_source_listing_id():
-    a = make_listing(source_listing_id=None, address="123 Main St", unit="4B", source="rentcast")
-    b = make_listing(source_listing_id=None, address="123 Main St", unit="4B", source="rentcast")
-    assert dedup_key(a) == dedup_key(b)
+# --- regressions for the audit's confirmed defects --------------------------
 
 
-def test_fallback_key_is_normalized_case_and_whitespace_insensitive():
-    a = make_listing(source_listing_id=None, address="123 Main St", unit="4B")
-    b = make_listing(source_listing_id=None, address=" 123 MAIN st ", unit=" 4b ")
-    assert dedup_key(a) == dedup_key(b)
+def test_same_address_in_different_cities_does_not_collide():
+    """The old key omitted city, so one of these two silently vanished."""
+    assert key(city="Austin", price=1500) != key(city="Dallas", price=2400)
 
 
-def test_fallback_key_differs_by_unit():
-    a = make_listing(source_listing_id=None, address="123 Main St", unit="4B")
-    b = make_listing(source_listing_id=None, address="123 Main St", unit="4C")
-    assert dedup_key(a) != dedup_key(b)
+def test_same_address_in_different_districts_does_not_collide():
+    assert key(district="North Loop") != key(district="South Congress")
 
 
-def test_fallback_key_differs_by_source():
-    a = make_listing(source_listing_id=None, address="123 Main St", unit=None, source="rentcast")
-    b = make_listing(source_listing_id=None, address="123 Main St", unit=None, source="other")
-    assert dedup_key(a) != dedup_key(b)
+def test_key_is_stable_when_the_source_starts_returning_an_id():
+    """The old key changed shape with source_listing_id, re-notifying everyone."""
+    without_id = key(source_listing_id=None)
+    with_id = key(source_listing_id="abc123")
+    assert without_id == with_id
 
 
-def test_source_listing_id_key_never_collides_with_fallback_key():
-    with_id = make_listing(source_listing_id="123 Main St", address="123 Main St", unit=None)
-    without_id = make_listing(source_listing_id=None, address="123 Main St", unit=None)
-    assert dedup_key(with_id) != dedup_key(without_id)
+def test_separator_cannot_be_forged_by_field_contents():
+    """A value containing the separator must not impersonate another listing."""
+    assert key(city="Austin", district="x") != key(city="Austin:x", district=None)
+    assert key(address="1 Main St", unit="2") != key(address="1 Main St:2", unit=None)
 
 
-def test_dedup_key_is_deterministic_same_input_same_output():
-    listing = make_listing(source_listing_id="ABC123")
-    assert dedup_key(listing) == dedup_key(listing)
+def test_unit_distinguishes_two_listings_at_one_address():
+    assert key(unit="4B") != key(unit="5C")
+
+
+def test_different_sources_are_distinct_identities():
+    assert key(source="feed-a") != key(source="feed-b")

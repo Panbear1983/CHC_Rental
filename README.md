@@ -1,94 +1,65 @@
 # CHC_Rental
 
-Local, offline, preference-driven rental-listing notifier foundation.
-SQLite is the source of truth; a Textual TUI is the owner's control plane for
-allowlisted Telegram users and their preference profiles; deterministic
-matching, dedup, and a fair daily scheduler decide what would be notified.
-Everything currently in this repo is offline: no listing source is queried
-and no messages are sent.
+A daily rental-listing scraper with a terminal dashboard. Each allowlisted person
+has one profile holding several independent saved searches; the daily run matches
+new listings against every search and pushes the **links** to that person on
+Telegram.
 
-Build status by phase (plan: `.hermes/plans/2026-08-07_060000-chc-rental-foundation.md`,
-decisions: `docs/DECISIONS.md`):
+There is no database. Configuration and state are plain files, which makes both
+easy to read, back up and hand-edit.
 
-- Phase 1 — offline allowlist/profile foundation: **built**
-- Phase 2 — Textual owner dashboard: **built**
-- Phase 3 — licensed listing-source adapter: **not built** (blocked on
-  `docs/DECISIONS.md` pending items)
-- Phase 4 — matching, dedup, fair scheduler, budgets: **built**
-- Phase 5 — outbound Telegram notifier: **offline transport seam built**;
-  no credential loading, network transport, or live send is enabled.
-- Phase 6 — market context: not built
+Plan: `.hermes/plans/2026-08-10_210000-chc-rental-filebased-scraper.md`.
 
 ## Architecture note: one-way notification, no inbound poller
 
-This codebase does not run a Telegram poller, webhook, or any inbound
-message handler, and Phase 1 contains no Telegram network code at all. The
-intended end-state architecture (later phases) is **one-way outbound
-notification only**: the owner manages allowlisted users and their
-preference profiles locally, and a future notifier would push qualifying
-listings out to already-allowlisted users. There is no user self-enrollment
-path and no code here that reads inbound Telegram messages or user
+This codebase does not run a Telegram poller, webhook, or any inbound message
+handler. The architecture is **one-way outbound notification only**: the owner
+manages allowlisted people and their searches locally, and the daily run pushes
+qualifying listings out to already-allowlisted recipients. There is no user
+self-enrollment path and no code that reads inbound Telegram messages or user
 interaction of any kind.
 
-## What's included
+## Build status
 
-- `src/chc_rental/models.py` — Pydantic models: `AllowlistedUser`,
-  `PreferenceProfile` (create/update variants), `Listing`, `AuditEvent`,
-  `DeliveryRecord`, `BudgetState`, `PropertyType`.
-- `src/chc_rental/db.py` — SQLite schema (`allowlisted_users`,
-  `preference_profiles`, `audit_events`, `delivery_ledger`,
-  `daily_budget_ledger`), connection management, and additive column
-  migrations for pre-existing databases.
-- `src/chc_rental/repositories.py` — `AllowlistRepository`,
-  `ProfileRepository`, `AuditRepository`. All profile access is gated on
-  allowlist membership; cross-user profile access is rejected; denied
-  attempts are recorded as audit events.
-- `src/chc_rental/matching.py` — deterministic listing-to-profile
-  eligibility from typed fields only.
-- `src/chc_rental/dedup.py` — listing dedup keys for the delivery ledger.
-- `src/chc_rental/scheduler.py` — fair round-robin daily allocation across
-  active profiles under per-profile caps and the global budget.
-- `src/chc_rental/budgets.py` — daily budget ledger + circuit breaker.
-- `src/chc_rental/delivery.py` — persistent delivery ledger with bounded
-  retries.
-- `src/chc_rental/notification_schedule.py` — per-profile local-time due
-  calculation (no transport, no daemon).
-- `src/chc_rental/dry_run.py` — fixture-only, read-only daily pipeline preview:
-  validate → match → dedupe → allocate → schedule → delivery-ledger eligibility.
-- `src/chc_rental/db_recovery.py` — explicit local SQLite health check, backup,
-  reviewed legacy migration, and refusal/audit report for unknown or corrupt DBs.
-- `src/chc_rental/outbound.py` — typed, recipient-free notification renderer and
-  disabled-by-default dedicated-Buddy transport seam; no HTTP/credentials/live send.
-- `src/chc_rental/status.py` — read-only operator status snapshot.
-- `src/chc_rental/errors.py` — domain exceptions.
-- `src/chc_rental/tui/` — Textual owner dashboard (`app.py`), service layer
-  (`controller.py`), form coercion (`forms.py`), status screen (`status.py`).
+| Phase | State |
+|---|---|
+| 0 — source vetting and run policy | **not started** — needs the site list |
+| 1 — file store and config schema | **built** |
+| 2 — matching, dedup, seen ledger | **built** |
+| 3 — source adapters and fetch budget | **not built** — gated on Phase 0 |
+| 4 — TUI dashboard | **built** |
+| 5 — Telegram push | **seam built**, no sender wired |
+| 6 — daily automation | **not built** |
 
-## Enforced profile rules
+Until Phase 3 lands, listings come from a local JSON fixture. Everything
+downstream of the fetch is real.
 
-- `city` required; `district` optional.
-- `price_min <= price_max`.
-- `property_types` normalized (trimmed/lowercased) and restricted to a known
-  set (`apartment`, `house`, `condo`, `townhouse`, `studio`, `room`); at
-  least one is required.
-- `bed_min <= bed_max`, `bath_min <= bath_max`.
-- `sqft_min` / `sqft_max` optional bounds (blank = no bound;
-  `sqft_min <= sqft_max` when both set). Listings without square footage are
-  not rejected by sqft bounds.
-- `required_features` / `excluded_features` normalized; a feature cannot be
-  in both lists at once.
-- `daily_cap` must be a positive integer.
-- `delivery_time` strict 24-hour `HH:MM`; `timezone` a valid IANA zone.
-- `notify_on_no_results` defaults to `False`; when enabled, a due profile may
-  receive an explicit no-match message in a later authorized delivery run.
-- `active` toggle, defaults to `True`.
-- One allowlisted Telegram user ID may own multiple profiles, distinguished
-  by unique `profile_name` per user.
-- A user not on the allowlist cannot create, list, read, update, or delete
-  any profile.
-- A user may not read, update, or delete another user's profile.
-- Profile creation, updates, deletions, and denied-access attempts are all
-  recorded in `audit_events`.
+## Layout
+
+```
+config/        allowlist.yaml, settings.yaml     (gitignored: holds real Telegram IDs)
+state/         seen/, quota/, runs/, rejected/, cache/
+backups/       timestamped copy taken before every config write
+examples/      allowlist.example.yaml, listings.sample.json
+```
+
+Every read and write of those paths goes through `chc_rental.store.Store`, which
+holds an exclusive lock across each read-modify-write and replaces files
+atomically. Nothing else may open them directly — a single enforcement point is
+what keeps the allowlist rule from being bypassed.
+
+## Modules
+
+- `models.py` — `Search`, `Profile`, `AllowlistEntry`, `Allowlist`, `Settings`,
+  `Listing`. Every business rule lives here.
+- `store.py` — the single gate: locking, atomic writes, backups, seen ledger,
+  request quota, run logs, rejected records, retention.
+- `matching.py` — deterministic listing-to-search eligibility.
+- `dedup.py` — stable per-listing identity, including city and district.
+- `notification_schedule.py` — per-person local-time due calculation.
+- `pipeline.py` — validate → allowlist → due → match → dedupe → cap → send.
+- `cli.py` — `chc-rental init | run | prune`.
+- `tui/` — the owner dashboard.
 
 ## Setup
 
@@ -98,43 +69,51 @@ source .venv/bin/activate
 pip install -e ".[dev]"
 ```
 
-## Run the owner dashboard (TUI)
+## Owner dashboard
 
 ```bash
-.venv/bin/chc-rental-tui                 # default DB: data/chc_rental.sqlite3
-.venv/bin/chc-rental-tui --db-path path/to/other.sqlite3
+.venv/bin/chc-rental-tui                 # uses ./config and ./state
+.venv/bin/chc-rental-tui --root /path/to/data
 ```
 
-(Or `source .venv/bin/activate && chc-rental-tui`.) The dashboard manages the
-allowlist, per-user preference profiles, and a read-only status screen
-(budget/circuit-breaker state, delivery counts, per-profile caps).
+Manage the allowlist, each person's searches, their delivery time and timezone,
+and view a read-only status screen (quota used today, last run, rejected records).
 
-## Offline operational scripts
-
-### Fixture-only daily preview
-
-This is read-only: it cannot fetch listings, consume a budget, mutate the
-ledger, or send a message. Supply only a local JSON fixture whose records fit
-the `Listing` model.
+## Daily run
 
 ```bash
-.venv/bin/python -m chc_rental.dry_run \
-  --db data/chc_rental.sqlite3 \
-  --fixture fixtures/listings.json \
-  --now 2026-08-10T12:00:00Z \
-  --global-daily-budget 20
+.venv/bin/chc-rental init
+.venv/bin/chc-rental run --fixture examples/listings.sample.json
+.venv/bin/chc-rental run --fixture examples/listings.sample.json --now 2026-01-15T05:00:00Z
+.venv/bin/chc-rental prune
 ```
 
-### Database health and bounded recovery
+The run is a dry run unless `--live` is passed **and** `live_push_enabled: true`
+is set in `config/settings.yaml` **and** a sender is wired in (Phase 5). A person
+is only pushed to once per local calendar day, after their `delivery_time`.
 
-Check is read-only. `repair` first creates a timestamped SQLite backup and
-only applies an exactly-recognized legacy schema migration. Unknown schemas or
-integrity failures refuse repair and produce an owner-action-needed JSON report.
+## Enforced rules
+
+- A person receives listings only while they are on the allowlist and active;
+  membership is re-checked at plan time and again immediately before each send.
+- Each search caps how many listings it contributes per day.
+- A person receives any given listing at most once, ever — across runs and across
+  their own overlapping searches.
+- A listing is marked as delivered only after a confirmed send, so a failed send
+  stays retryable.
+- A record that fails validation is written to `state/rejected/` and the run
+  continues; one bad record never discards a good batch.
+- Listings must carry an `http(s)` link, since the link is the payload.
+- Search names are unique per profile; Telegram IDs are unique across the file.
+
+## Migration from the SQLite build
 
 ```bash
-.venv/bin/python -m chc_rental.db_recovery check data/chc_rental.sqlite3
-.venv/bin/python -m chc_rental.db_recovery repair path/to/known-legacy.sqlite3
+python scripts/migrate_from_sqlite.py data/chc_rental.sqlite3 --root .
 ```
+
+Each old preference profile becomes one search under its owner's profile. Run it
+once, check the output, then delete the script.
 
 ## Run tests
 
@@ -142,20 +121,8 @@ integrity failures refuse repair and produce an owner-action-needed JSON report.
 pytest -q
 ```
 
-## Environment
-
-Copy `.env.example` to `.env` for later phases. Current code reads only
-`CHC_RENTAL_DB_PATH` (optional); no credentials are read or sent anywhere.
-
-```bash
-cp .env.example .env
-```
-
 ## Not built yet
 
-- No listing-source scraper or API client (Phase 3 — blocked on
-  `docs/DECISIONS.md`).
-- No Telegram bot, poller, webhook, or any network transport (Phase 5
-  transport pending).
-- No `cli.py` / daily-run entry point.
-- No network calls of any kind.
+- No source adapters and no network calls (Phase 3, gated on Phase 0 vetting).
+- No Telegram sender; `pipeline.PushSender` is the seam it will plug into.
+- No scheduled automation; the daily run is manual for now.

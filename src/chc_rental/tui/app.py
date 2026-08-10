@@ -1,16 +1,22 @@
-"""Phase 2 minimal Textual owner dashboard.
+"""Textual owner dashboard for the file-based build.
 
-Local-only operator control plane for the allowlist and preference profiles.
-No business validation lives here: form coercion and rule enforcement stay in
-`chc_rental.tui.controller` / `chc_rental.tui.forms` / `chc_rental.repositories`.
-This module only wires widgets to `TuiController` calls.
+Local-only operator control plane over `Store`: who is on the allowlist, what
+each person's searches are, and what the last daily run did. No business
+validation lives here — coercion is in `chc_rental.tui.forms` and every rule is
+enforced by the Pydantic models.
+
+Layout rules worth keeping (each one was a real clipping bug):
+  * `DataTable` gets `height: 1fr` so growing tables scroll instead of pushing
+    the action buttons off the bottom of the screen.
+  * Row containers inside an auto-height dialog need `height: auto`; the default
+    `1fr` collapses to one row and clips 3-row Buttons and Switches.
+  * Dialog labels need `width: 100%` or they clip mid-word instead of wrapping.
 """
 
 from __future__ import annotations
 
 import argparse
 import os
-from datetime import date
 from pathlib import Path
 from typing import Optional, Union
 
@@ -21,92 +27,34 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen, Screen
 from textual.widgets import Button, DataTable, Footer, Header, Input, Label, Switch
 
-from chc_rental.db import Database
-from chc_rental.errors import (
-    DuplicateProfileNameError,
-    NotAllowlistedError,
-    ProfileAccessDeniedError,
-    ProfileNotFoundError,
-)
-from chc_rental.tui.controller import TuiController
-from chc_rental.tui.forms import FormParsingError
+from chc_rental.store import Store, StoreError
+from chc_rental.tui.controller import DuplicateError, NotFoundError, TuiController
+from chc_rental.tui.forms import FormParsingError, search_to_form
 from chc_rental.tui.status import StatusScreen
 
-DEFAULT_DB_PATH = os.environ.get("CHC_RENTAL_DB_PATH", "data/chc_rental.sqlite3")
+DEFAULT_ROOT = os.environ.get("CHC_RENTAL_ROOT", ".")
 
-PROFILE_FIELDS = (
-    "profile_name",
-    "city",
-    "district",
-    "price_min",
-    "price_max",
-    "property_types",
-    "bed_min",
-    "bed_max",
-    "bath_min",
-    "bath_max",
-    "sqft_min",
-    "sqft_max",
-    "required_features",
-    "excluded_features",
-    "daily_cap",
-    "delivery_time",
-    "timezone",
-    "notify_on_no_results",
-)
-
-PROFILE_FORM_ERRORS = (
-    FormParsingError,
-    ValidationError,
-    DuplicateProfileNameError,
-    NotAllowlistedError,
-    ProfileNotFoundError,
-    ProfileAccessDeniedError,
-)
+FORM_ERRORS = (FormParsingError, ValidationError, DuplicateError, NotFoundError, StoreError)
 
 
-def _sqft_range_text(sqft_min: Optional[int], sqft_max: Optional[int]) -> str:
-    if sqft_min is None and sqft_max is None:
+def _sqft_text(low: Optional[int], high: Optional[int]) -> str:
+    if low is None and high is None:
         return "any"
-    if sqft_max is None:
-        return f"{sqft_min}+"
-    if sqft_min is None:
-        return f"<={sqft_max}"
-    return f"{sqft_min}-{sqft_max}"
+    if high is None:
+        return f"{low}+"
+    if low is None:
+        return f"<={high}"
+    return f"{low}-{high}"
 
 
-def _profile_to_form(profile) -> dict:
-    return {
-        "profile_name": profile.profile_name,
-        "city": profile.city,
-        "district": profile.district or "",
-        "price_min": str(profile.price_min),
-        "price_max": str(profile.price_max),
-        "property_types": ", ".join(pt.value for pt in profile.property_types),
-        "bed_min": str(profile.bed_min),
-        "bed_max": str(profile.bed_max),
-        "bath_min": str(profile.bath_min),
-        "bath_max": str(profile.bath_max),
-        "sqft_min": "" if profile.sqft_min is None else str(profile.sqft_min),
-        "sqft_max": "" if profile.sqft_max is None else str(profile.sqft_max),
-        "required_features": ", ".join(profile.required_features),
-        "excluded_features": ", ".join(profile.excluded_features),
-        "daily_cap": str(profile.daily_cap),
-        "delivery_time": profile.delivery_time,
-        "timezone": profile.timezone,
-        "notify_on_no_results": profile.notify_on_no_results,
-        "active": profile.active,
-    }
-
-
-class AddUserScreen(ModalScreen[Optional[dict]]):
-    """Modal to add a numeric allowlisted Telegram user ID + display name."""
+class AddPersonScreen(ModalScreen[Optional[dict]]):
+    """Modal to allowlist a numeric Telegram id plus a display name."""
 
     def compose(self) -> ComposeResult:
         with Vertical(id="dialog"):
-            yield Label("Add allowlisted user")
-            yield Label("", id="add-user-error")
-            yield Input(placeholder="Telegram user ID (number)", id="telegram_user_id")
+            yield Label("Add allowlisted person")
+            yield Label("", id="add-person-error")
+            yield Input(placeholder="Telegram user ID (number)", id="telegram_id")
             yield Input(placeholder="Display name", id="display_name")
             with Horizontal():
                 yield Button("Add", id="submit", variant="primary")
@@ -118,18 +66,18 @@ class AddUserScreen(ModalScreen[Optional[dict]]):
 
     @on(Button.Pressed, "#submit")
     def _submit(self) -> None:
-        telegram_user_id = self.query_one("#telegram_user_id", Input).value.strip()
+        telegram_id = self.query_one("#telegram_id", Input).value.strip()
         display_name = self.query_one("#display_name", Input).value.strip()
-        if not telegram_user_id.isdigit() or int(telegram_user_id) <= 0 or not display_name:
-            self.query_one("#add-user-error", Label).update(
-                "Telegram user ID must be a positive whole number and display name is required."
+        if not telegram_id.isdigit() or int(telegram_id) <= 0 or not display_name:
+            self.query_one("#add-person-error", Label).update(
+                "Telegram ID must be a positive whole number and display name is required."
             )
             return
-        self.dismiss({"telegram_user_id": int(telegram_user_id), "display_name": display_name})
+        self.dismiss({"telegram_id": int(telegram_id), "display_name": display_name})
 
 
-class ProfileFormScreen(ModalScreen[Optional[dict]]):
-    """Create/edit modal covering every preference-profile field."""
+class SearchFormScreen(ModalScreen[Optional[dict]]):
+    """Create/edit modal covering every field of one search."""
 
     def __init__(self, *, title: str, initial: Optional[dict] = None) -> None:
         super().__init__()
@@ -139,16 +87,16 @@ class ProfileFormScreen(ModalScreen[Optional[dict]]):
     def compose(self) -> ComposeResult:
         with Vertical(id="dialog", classes="form-dialog"):
             yield Label(self._title)
-            yield Label("", id="profile-form-error")
-            with VerticalScroll(id="profile-form-fields"):
+            yield Label("", id="search-form-error")
+            with VerticalScroll(id="search-form-fields"):
                 yield from self._compose_fields()
             with Horizontal():
                 yield Button("Save", id="submit", variant="primary")
                 yield Button("Cancel", id="cancel")
 
     def _compose_fields(self) -> ComposeResult:
-        yield Label("Profile name")
-        yield Input(value=self._initial.get("profile_name", ""), id="profile_name")
+        yield Label("Search name")
+        yield Input(value=self._initial.get("name", ""), id="name")
         yield Label("City")
         yield Input(value=self._initial.get("city", ""), id="city")
         yield Label("District (optional)")
@@ -158,7 +106,8 @@ class ProfileFormScreen(ModalScreen[Optional[dict]]):
         yield Label("Price max")
         yield Input(value=self._initial.get("price_max", ""), id="price_max")
         yield Label(
-            "Property types (comma-separated: apartment, house, condo, townhouse, studio, room)"
+            "Property types (comma-separated: apartment, house, condo, townhouse, "
+            "studio, room, single_family, multi_family)"
         )
         yield Input(value=self._initial.get("property_types", ""), id="property_types")
         yield Label("Bed min")
@@ -177,15 +126,8 @@ class ProfileFormScreen(ModalScreen[Optional[dict]]):
         yield Input(value=self._initial.get("required_features", ""), id="required_features")
         yield Label("Excluded features (comma-separated)")
         yield Input(value=self._initial.get("excluded_features", ""), id="excluded_features")
-        yield Label("Daily cap")
+        yield Label("Daily cap (max listings per day from this search)")
         yield Input(value=self._initial.get("daily_cap", ""), id="daily_cap")
-        yield Label("Daily notification time (HH:MM)")
-        yield Input(value=self._initial.get("delivery_time", "09:00"), id="delivery_time")
-        yield Label("Timezone (IANA, e.g. America/New_York)")
-        yield Input(value=self._initial.get("timezone", "America/New_York"), id="timezone")
-        with Horizontal():
-            yield Label("Notify when no listings match")
-            yield Switch(value=self._initial.get("notify_on_no_results", False), id="notify_on_no_results")
         with Horizontal():
             yield Label("Active")
             yield Switch(value=self._initial.get("active", True), id="active")
@@ -196,71 +138,149 @@ class ProfileFormScreen(ModalScreen[Optional[dict]]):
 
     @on(Button.Pressed, "#submit")
     def _submit(self) -> None:
-        data = {
-            field: self.query_one(f"#{field}", Input).value
-            for field in PROFILE_FIELDS
-            if field != "notify_on_no_results"
-        }
-        data["notify_on_no_results"] = self.query_one("#notify_on_no_results", Switch).value
+        text_fields = (
+            "name", "city", "district", "price_min", "price_max", "property_types",
+            "bed_min", "bed_max", "bath_min", "bath_max", "sqft_min", "sqft_max",
+            "required_features", "excluded_features", "daily_cap",
+        )
+        data = {field: self.query_one(f"#{field}", Input).value for field in text_fields}
         data["active"] = self.query_one("#active", Switch).value
         self.dismiss(data)
 
 
-class ProfilesScreen(Screen[None]):
-    """List/create/edit/delete profiles for one allowlisted Telegram user."""
+class DeliveryFormScreen(ModalScreen[Optional[dict]]):
+    """Edit when and where a person's daily push lands."""
 
-    BINDINGS = [("escape", "go_back", "Back")]
+    def __init__(self, *, initial: dict) -> None:
+        super().__init__()
+        self._initial = initial
 
-    def __init__(self, controller: TuiController, telegram_user_id: int, display_name: str) -> None:
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dialog"):
+            yield Label("Delivery settings")
+            yield Label("", id="delivery-form-error")
+            yield Label("Daily notification time (HH:MM)")
+            yield Input(value=self._initial.get("delivery_time", "09:00"), id="delivery_time")
+            yield Label("Timezone (IANA, e.g. Asia/Taipei)")
+            yield Input(value=self._initial.get("timezone", "America/New_York"), id="timezone")
+            with Horizontal():
+                yield Label("Notify when nothing matched")
+                yield Switch(
+                    value=self._initial.get("notify_on_no_results", False),
+                    id="notify_on_no_results",
+                )
+            with Horizontal():
+                yield Button("Save", id="submit", variant="primary")
+                yield Button("Cancel", id="cancel")
+
+    @on(Button.Pressed, "#cancel")
+    def _cancel(self) -> None:
+        self.dismiss(None)
+
+    @on(Button.Pressed, "#submit")
+    def _submit(self) -> None:
+        self.dismiss(
+            {
+                "delivery_time": self.query_one("#delivery_time", Input).value.strip(),
+                "timezone": self.query_one("#timezone", Input).value.strip(),
+                "notify_on_no_results": self.query_one("#notify_on_no_results", Switch).value,
+            }
+        )
+
+
+class SearchesScreen(Screen[None]):
+    """Every saved search belonging to one allowlisted person."""
+
+    # Six buttons cannot fit at 80 columns with Textual's default 16-cell
+    # minimum, so the labels are short and every action also has a key.
+    BINDINGS = [
+        ("escape", "go_back", "Back"),
+        ("n", "new_search", "New"),
+        ("e", "edit_search", "Edit"),
+        ("t", "toggle_search", "Toggle"),
+        ("d", "delete_search", "Delete"),
+        ("y", "delivery_settings", "Delivery"),
+    ]
+
+    def __init__(self, controller: TuiController, telegram_id: int, display_name: str) -> None:
         super().__init__()
         self._controller = controller
-        self._telegram_user_id = telegram_user_id
+        self._telegram_id = telegram_id
         self._display_name = display_name
 
     def compose(self) -> ComposeResult:
         yield Header()
-        yield Label(f"Profiles for {self._display_name} ({self._telegram_user_id})")
-        yield Label("", id="profiles-error")
-        yield DataTable(id="profiles-table")
+        yield Label(f"Searches for {self._display_name} ({self._telegram_id})", id="searches-title")
+        yield Label("", id="searches-error")
+        yield DataTable(id="searches-table")
         with Horizontal(classes="action-row"):
-            yield Button("New profile", id="new-profile", variant="primary")
-            yield Button("Edit profile", id="edit-profile")
-            yield Button("Delete profile", id="delete-profile", variant="error")
+            yield Button("New", id="new-search", variant="primary")
+            yield Button("Edit", id="edit-search")
+            yield Button("Toggle", id="toggle-search")
+            yield Button("Delete", id="delete-search", variant="error")
+            yield Button("Delivery", id="delivery-settings")
             yield Button("Back", id="back")
         yield Footer()
 
+    def action_new_search(self) -> None:
+        self._new_search()
+
+    def action_edit_search(self) -> None:
+        self._edit_search()
+
+    def action_toggle_search(self) -> None:
+        self._toggle_search()
+
+    def action_delete_search(self) -> None:
+        self._delete_search()
+
+    def action_delivery_settings(self) -> None:
+        self._delivery_settings()
+
     def on_mount(self) -> None:
-        table = self.query_one("#profiles-table", DataTable)
+        table = self.query_one("#searches-table", DataTable)
         table.cursor_type = "row"
-        table.add_columns("ID", "Name", "City", "Price", "Beds", "Baths", "Sqft", "Cap", "Active")
-        self.refresh_profiles()
+        table.add_columns("#", "Name", "City", "Price", "Beds", "Baths", "Sqft", "Cap", "Active")
+        self.refresh_searches()
 
-    def refresh_profiles(self) -> None:
-        table = self.query_one("#profiles-table", DataTable)
+    def refresh_searches(self) -> None:
+        table = self.query_one("#searches-table", DataTable)
         table.clear()
-        for profile in self._controller.list_profiles(self._telegram_user_id):
+        try:
+            searches = self._controller.list_searches(self._telegram_id)
+        except FORM_ERRORS as exc:
+            self._set_error(str(exc))
+            return
+        for index, search in enumerate(searches):
             table.add_row(
-                str(profile.id),
-                profile.profile_name,
-                profile.city,
-                f"{profile.price_min}-{profile.price_max}",
-                f"{profile.bed_min}-{profile.bed_max}",
-                f"{profile.bath_min}-{profile.bath_max}",
-                _sqft_range_text(profile.sqft_min, profile.sqft_max),
-                str(profile.daily_cap),
-                "yes" if profile.active else "no",
-                key=str(profile.id),
+                str(index + 1),
+                search.name,
+                search.city + (f"/{search.district}" if search.district else ""),
+                f"{search.price_min}-{search.price_max}",
+                f"{search.bed_min}-{search.bed_max}",
+                f"{search.bath_min:g}-{search.bath_max:g}",
+                _sqft_text(search.sqft_min, search.sqft_max),
+                str(search.daily_cap),
+                "yes" if search.active else "no",
+                key=str(index),
             )
+        person = self._controller.get_person(self._telegram_id)
+        profile = person.profile
+        self.query_one("#searches-title", Label).update(
+            f"Searches for {person.display_name} ({person.telegram_id}) — "
+            f"daily at {profile.delivery_time} {profile.timezone}"
+            + ("  [no-match notices on]" if profile.notify_on_no_results else "")
+        )
 
-    def _selected_profile_id(self) -> Optional[int]:
-        table = self.query_one("#profiles-table", DataTable)
+    def _selected_index(self) -> Optional[int]:
+        table = self.query_one("#searches-table", DataTable)
         if table.row_count == 0:
             return None
         row_key, _ = table.coordinate_to_cell_key(table.cursor_coordinate)
         return int(row_key.value)
 
     def _set_error(self, message: str) -> None:
-        self.query_one("#profiles-error", Label).update(message)
+        self.query_one("#searches-error", Label).update(message)
 
     @on(Button.Pressed, "#back")
     def _back(self) -> None:
@@ -269,30 +289,30 @@ class ProfilesScreen(Screen[None]):
     def action_go_back(self) -> None:
         self.app.pop_screen()
 
-    @on(Button.Pressed, "#new-profile")
-    def _new_profile(self) -> None:
+    @on(Button.Pressed, "#new-search")
+    def _new_search(self) -> None:
         def handle(result: Optional[dict]) -> None:
             if result is None:
                 return
             try:
-                self._controller.create_profile(self._telegram_user_id, result)
-            except PROFILE_FORM_ERRORS as exc:
+                self._controller.add_search(self._telegram_id, result)
+            except FORM_ERRORS as exc:
                 self._set_error(str(exc))
                 return
             self._set_error("")
-            self.refresh_profiles()
+            self.refresh_searches()
 
-        self.app.push_screen(ProfileFormScreen(title="New profile"), handle)
+        self.app.push_screen(SearchFormScreen(title="New search"), handle)
 
-    @on(Button.Pressed, "#edit-profile")
-    def _edit_profile(self) -> None:
-        profile_id = self._selected_profile_id()
-        if profile_id is None:
-            self._set_error("Select a profile first.")
+    @on(Button.Pressed, "#edit-search")
+    def _edit_search(self) -> None:
+        index = self._selected_index()
+        if index is None:
+            self._set_error("Select a search first.")
             return
         try:
-            current = self._controller.get_profile(self._telegram_user_id, profile_id)
-        except PROFILE_FORM_ERRORS as exc:
+            current = self._controller.list_searches(self._telegram_id)[index]
+        except (FORM_ERRORS, IndexError) as exc:
             self._set_error(str(exc))
             return
 
@@ -300,38 +320,84 @@ class ProfilesScreen(Screen[None]):
             if result is None:
                 return
             try:
-                self._controller.update_profile(self._telegram_user_id, profile_id, result)
-            except PROFILE_FORM_ERRORS as exc:
+                self._controller.update_search(self._telegram_id, index, result)
+            except FORM_ERRORS as exc:
                 self._set_error(str(exc))
                 return
             self._set_error("")
-            self.refresh_profiles()
+            self.refresh_searches()
 
         self.app.push_screen(
-            ProfileFormScreen(
-                title=f"Edit profile: {current.profile_name}",
-                initial=_profile_to_form(current),
+            SearchFormScreen(title=f"Edit search: {current.name}", initial=search_to_form(current)),
+            handle,
+        )
+
+    @on(Button.Pressed, "#toggle-search")
+    def _toggle_search(self) -> None:
+        index = self._selected_index()
+        if index is None:
+            self._set_error("Select a search first.")
+            return
+        try:
+            self._controller.toggle_search(self._telegram_id, index)
+        except FORM_ERRORS as exc:
+            self._set_error(str(exc))
+            return
+        self._set_error("")
+        self.refresh_searches()
+
+    @on(Button.Pressed, "#delete-search")
+    def _delete_search(self) -> None:
+        index = self._selected_index()
+        if index is None:
+            self._set_error("Select a search first.")
+            return
+        try:
+            self._controller.delete_search(self._telegram_id, index)
+        except FORM_ERRORS as exc:
+            self._set_error(str(exc))
+            return
+        self._set_error("")
+        self.refresh_searches()
+
+    @on(Button.Pressed, "#delivery-settings")
+    def _delivery_settings(self) -> None:
+        try:
+            profile = self._controller.get_person(self._telegram_id).profile
+        except FORM_ERRORS as exc:
+            self._set_error(str(exc))
+            return
+
+        def handle(result: Optional[dict]) -> None:
+            if result is None:
+                return
+            try:
+                self._controller.update_delivery(
+                    self._telegram_id,
+                    delivery_time=result["delivery_time"],
+                    timezone_name=result["timezone"],
+                    notify_on_no_results=result["notify_on_no_results"],
+                )
+            except FORM_ERRORS as exc:
+                self._set_error(str(exc))
+                return
+            self._set_error("")
+            self.refresh_searches()
+
+        self.app.push_screen(
+            DeliveryFormScreen(
+                initial={
+                    "delivery_time": profile.delivery_time,
+                    "timezone": profile.timezone,
+                    "notify_on_no_results": profile.notify_on_no_results,
+                }
             ),
             handle,
         )
 
-    @on(Button.Pressed, "#delete-profile")
-    def _delete_profile(self) -> None:
-        profile_id = self._selected_profile_id()
-        if profile_id is None:
-            self._set_error("Select a profile first.")
-            return
-        try:
-            self._controller.delete_profile(self._telegram_user_id, profile_id)
-        except PROFILE_FORM_ERRORS as exc:
-            self._set_error(str(exc))
-            return
-        self._set_error("")
-        self.refresh_profiles()
-
 
 class OwnerDashboardApp(App[None]):
-    """Local owner dashboard: allowlist management + per-user profile screens."""
+    """Allowlist management plus per-person search screens."""
 
     CSS = """
     #dialog {
@@ -343,27 +409,25 @@ class OwnerDashboardApp(App[None]):
         background: $panel;
         border: thick $primary;
     }
-    /* The profile form keeps its fields in a scroll region with the
-       Save/Cancel row pinned below it, so the actions are always visible. */
     .form-dialog {
         height: 90%;
     }
-    #profile-form-fields {
+    #search-form-fields {
         height: 1fr;
     }
-    /* Labels wrap instead of clipping at the dialog edge. */
     #dialog > Label,
-    #profile-form-fields > Label {
+    #search-form-fields > Label {
         width: 100%;
     }
-    /* Horizontal defaults to 1fr; inside an auto-height dialog that collapses
-       to 1 row and clips the 3-row Switch/Buttons, so size rows to content. */
     #dialog Horizontal,
     .action-row {
         height: auto;
     }
-    /* Tables scroll internally instead of growing and pushing the action
-       buttons off the bottom of the screen. */
+    /* Textual's default Button min-width of 16 puts a six-button toolbar past
+       the right edge at 80 columns, leaving the last one unreachable. */
+    .action-row Button {
+        min-width: 11;
+    }
     DataTable {
         height: 1fr;
     }
@@ -371,52 +435,55 @@ class OwnerDashboardApp(App[None]):
 
     BINDINGS = [("q", "quit", "Quit")]
 
-    def __init__(self, db_path: Union[str, Path] = DEFAULT_DB_PATH) -> None:
+    def __init__(self, root: Union[str, Path] = DEFAULT_ROOT) -> None:
         super().__init__()
-        self._db_path = db_path
-        self._db: Optional[Database] = None
+        self._root = Path(root)
+        self.store: Optional[Store] = None
         self.controller: Optional[TuiController] = None
 
     def compose(self) -> ComposeResult:
         yield Header()
-        yield Label("CHC Rental — Owner Dashboard")
+        yield Label("CHC Rental — Owner Dashboard", id="dashboard-title")
         yield Label("", id="dashboard-error")
-        yield DataTable(id="users-table")
+        yield DataTable(id="people-table")
         with Horizontal(classes="action-row"):
-            yield Button("Add user", id="add-user", variant="primary")
-            yield Button("Deactivate user", id="deactivate-user", variant="error")
-            yield Button("Open profiles", id="open-profiles")
+            yield Button("Add person", id="add-person", variant="primary")
+            yield Button("Toggle allowlist", id="toggle-person", variant="error")
+            yield Button("Open searches", id="open-searches")
             yield Button("Status", id="open-status")
         yield Footer()
 
     def on_mount(self) -> None:
-        if str(self._db_path) != ":memory:":
-            Path(self._db_path).parent.mkdir(parents=True, exist_ok=True)
-        self._db = Database(self._db_path)
-        self.controller = TuiController(self._db)
+        self.store = Store(self._root)
+        self.store.initialize()
+        self.controller = TuiController(self.store)
 
-        table = self.query_one("#users-table", DataTable)
+        table = self.query_one("#people-table", DataTable)
         table.cursor_type = "row"
-        table.add_columns("Telegram ID", "Display name", "Active")
-        self.refresh_users()
+        table.add_columns("Telegram ID", "Display name", "Searches", "Delivery", "Allowlisted")
+        self.refresh_people()
 
-    def on_unmount(self) -> None:
-        if self._db is not None:
-            self._db.close()
-
-    def refresh_users(self) -> None:
-        table = self.query_one("#users-table", DataTable)
+    def refresh_people(self) -> None:
+        table = self.query_one("#people-table", DataTable)
         table.clear()
-        for user in self.controller.list_users():
+        try:
+            people = self.controller.list_people()
+        except StoreError as exc:
+            self._set_error(str(exc))
+            return
+        for person in people:
+            profile = person.profile
             table.add_row(
-                str(user.telegram_user_id),
-                user.display_name,
-                "yes" if user.active else "no",
-                key=str(user.telegram_user_id),
+                str(person.telegram_id),
+                person.display_name,
+                f"{len(profile.active_searches())}/{len(profile.searches)}",
+                f"{profile.delivery_time} {profile.timezone}",
+                "yes" if person.active else "no",
+                key=str(person.telegram_id),
             )
 
-    def _selected_user_id(self) -> Optional[int]:
-        table = self.query_one("#users-table", DataTable)
+    def _selected_person_id(self) -> Optional[int]:
+        table = self.query_one("#people-table", DataTable)
         if table.row_count == 0:
             return None
         row_key, _ = table.coordinate_to_cell_key(table.cursor_coordinate)
@@ -425,67 +492,68 @@ class OwnerDashboardApp(App[None]):
     def _set_error(self, message: str) -> None:
         self.query_one("#dashboard-error", Label).update(message)
 
-    @on(Button.Pressed, "#add-user")
-    def _add_user(self) -> None:
+    @on(Button.Pressed, "#add-person")
+    def _add_person(self) -> None:
         def handle(result: Optional[dict]) -> None:
             if result is None:
                 return
             try:
-                self.controller.add_user(result["telegram_user_id"], result["display_name"])
-            except ValueError as exc:
+                self.controller.add_person(result["telegram_id"], result["display_name"])
+            except FORM_ERRORS as exc:
                 self._set_error(str(exc))
                 return
             self._set_error("")
-            self.refresh_users()
+            self.refresh_people()
 
-        self.push_screen(AddUserScreen(), handle)
+        self.push_screen(AddPersonScreen(), handle)
 
-    @on(Button.Pressed, "#deactivate-user")
-    def _deactivate_user(self) -> None:
-        user_id = self._selected_user_id()
-        if user_id is None:
-            self._set_error("Select a user first.")
+    @on(Button.Pressed, "#toggle-person")
+    def _toggle_person(self) -> None:
+        telegram_id = self._selected_person_id()
+        if telegram_id is None:
+            self._set_error("Select a person first.")
             return
         try:
-            self.controller.deactivate_user(user_id)
-        except ValueError as exc:
+            person = self.controller.get_person(telegram_id)
+            self.controller.set_person_active(telegram_id, not person.active)
+        except FORM_ERRORS as exc:
             self._set_error(str(exc))
             return
         self._set_error("")
-        self.refresh_users()
+        self.refresh_people()
 
-    @on(Button.Pressed, "#open-profiles")
-    def _open_profiles(self) -> None:
-        user_id = self._selected_user_id()
-        if user_id is None:
-            self._set_error("Select a user first.")
+    @on(Button.Pressed, "#open-searches")
+    def _open_searches(self) -> None:
+        telegram_id = self._selected_person_id()
+        if telegram_id is None:
+            self._set_error("Select a person first.")
             return
-        user = next(
-            (u for u in self.controller.list_users() if u.telegram_user_id == user_id), None
-        )
-        if user is None:
-            self._set_error("User not found.")
+        try:
+            person = self.controller.get_person(telegram_id)
+        except FORM_ERRORS as exc:
+            self._set_error(str(exc))
             return
         self._set_error("")
-        self.push_screen(ProfilesScreen(self.controller, user.telegram_user_id, user.display_name))
+        self.push_screen(SearchesScreen(self.controller, person.telegram_id, person.display_name))
 
     @on(Button.Pressed, "#open-status")
     def _open_status(self) -> None:
-        self.push_screen(StatusScreen(self.controller, date.today().isoformat()))
+        self._set_error("")
+        self.push_screen(StatusScreen(self.controller))
 
 
 def run() -> None:
     parser = argparse.ArgumentParser(
         prog="chc-rental-tui",
-        description="CHC Rental owner dashboard — local Textual TUI for the allowlist and preference profiles.",
+        description="CHC Rental owner dashboard — allowlist and per-person searches.",
     )
     parser.add_argument(
-        "--db-path",
-        default=DEFAULT_DB_PATH,
-        help="Path to the local SQLite database file (default: %(default)s).",
+        "--root",
+        default=DEFAULT_ROOT,
+        help="Data directory holding config/ and state/ (default: %(default)s).",
     )
     args = parser.parse_args()
-    OwnerDashboardApp(db_path=args.db_path).run()
+    OwnerDashboardApp(root=args.root).run()
 
 
 if __name__ == "__main__":

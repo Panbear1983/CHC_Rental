@@ -6,6 +6,7 @@ requires-python = ">=3.11,<3.12"
 dependencies = [
     "pydantic>=2,<3",
     "textual>=8,<9",
+    "pyyaml>=6,<7",
 ]
 
 [project.optional-dependencies]
@@ -15,6 +16,7 @@ dev = [
 
 [project.scripts]
 chc-rental-tui = "chc_rental.tui.app:run"
+chc-rental = "chc_rental.cli:main"
 
 [build-system]
 requires = ["setuptools>=68", "wheel"]

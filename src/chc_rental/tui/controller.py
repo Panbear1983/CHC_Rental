@@ -1,66 +1,152 @@
 """Service layer the TUI screens call into.
 
-No business validation lives here: form coercion happens in `chc_rental.tui.forms`
-and every rule about ranges, allowlist membership, cross-user access, and
-duplicate names is enforced by the existing repositories and Pydantic models.
+Every mutation goes through `Store.edit_allowlist`, which holds one lock across
+the whole read-modify-write. No screen may touch a file directly.
 """
 
 from __future__ import annotations
 
-from chc_rental.budgets import BudgetRepository
-from chc_rental.db import Database
-from chc_rental.delivery import DeliveryRepository
-from chc_rental.models import AllowlistedUser, PreferenceProfile
-from chc_rental.repositories import AllowlistRepository, AuditRepository, ProfileRepository
-from chc_rental.status import StatusSnapshot, build_status_snapshot
-from chc_rental.tui.forms import parse_profile_create_form, parse_profile_update_form
+from datetime import date, datetime, timezone
+from typing import Optional
 
-DEFAULT_DAILY_BUDGET_LIMIT = 100
+from chc_rental.models import AllowlistEntry, Profile, Search, Settings
+from chc_rental.pipeline import PipelineResult, plan_pushes
+from chc_rental.store import Store, StoreError
+from chc_rental.tui.forms import parse_search_form
+
+
+class DuplicateError(ValueError):
+    """Raised when a telegram id or search name is already taken."""
+
+
+class NotFoundError(ValueError):
+    """Raised when a person or search does not exist."""
 
 
 class TuiController:
-    def __init__(self, db: Database, *, daily_budget_limit: int = DEFAULT_DAILY_BUDGET_LIMIT) -> None:
-        self.allowlist = AllowlistRepository(db)
-        self.audit = AuditRepository(db)
-        self.profiles = ProfileRepository(db, self.allowlist, self.audit)
-        self.budgets = BudgetRepository(db)
-        self.delivery = DeliveryRepository(db)
-        self._daily_budget_limit = daily_budget_limit
+    def __init__(self, store: Store) -> None:
+        self.store = store
 
-    def list_users(self) -> list[AllowlistedUser]:
-        return self.allowlist.list_users()
+    # ------------------------------------------------------------------ people
+    def list_people(self) -> list[AllowlistEntry]:
+        return self.store.load_allowlist().people
 
-    def add_user(self, telegram_user_id: int, display_name: str) -> AllowlistedUser:
-        return self.allowlist.add_user(telegram_user_id, display_name)
+    def get_person(self, telegram_id: int) -> AllowlistEntry:
+        person = self.store.load_allowlist().get(telegram_id)
+        if person is None:
+            raise NotFoundError(f"no allowlisted person with id {telegram_id}")
+        return person
 
-    def deactivate_user(self, telegram_user_id: int) -> AllowlistedUser:
-        return self.allowlist.deactivate_user(telegram_user_id)
+    def add_person(self, telegram_id: int, display_name: str) -> None:
+        with self.store.edit_allowlist() as allowlist:
+            if allowlist.get(telegram_id) is not None:
+                raise DuplicateError(f"telegram id {telegram_id} is already on the allowlist")
+            allowlist.people.append(
+                AllowlistEntry(
+                    telegram_id=telegram_id, display_name=display_name, profile=Profile()
+                )
+            )
 
-    def list_profiles(self, telegram_user_id: int) -> list[PreferenceProfile]:
-        return self.profiles.list_profiles(telegram_user_id)
+    def set_person_active(self, telegram_id: int, active: bool) -> None:
+        with self.store.edit_allowlist() as allowlist:
+            person = allowlist.get(telegram_id)
+            if person is None:
+                raise NotFoundError(f"no allowlisted person with id {telegram_id}")
+            person.active = active
 
-    def get_profile(self, telegram_user_id: int, profile_id: int) -> PreferenceProfile:
-        return self.profiles.get_profile(telegram_user_id, profile_id)
+    def remove_person(self, telegram_id: int) -> None:
+        with self.store.edit_allowlist() as allowlist:
+            if allowlist.get(telegram_id) is None:
+                raise NotFoundError(f"no allowlisted person with id {telegram_id}")
+            allowlist.people = [p for p in allowlist.people if p.telegram_id != telegram_id]
 
-    def create_profile(self, telegram_user_id: int, form_data: dict) -> PreferenceProfile:
-        profile = parse_profile_create_form(form_data)
-        return self.profiles.create_profile(telegram_user_id, profile)
+    # ---------------------------------------------------------------- searches
+    def list_searches(self, telegram_id: int) -> list[Search]:
+        return self.get_person(telegram_id).profile.searches
 
-    def update_profile(
-        self, telegram_user_id: int, profile_id: int, form_data: dict
-    ) -> PreferenceProfile:
-        updates = parse_profile_update_form(form_data)
-        return self.profiles.update_profile(telegram_user_id, profile_id, updates)
+    def add_search(self, telegram_id: int, form_data: dict) -> None:
+        search = parse_search_form(form_data)
+        with self.store.edit_allowlist() as allowlist:
+            person = allowlist.get(telegram_id)
+            if person is None:
+                raise NotFoundError(f"no allowlisted person with id {telegram_id}")
+            existing = {s.name.lower() for s in person.profile.searches}
+            if search.name.lower() in existing:
+                raise DuplicateError(f"this profile already has a search named {search.name!r}")
+            person.profile.searches.append(search)
 
-    def delete_profile(self, telegram_user_id: int, profile_id: int) -> None:
-        self.profiles.delete_profile(telegram_user_id, profile_id)
+    def update_search(self, telegram_id: int, index: int, form_data: dict) -> None:
+        search = parse_search_form(form_data)
+        with self.store.edit_allowlist() as allowlist:
+            person = allowlist.get(telegram_id)
+            if person is None:
+                raise NotFoundError(f"no allowlisted person with id {telegram_id}")
+            if not 0 <= index < len(person.profile.searches):
+                raise NotFoundError(f"no search at position {index}")
+            clashes = {
+                s.name.lower()
+                for position, s in enumerate(person.profile.searches)
+                if position != index
+            }
+            if search.name.lower() in clashes:
+                raise DuplicateError(f"this profile already has a search named {search.name!r}")
+            person.profile.searches[index] = search
 
-    def get_status_snapshot(self, budget_date: str) -> StatusSnapshot:
-        return build_status_snapshot(
-            self.allowlist,
-            self.profiles,
-            self.budgets,
-            self.delivery,
-            budget_date,
-            self._daily_budget_limit,
+    def delete_search(self, telegram_id: int, index: int) -> None:
+        with self.store.edit_allowlist() as allowlist:
+            person = allowlist.get(telegram_id)
+            if person is None:
+                raise NotFoundError(f"no allowlisted person with id {telegram_id}")
+            if not 0 <= index < len(person.profile.searches):
+                raise NotFoundError(f"no search at position {index}")
+            person.profile.searches.pop(index)
+
+    def toggle_search(self, telegram_id: int, index: int) -> None:
+        with self.store.edit_allowlist() as allowlist:
+            person = allowlist.get(telegram_id)
+            if person is None:
+                raise NotFoundError(f"no allowlisted person with id {telegram_id}")
+            if not 0 <= index < len(person.profile.searches):
+                raise NotFoundError(f"no search at position {index}")
+            search = person.profile.searches[index]
+            search.active = not search.active
+
+    # ----------------------------------------------------------------- profile
+    def update_delivery(
+        self,
+        telegram_id: int,
+        *,
+        delivery_time: str,
+        timezone_name: str,
+        notify_on_no_results: bool,
+    ) -> None:
+        with self.store.edit_allowlist() as allowlist:
+            person = allowlist.get(telegram_id)
+            if person is None:
+                raise NotFoundError(f"no allowlisted person with id {telegram_id}")
+            person.profile.delivery_time = delivery_time
+            person.profile.timezone = timezone_name
+            person.profile.notify_on_no_results = notify_on_no_results
+
+    # ------------------------------------------------------------------ status
+    def settings(self) -> Settings:
+        return self.store.load_settings()
+
+    def latest_run(self) -> Optional[dict]:
+        return self.store.latest_run_log()
+
+    def quota_today(self) -> tuple[int, int]:
+        settings = self.store.load_settings()
+        used = self.store.quota_total(date.today())
+        return used, settings.global_daily_request_budget
+
+    def rejected_today(self) -> int:
+        return self.store.rejected_count(date.today())
+
+    def preview(self, listings, *, now_utc: Optional[datetime] = None) -> PipelineResult:
+        return plan_pushes(
+            self.store, listings, now_utc=now_utc or datetime.now(timezone.utc)
         )
+
+
+__all__ = ["TuiController", "DuplicateError", "NotFoundError", "StoreError"]

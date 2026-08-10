@@ -1,0 +1,17 @@
+[
+  {"source":"feed","source_listing_id":"A1","url":"https://example.com/rent/a1",
+   "address":"12 Renai Rd","unit":null,"city":"Taipei","district":"Da'an",
+   "price":28000,"property_type":"apartment","beds":2,"baths":1.0,"sqft":780,
+   "features":["elevator","balcony"]},
+  {"source":"feed","source_listing_id":"A2","url":"https://example.com/rent/a2",
+   "address":"5 Xinyi Rd","unit":"7F","city":"Taipei","district":"Da'an",
+   "price":52000,"property_type":"apartment","beds":3,"baths":2.0,"sqft":1200,
+   "features":["elevator","parking"]},
+  {"source":"feed","source_listing_id":"A3","url":"https://example.com/rent/a3",
+   "address":"99 Zhongshan N Rd","unit":null,"city":"Taipei","district":"Zhongshan",
+   "price":19000,"property_type":"studio","beds":1,"baths":1.0,"sqft":420,
+   "features":[]},
+  {"source":"feed","source_listing_id":"BAD","url":"not-a-link",
+   "address":"1 Broken St","city":"Taipei","price":15000,
+   "property_type":"apartment","beds":1,"baths":1.0}
+]
