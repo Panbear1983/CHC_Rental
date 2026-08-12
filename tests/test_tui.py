@@ -5,9 +5,9 @@ from __future__ import annotations
 import asyncio
 
 from textual.errors import NoWidget
-from textual.widgets import Button, DataTable, Input, Label, Switch
+from textual.widgets import Button, DataTable, Input, Label, Select, Switch
 
-from chc_rental.models import Allowlist, Profile
+from chc_rental.models import Allowlist, DeliveryMode, Profile, Settings
 from chc_rental.store import Store
 from chc_rental.tui.app import (
     AddPersonScreen,
@@ -17,6 +17,8 @@ from chc_rental.tui.app import (
     SearchFormScreen,
 )
 from chc_rental.tui.controller import TuiController
+from chc_rental.tui.alert_settings import IncrementalSettingsScreen
+from chc_rental.tui.alerts import AlertsScreen
 from chc_rental.tui.status import StatusScreen
 
 from tests.conftest import make_person, make_search
@@ -201,6 +203,7 @@ def _modal_screens() -> list[tuple[str, object]]:
                 }
             ),
         ),
+        ("incremental-settings", IncrementalSettingsScreen(settings=Settings())),
     ]
 
 
@@ -226,6 +229,10 @@ def test_no_action_button_is_clipped_at_80_columns(tmp_path):
             app.push_screen(StatusScreen(app.controller))
             await pilot.pause()
             problems += _clipped_buttons(app, "status")
+
+            app.push_screen(AlertsScreen(app.controller))
+            await pilot.pause()
+            problems += _clipped_buttons(app, "alerts")
 
             assert problems == [], problems
 
@@ -447,6 +454,112 @@ def test_delivery_form_stays_open_on_a_bad_time(tmp_path):
             assert app.screen is form, "a bad delivery time must keep the modal open"
             error = str(form.query_one("#delivery-form-error", Label).render())
             assert "HH:MM" in error or "24-hour" in error
+
+    run(scenario())
+
+
+def test_delivery_mode_and_quiet_hours_round_trip_through_dashboard(tmp_path):
+    async def scenario():
+        app = OwnerDashboardApp(root=tmp_path)
+        async with app.run_test(size=(100, 40)) as pilot:
+            app.controller.add_person(111, "Peter")
+            app.refresh_people()
+            await pilot.pause()
+            await pilot.click("#open-searches")
+            await pilot.pause()
+            await pilot.click("#delivery-settings")
+            await pilot.pause()
+            form = app.screen
+            form.query_one("#delivery_mode", Select).value = "immediate"
+            form.query_one("#timezone", Input).value = "Asia/Taipei"
+            form.query_one("#quiet_hours_start", Input).value = "23:00"
+            form.query_one("#quiet_hours_end", Input).value = "07:00"
+            await pilot.click("#submit")
+            await pilot.pause()
+            profile = app.controller.get_person(111).profile
+            assert profile.delivery_mode == DeliveryMode.IMMEDIATE
+            assert profile.quiet_hours_start == "23:00"
+            assert profile.quiet_hours_end == "07:00"
+            title = str(app.screen.query_one("#searches-title", Label).render())
+            assert "immediate" in title and "quiet 23:00-07:00" in title
+
+    run(scenario())
+
+
+def test_incremental_settings_control_writes_real_gates_and_limits(tmp_path):
+    async def scenario():
+        app = OwnerDashboardApp(root=tmp_path)
+        async with app.run_test(size=(100, 40)) as pilot:
+            app.controller.add_person(111, "Peter")
+            app.controller.add_search(111, SEARCH_FORM)
+            app.store.migrate_config_v2()
+            app.store.migrate_alert_ledger()
+            (tmp_path / ".env").write_text("APIFY_TOKEN=fake-test-token\n")
+            await pilot.click("#open-status")
+            await pilot.pause()
+            await pilot.click("#alert-settings")
+            await pilot.pause()
+            form = app.screen
+            assert isinstance(form, IncrementalSettingsScreen)
+            form.query_one("#zillow_enabled", Switch).value = True
+            form.query_one("#zillow_terms_confirmed", Switch).value = True
+            form.query_one("#incremental_alerts_enabled", Switch).value = True
+            form.query_one("#zillow_interval", Input).value = "120"
+            form.query_one("#zillow_daily_budget", Input).value = "7"
+            form.query_one("#zillow_results_limit", Input).value = "30"
+            form.query_one("#zillow_max_charge_usd", Input).value = "0.30"
+            await pilot.click("#submit")
+            await pilot.pause()
+            saved = app.controller.settings()
+            assert saved.incremental_alerts_enabled is True
+            assert saved.zillow_enabled is True
+            assert saved.zillow_actor == "maxcopell~zillow-scraper"
+            assert saved.zillow_incremental_interval_minutes == 120
+            assert saved.source_request_budget("zillow") == 7
+            assert saved.zillow_results_limit == 30
+            assert saved.zillow_max_charge_usd == 0.30
+            confirmation = str(
+                app.screen.query_one("#incremental-action", Label).render()
+            )
+            assert "no scrape was started" in confirmation
+
+    run(scenario())
+
+
+def test_zillow_first_enable_requires_explicit_warning_confirmation(tmp_path):
+    store = Store(tmp_path)
+    store.initialize()
+    (tmp_path / ".env").write_text("APIFY_TOKEN=fake-test-token\n")
+    controller = TuiController(store)
+    try:
+        controller.update_incremental_settings(
+            incremental_alerts_enabled=False,
+            zillow_enabled=True,
+            zillow_terms_confirmed=False,
+            zillow_actor="maxcopell~zillow-scraper",
+            zillow_incremental_interval_minutes=180,
+            zillow_daily_request_budget=5,
+            zillow_results_limit=25,
+            zillow_max_charge_usd=0.25,
+            incremental_active_start="08:00",
+            incremental_active_end="23:00",
+        )
+    except ValueError as exc:
+        assert "confirm" in str(exc)
+    else:
+        raise AssertionError("first Zillow enable must require explicit confirmation")
+    assert controller.settings().zillow_enabled is False
+
+
+def test_dashboard_opens_incremental_alert_operations_screen(tmp_path):
+    async def scenario():
+        app = OwnerDashboardApp(root=tmp_path)
+        async with app.run_test(size=(100, 40)) as pilot:
+            await pilot.click("#open-alerts")
+            await pilot.pause()
+            assert isinstance(app.screen, AlertsScreen)
+            state = str(app.screen.query_one("#alerts-config", Label).render())
+            assert "PAUSED" in state and "APIFY_TOKEN missing" in state
 
     run(scenario())
 

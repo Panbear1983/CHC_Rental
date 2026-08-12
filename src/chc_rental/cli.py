@@ -315,6 +315,36 @@ def _alert_foundation_status(store: Store) -> dict[str, Any]:
     }
 
 
+def _alert_operational_status(store: Store, *, env_file: str) -> dict[str, Any]:
+    payload = _alert_foundation_status(store)
+    settings = store.load_settings()
+    used = store.quota_used(datetime.now(timezone.utc).date(), "zillow")
+    budget = settings.source_request_budget("zillow")
+    payload["incremental"] = {
+        "enabled": settings.incremental_alerts_enabled,
+        "zillow_enabled": settings.zillow_enabled,
+        "token_ready": load_apify_token(env_file) is not None,
+        "actor": settings.zillow_actor,
+        "interval_minutes": settings.zillow_incremental_interval_minutes,
+        "active_window": {
+            "start": settings.incremental_active_start,
+            "end": settings.incremental_active_end,
+            "timezone": settings.scrape_timezone,
+        },
+        "daily_budget": budget,
+        "used_today": used,
+        "remaining_today": max(0, budget - used),
+        "results_limit": settings.zillow_results_limit,
+        "max_charge_usd": settings.zillow_max_charge_usd,
+        "health": (
+            store.event_store().health_snapshot()
+            if payload["ledger"]["ready"]
+            else None
+        ),
+    }
+    return payload
+
+
 def _cmd_alerts_migrate(args: argparse.Namespace) -> int:
     """Inspect or apply the inert incremental-alert foundation."""
     store = Store(args.root)
@@ -333,7 +363,8 @@ def _cmd_alerts_status(args: argparse.Namespace) -> int:
     """Read-only foundation status; never creates the alert database."""
     store = Store(args.root)
     store.initialize()
-    payload = _alert_foundation_status(store)
+    env_file = args.env_file or str(store.root / ".env")
+    payload = _alert_operational_status(store, env_file=env_file)
     if args.json:
         print(json.dumps(payload, sort_keys=True))
     else:
@@ -342,7 +373,9 @@ def _cmd_alerts_status(args: argparse.Namespace) -> int:
         print(
             "incremental foundation: "
             f"config={'ready' if config['ready'] else 'migration needed'}, "
-            f"ledger={'ready' if ledger['ready'] else 'migration needed'}"
+            f"ledger={'ready' if ledger['ready'] else 'migration needed'}; "
+            f"collection={'on' if payload['incremental']['enabled'] else 'paused'}, "
+            f"Zillow={'on' if payload['incremental']['zillow_enabled'] else 'off'}"
         )
     return 0
 
@@ -474,6 +507,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "status", help="Show incremental foundation readiness without changing it"
     )
     alerts_status_parser.add_argument("--json", action="store_true")
+    alerts_status_parser.add_argument(
+        "--env-file", help="Credential file for readiness checks (default: ROOT/.env)"
+    )
     alerts_status_parser.set_defaults(func=_cmd_alerts_status)
     cycle_parser = alerts_sub.add_parser(
         "cycle", help="Run one source-only incremental shadow cycle"

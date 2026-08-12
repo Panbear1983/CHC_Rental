@@ -10,11 +10,14 @@ from datetime import date, datetime, timezone
 from typing import Optional
 from uuid import uuid4
 
-from chc_rental.models import AllowlistEntry, Profile, Search, Settings
+from chc_rental.models import AllowlistEntry, DeliveryMode, Profile, Search, Settings
+from chc_rental.incremental import IncrementalCollector
+from chc_rental.outbox import process_incremental_report
 from chc_rental.pipeline import PipelineResult, plan_pushes
+from chc_rental.sources.apify import ApifyClient
 from chc_rental.sources import KNOWN_SOURCES
 from chc_rental.sources.rentcast import load_rentcast_key
-from chc_rental.sources.zillow import load_apify_token
+from chc_rental.sources.zillow import ZillowRentalAdapter, load_apify_token
 from chc_rental.store import Store, StoreError
 from chc_rental.tui.forms import parse_search_form
 
@@ -124,6 +127,9 @@ class TuiController:
         *,
         delivery_time: str,
         timezone_name: str,
+        delivery_mode: str,
+        quiet_hours_start: str | None,
+        quiet_hours_end: str | None,
         notify_on_no_results: bool,
     ) -> None:
         with self.store.edit_allowlist() as allowlist:
@@ -132,7 +138,84 @@ class TuiController:
                 raise NotFoundError(f"no allowlisted person with id {telegram_id}")
             person.profile.delivery_time = delivery_time
             person.profile.timezone = timezone_name
+            person.profile.delivery_mode = DeliveryMode(delivery_mode)
+            person.profile.quiet_hours_start = quiet_hours_start
+            person.profile.quiet_hours_end = quiet_hours_end
             person.profile.notify_on_no_results = notify_on_no_results
+
+    def update_incremental_settings(
+        self,
+        *,
+        incremental_alerts_enabled: bool,
+        zillow_enabled: bool,
+        zillow_terms_confirmed: bool,
+        zillow_actor: str,
+        zillow_incremental_interval_minutes: int,
+        zillow_daily_request_budget: int,
+        zillow_results_limit: int,
+        zillow_max_charge_usd: float,
+        incremental_active_start: str,
+        incremental_active_end: str,
+    ) -> Settings:
+        if zillow_enabled and load_apify_token(str(self.store.root / ".env")) is None:
+            raise ValueError("APIFY_TOKEN is required before Zillow can be enabled")
+        if incremental_alerts_enabled:
+            if not zillow_enabled:
+                raise ValueError("enable Zillow before enabling incremental alerts")
+            if not self.store.config_v2_status()["ready"]:
+                raise ValueError("config migration is required before incremental alerts can run")
+            if not self.store.alert_migration_status().ready:
+                raise ValueError("alert-ledger migration is required before incremental alerts can run")
+
+        with self.store.edit_settings() as settings:
+            if zillow_enabled and not settings.zillow_enabled and not zillow_terms_confirmed:
+                raise ValueError("confirm the Zillow managed-scraper warning before enabling it")
+            source_budgets = dict(settings.source_daily_request_budgets)
+            source_budgets["zillow"] = zillow_daily_request_budget
+            candidate = Settings.model_validate(
+                {
+                    **settings.model_dump(mode="python"),
+                    "incremental_alerts_enabled": incremental_alerts_enabled,
+                    "zillow_enabled": zillow_enabled,
+                    "zillow_actor": zillow_actor,
+                    "zillow_incremental_interval_minutes": (
+                        zillow_incremental_interval_minutes
+                    ),
+                    "source_daily_request_budgets": source_budgets,
+                    "zillow_results_limit": zillow_results_limit,
+                    "zillow_max_charge_usd": zillow_max_charge_usd,
+                    "incremental_active_start": incremental_active_start,
+                    "incremental_active_end": incremental_active_end,
+                }
+            )
+            for field in (
+                "incremental_alerts_enabled",
+                "zillow_enabled",
+                "zillow_actor",
+                "zillow_incremental_interval_minutes",
+                "source_daily_request_budgets",
+                "zillow_results_limit",
+                "zillow_max_charge_usd",
+                "incremental_active_start",
+                "incremental_active_end",
+            ):
+                setattr(settings, field, getattr(candidate, field))
+        return self.store.load_settings()
+
+    def set_incremental_enabled(self, enabled: bool) -> Settings:
+        current = self.store.load_settings()
+        if enabled:
+            if not current.zillow_enabled:
+                raise ValueError("enable Zillow before resuming incremental collection")
+            if load_apify_token(str(self.store.root / ".env")) is None:
+                raise ValueError("APIFY_TOKEN is required before resuming")
+            if not self.store.config_v2_status()["ready"]:
+                raise ValueError("config migration is required before resuming")
+            if not self.store.alert_migration_status().ready:
+                raise ValueError("alert-ledger migration is required before resuming")
+        with self.store.edit_settings() as settings:
+            settings.incremental_alerts_enabled = enabled
+        return self.store.load_settings()
 
     # ------------------------------------------------------------------ status
     def settings(self) -> Settings:
@@ -220,6 +303,127 @@ class TuiController:
 
     def rejected_today(self) -> int:
         return self.store.rejected_count(self._today())
+
+    def incremental_status(self) -> dict:
+        config = self.store.config_v2_status()
+        ledger = self.store.alert_migration_status()
+        settings = self.store.load_settings()
+        token_ready = load_apify_token(str(self.store.root / ".env")) is not None
+        status = {
+            "config": config,
+            "ledger": ledger.as_dict(),
+            "enabled": settings.incremental_alerts_enabled,
+            "zillow_enabled": settings.zillow_enabled,
+            "token_ready": token_ready,
+            "actor": settings.zillow_actor,
+            "interval_minutes": settings.zillow_incremental_interval_minutes,
+            "daily_budget": settings.source_request_budget("zillow"),
+            "used_today": self.store.quota_used(self._today(), "zillow"),
+            "results_limit": settings.zillow_results_limit,
+            "max_charge_usd": settings.zillow_max_charge_usd,
+            "active_window": (
+                f"{settings.incremental_active_start}-{settings.incremental_active_end} "
+                f"{settings.scrape_timezone}"
+            ),
+            "health": None,
+        }
+        status["remaining_today"] = max(
+            0, status["daily_budget"] - status["used_today"]
+        )
+        if ledger.ready:
+            health = self.store.event_store().health_snapshot()
+            last_success = health.get("last_success_at")
+            if last_success:
+                parsed = datetime.fromisoformat(str(last_success).replace("Z", "+00:00"))
+                age_minutes = max(
+                    0, int((datetime.now(timezone.utc) - parsed).total_seconds() // 60)
+                )
+                health["last_success_age_minutes"] = age_minutes
+                health["stale"] = age_minutes > (
+                    settings.zillow_incremental_interval_minutes * 2
+                )
+            else:
+                health["last_success_age_minutes"] = None
+                health["stale"] = bool(health["active_scopes"])
+            for scope in health["scopes"]:
+                last_scope_success = scope.get("last_success_at")
+                if last_scope_success:
+                    parsed = datetime.fromisoformat(
+                        str(last_scope_success).replace("Z", "+00:00")
+                    )
+                    age = max(
+                        0,
+                        int(
+                            (datetime.now(timezone.utc) - parsed).total_seconds()
+                            // 60
+                        ),
+                    )
+                    scope["age_minutes"] = age
+                    scope["stale"] = age > (
+                        settings.zillow_incremental_interval_minutes * 2
+                    )
+                else:
+                    scope["age_minutes"] = None
+                    scope["stale"] = True
+            status["health"] = health
+        return status
+
+    def recipient_outbox_counts(self, telegram_id: int) -> dict[str, int]:
+        if not self.store.alert_migration_status().ready:
+            return {}
+        return self.store.event_store().outbox_counts(telegram_id=telegram_id)
+
+    def incremental_outbox(self):
+        if not self.store.alert_migration_status().ready:
+            return []
+        return self.store.event_store().outbox_records()
+
+    def retry_failed_outbox(self, outbox_id: int) -> None:
+        if not self.store.alert_migration_status().ready:
+            raise ValueError("alert-ledger migration is required")
+        self.store.event_store().retry_failed_outbox(
+            outbox_id, now_utc=datetime.now(timezone.utc)
+        )
+
+    def reset_baseline(self, query_id: str, *, reason: str) -> None:
+        if not self.store.alert_migration_status().ready:
+            raise ValueError("alert-ledger migration is required")
+        self.store.event_store().reset_query_baseline(
+            query_id, now_utc=datetime.now(timezone.utc), reason=reason
+        )
+
+    def run_shadow_cycle(self) -> dict:
+        """Run one real source cycle and shadow processing; never send Telegram."""
+        settings = self.store.load_settings()
+        token = load_apify_token(str(self.store.root / ".env"))
+        if not token:
+            raise ValueError("APIFY_TOKEN is required for a shadow cycle")
+        if not settings.incremental_alerts_enabled or not settings.zillow_enabled:
+            raise ValueError("incremental collection and Zillow must both be enabled")
+        with self.store.try_run_lock() as acquired:
+            if not acquired:
+                raise ValueError("another rental workflow is already running")
+            now_utc = datetime.now(timezone.utc)
+            report = IncrementalCollector(
+                self.store,
+                settings=settings,
+                adapter=ZillowRentalAdapter(
+                    token=token,
+                    actor=settings.zillow_actor,
+                    results_limit=settings.zillow_results_limit,
+                    timeout=settings.zillow_timeout_seconds,
+                    max_charge_usd=settings.zillow_max_charge_usd,
+                ),
+                client=ApifyClient(
+                    token=token, timeout=settings.zillow_timeout_seconds
+                ),
+            ).cycle(now_utc=now_utc)
+            processing = process_incremental_report(
+                self.store, report, now_utc=now_utc
+            )
+        summary = report.summary()
+        summary["processing"] = processing.summary()
+        return summary
 
     def preview(self, listings, *, now_utc: Optional[datetime] = None) -> PipelineResult:
         return plan_pushes(

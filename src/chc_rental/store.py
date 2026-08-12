@@ -256,6 +256,19 @@ class Store:
             self._backup(self.settings_path)
             self._write_yaml(self.settings_path, settings.model_dump(mode="json"))
 
+    @contextmanager
+    def edit_settings(self) -> Iterator[Settings]:
+        """Lock, validate, back up, and atomically update global settings."""
+        with self._locked("settings"):
+            try:
+                current = Settings.model_validate(self._read_yaml(self.settings_path))
+            except ValidationError as exc:
+                raise StoreError(f"{self.settings_path} failed validation:\n{exc}") from exc
+            yield current
+            validated = Settings.model_validate(current.model_dump())
+            self._backup(self.settings_path)
+            self._write_yaml(self.settings_path, validated.model_dump(mode="json"))
+
     # --------------------------------------------------- incremental migration
     def config_v2_status(self) -> dict[str, Any]:
         """Inspect config migration readiness without changing either file."""

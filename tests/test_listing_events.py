@@ -5,7 +5,10 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
+import pytest
+
 from chc_rental.events import observe_collection
+from chc_rental.event_store import AlertStoreError
 from chc_rental.incremental import IncrementalCollector
 from chc_rental.models import Allowlist, Profile
 from chc_rental.outbox import process_incremental_report
@@ -243,3 +246,50 @@ def test_persisted_new_event_survives_crash_before_outbox_insert(store):
     )
     assert processed.outbox.queued == 1
     assert store.event_store().outbox_records()[0].status == "shadow"
+
+
+def test_confirmed_baseline_reset_is_audited_and_next_window_is_silent(store):
+    settings = prepare(store)
+    cycle(store, settings, [raw_listing("a")], NOW)
+    query_id = next(iter(store.event_store().query_baseline_states()))
+    store.event_store().reset_query_baseline(
+        query_id,
+        now_utc=NOW + timedelta(hours=1),
+        reason="test owner confirmation",
+    )
+    assert store.event_store().query_baseline_states()[query_id] == "reset_pending"
+    _, processed = cycle(
+        store,
+        settings,
+        [raw_listing("a"), raw_listing("b", address="200 Main St")],
+        NOW + timedelta(hours=3),
+    )
+    assert {
+        event.event_type for event in processed.observations[0].events
+    } == {"baseline"}
+    assert processed.outbox.queued == 0
+    with store.event_store().connection() as connection:
+        audit = connection.execute(
+            "SELECT action, target_id, details_json FROM operator_audit"
+        ).fetchone()
+    assert audit[0] == "reset_baseline" and audit[1] == query_id
+    assert "test owner confirmation" in audit[2]
+
+
+def test_baseline_reset_refuses_an_open_or_unprocessed_source_run(store):
+    settings = prepare(store)
+    collected = IncrementalCollector(
+        store,
+        settings=settings,
+        adapter=ZillowRentalAdapter(
+            token="SECRET", results_limit=25, bounds_resolver=lambda query: BOUNDS
+        ),
+        client=ImmediateClient([raw_listing("a")]),
+        worker_id="unprocessed-run-test",
+    ).cycle(now_utc=NOW)
+    query_id = collected.collections[0].query_id
+    with pytest.raises(AlertStoreError, match="open or unprocessed"):
+        store.event_store().reset_query_baseline(
+            query_id, now_utc=NOW + timedelta(minutes=1), reason="unsafe timing"
+        )
+    assert store.event_store().query_baseline_states()[query_id] == "pending"

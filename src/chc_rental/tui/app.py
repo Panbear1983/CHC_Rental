@@ -34,11 +34,12 @@ from textual import on
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen, Screen
-from textual.widgets import Button, DataTable, Footer, Header, Input, Label, Switch
+from textual.widgets import Button, DataTable, Footer, Header, Input, Label, Select, Switch
 
 from chc_rental.models import Profile
 from chc_rental.store import Store, StoreError
 from chc_rental.tui.controller import DuplicateError, NotFoundError, TuiController
+from chc_rental.tui.alerts import AlertsScreen, ConfirmActionScreen
 from chc_rental.tui.forms import FormParsingError, parse_search_form, search_to_form
 from chc_rental.tui.status import StatusScreen
 
@@ -71,6 +72,15 @@ def _sqft_text(low: Optional[int], high: Optional[int]) -> str:
     if low is None:
         return f"<={high}"
     return f"{low}-{high}"
+
+
+def _delivery_text(profile: Profile) -> str:
+    if profile.delivery_mode.value == "immediate":
+        text = f"immediate · {profile.timezone}"
+        if profile.quiet_hours_start:
+            text += f" · quiet {profile.quiet_hours_start}-{profile.quiet_hours_end}"
+        return text
+    return f"daily {profile.delivery_time} {profile.timezone}"
 
 
 class AddPersonScreen(ModalScreen[Optional[dict]]):
@@ -256,7 +266,7 @@ class SearchFormScreen(ModalScreen[Optional[dict]]):
 
 
 class DeliveryFormScreen(ModalScreen[Optional[dict]]):
-    """Edit when and where a person's daily push lands."""
+    """Edit daily/immediate delivery and local quiet hours."""
 
     BINDINGS = [("escape", "cancel_dialog", "Cancel")]
 
@@ -270,10 +280,32 @@ class DeliveryFormScreen(ModalScreen[Optional[dict]]):
             yield Label("Delivery settings")
             yield Label("", id="delivery-form-error")
             with VerticalScroll(classes="dialog-fields"):
+                yield Label(
+                    f"Incremental outbox: shadow {self._initial.get('shadow_alerts', 0)} · "
+                    f"pending {self._initial.get('pending_alerts', 0)} · "
+                    f"failed {self._initial.get('failed_alerts', 0)}"
+                )
+                yield Label("Alert delivery mode")
+                yield Select(
+                    [("Daily at the selected time", "daily"), ("Immediate", "immediate")],
+                    value=self._initial.get("delivery_mode", "daily"),
+                    allow_blank=False,
+                    id="delivery_mode",
+                )
                 yield Label("Daily notification time (HH:MM)")
                 yield Input(value=self._initial.get("delivery_time", "09:00"), id="delivery_time")
                 yield Label("Timezone (IANA, e.g. Asia/Taipei)")
                 yield Input(value=self._initial.get("timezone", "America/New_York"), id="timezone")
+                yield Label("Immediate-mode quiet-hours start (HH:MM; both blank = off)")
+                yield Input(
+                    value=self._initial.get("quiet_hours_start", ""),
+                    id="quiet_hours_start",
+                )
+                yield Label("Immediate-mode quiet-hours end (HH:MM; both blank = off)")
+                yield Input(
+                    value=self._initial.get("quiet_hours_end", ""),
+                    id="quiet_hours_end",
+                )
                 with Horizontal():
                     yield Label("Notify when nothing matched")
                     yield Switch(
@@ -291,8 +323,11 @@ class DeliveryFormScreen(ModalScreen[Optional[dict]]):
 
     def _collect(self) -> dict:
         return {
+            "delivery_mode": str(self.query_one("#delivery_mode", Select).value),
             "delivery_time": self.query_one("#delivery_time", Input).value,
             "timezone": self.query_one("#timezone", Input).value,
+            "quiet_hours_start": self.query_one("#quiet_hours_start", Input).value,
+            "quiet_hours_end": self.query_one("#quiet_hours_end", Input).value,
             "notify_on_no_results": self.query_one("#notify_on_no_results", Switch).value,
         }
 
@@ -318,8 +353,11 @@ class DeliveryFormScreen(ModalScreen[Optional[dict]]):
     def _submit(self) -> None:
         raw = self._collect()
         data = {
+            "delivery_mode": raw["delivery_mode"],
             "delivery_time": raw["delivery_time"].strip(),
             "timezone": raw["timezone"].strip(),
+            "quiet_hours_start": raw["quiet_hours_start"].strip() or None,
+            "quiet_hours_end": raw["quiet_hours_end"].strip() or None,
             "notify_on_no_results": raw["notify_on_no_results"],
         }
         if self._validator is not None:
@@ -432,7 +470,7 @@ class SearchesScreen(Screen[None]):
         profile = person.profile
         self.query_one("#searches-title", Label).update(
             f"Searches for {person.display_name} ({person.telegram_id}) — "
-            f"daily at {profile.delivery_time} {profile.timezone}"
+            f"{_delivery_text(profile)}"
             + ("  [no-match notices on]" if profile.notify_on_no_results else "")
         )
 
@@ -469,8 +507,11 @@ class SearchesScreen(Screen[None]):
     def _validate_delivery_form(self, data: dict) -> Optional[str]:
         try:
             Profile(
+                delivery_mode=data["delivery_mode"],
                 delivery_time=data["delivery_time"],
                 timezone=data["timezone"],
+                quiet_hours_start=data["quiet_hours_start"],
+                quiet_hours_end=data["quiet_hours_end"],
                 notify_on_no_results=data["notify_on_no_results"],
             )
         except ValidationError as exc:
@@ -567,6 +608,7 @@ class SearchesScreen(Screen[None]):
     def _delivery_settings(self) -> None:
         try:
             profile = self._controller.get_person(self._telegram_id).profile
+            outbox = self._controller.recipient_outbox_counts(self._telegram_id)
         except FORM_ERRORS as exc:
             self._set_error(str(exc))
             return
@@ -579,6 +621,9 @@ class SearchesScreen(Screen[None]):
                     self._telegram_id,
                     delivery_time=result["delivery_time"],
                     timezone_name=result["timezone"],
+                    delivery_mode=result["delivery_mode"],
+                    quiet_hours_start=result["quiet_hours_start"],
+                    quiet_hours_end=result["quiet_hours_end"],
                     notify_on_no_results=result["notify_on_no_results"],
                 )
             except FORM_ERRORS as exc:
@@ -590,9 +635,19 @@ class SearchesScreen(Screen[None]):
         self.app.push_screen(
             DeliveryFormScreen(
                 initial={
+                    "delivery_mode": profile.delivery_mode.value,
                     "delivery_time": profile.delivery_time,
                     "timezone": profile.timezone,
+                    "quiet_hours_start": profile.quiet_hours_start or "",
+                    "quiet_hours_end": profile.quiet_hours_end or "",
                     "notify_on_no_results": profile.notify_on_no_results,
+                    "shadow_alerts": outbox.get("shadow", 0),
+                    "pending_alerts": (
+                        outbox.get("pending", 0) + outbox.get("retry_wait", 0)
+                    ),
+                    "failed_alerts": (
+                        outbox.get("failed", 0) + outbox.get("uncertain", 0)
+                    ),
                 },
                 validator=self._validate_delivery_form,
             ),
@@ -605,7 +660,8 @@ class OwnerDashboardApp(App[None]):
 
     CSS = """
     /* Textual's ModalScreen no longer centers its children by default. */
-    AddPersonScreen, SearchFormScreen, DeliveryFormScreen {
+    AddPersonScreen, SearchFormScreen, DeliveryFormScreen, IncrementalSettingsScreen,
+    ConfirmActionScreen {
         align: center middle;
     }
     #dialog {
@@ -623,7 +679,19 @@ class OwnerDashboardApp(App[None]):
        whole squeeze by scrolling — never the button row. If a dialog gains a
        field, bump its number here or the fields just scroll a little. */
     AddPersonScreen #dialog { height: 15; }    /* fields: 2 inputs = 6 rows */
-    DeliveryFormScreen #dialog { height: 20; } /* fields: 2 labels + 2 inputs + switch row = 11 rows */
+    DeliveryFormScreen #dialog { height: 32; }
+    IncrementalSettingsScreen #dialog { height: 90%; }
+    #confirm-dialog {
+        padding: 1 2;
+        width: 64;
+        max-width: 95%;
+        height: 16;
+        max-height: 90%;
+        background: $panel;
+        border: thick $warning;
+    }
+    #confirm-message { width: 100%; height: 1fr; }
+    #confirm-dialog Horizontal { height: auto; }
     SearchFormScreen #dialog { height: 90%; }  /* fields always overflow; give them everything */
     /* The scrollable middle of every dialog. `1fr` is what lets a short
        terminal squeeze this region while the button row below stays visible;
@@ -656,6 +724,10 @@ class OwnerDashboardApp(App[None]):
         height: 5;
         min-height: 5;
     }
+    #query-health-table, #incremental-outbox-table {
+        height: 1fr;
+        min-height: 5;
+    }
     """
 
     BINDINGS = [("q", "quit", "Quit")]
@@ -675,6 +747,7 @@ class OwnerDashboardApp(App[None]):
             yield Button("Add person", id="add-person", variant="primary")
             yield Button("Toggle allowlist", id="toggle-person", variant="error")
             yield Button("Open searches", id="open-searches")
+            yield Button("Alerts", id="open-alerts")
             yield Button("Status", id="open-status")
         yield Footer()
 
@@ -702,7 +775,7 @@ class OwnerDashboardApp(App[None]):
                 str(person.telegram_id),
                 person.display_name,
                 f"{len(profile.active_searches())}/{len(profile.searches)}",
-                f"{profile.delivery_time} {profile.timezone}",
+                _delivery_text(profile),
                 "yes" if person.active else "no",
                 key=str(person.telegram_id),
             )
@@ -773,6 +846,11 @@ class OwnerDashboardApp(App[None]):
     def _open_status(self) -> None:
         self._set_error("")
         self.push_screen(StatusScreen(self.controller))
+
+    @on(Button.Pressed, "#open-alerts")
+    def _open_alerts(self) -> None:
+        self._set_error("")
+        self.push_screen(AlertsScreen(self.controller))
 
 
 def run() -> None:

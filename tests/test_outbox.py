@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from datetime import timedelta
 
+import pytest
+
 from chc_rental.dedup import dedup_key
+from chc_rental.event_store import AlertStoreError
 from chc_rental.models import DeliveryMode
 
 from tests.test_listing_events import NOW, cycle, prepare, raw_listing
@@ -83,3 +86,36 @@ def test_immediate_alert_during_cross_midnight_quiet_hours_is_deferred(store):
     cycle(store, settings, [raw_listing("b", address="200 Main St")], alert_time)
     row = store.event_store().outbox_records()[0]
     assert row.not_before.startswith("2026-01-16T08:00:00")
+
+
+def test_only_definitely_failed_outbox_items_can_be_retried(store):
+    settings = prepare(store)
+    cycle(store, settings, [raw_listing("a")], NOW)
+    cycle(
+        store,
+        settings,
+        [raw_listing("b", address="200 Main St")],
+        NOW + timedelta(hours=3),
+    )
+    event_store = store.event_store()
+    row = event_store.outbox_records()[0]
+    with event_store.connection() as connection:
+        connection.execute(
+            "UPDATE outbox SET status='failed', last_error='definite rejection' "
+            "WHERE outbox_id=?",
+            (row.outbox_id,),
+        )
+        connection.commit()
+    event_store.retry_failed_outbox(
+        row.outbox_id, now_utc=NOW + timedelta(hours=4)
+    )
+    assert event_store.outbox_records()[0].status == "retry_wait"
+    with event_store.connection() as connection:
+        connection.execute(
+            "UPDATE outbox SET status='uncertain' WHERE outbox_id=?", (row.outbox_id,)
+        )
+        connection.commit()
+    with pytest.raises(AlertStoreError, match="not definitely failed"):
+        event_store.retry_failed_outbox(
+            row.outbox_id, now_utc=NOW + timedelta(hours=5)
+        )

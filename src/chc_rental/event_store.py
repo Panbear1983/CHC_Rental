@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 
-LATEST_ALERT_SCHEMA_VERSION = 3
+LATEST_ALERT_SCHEMA_VERSION = 4
 
 
 class AlertStoreError(RuntimeError):
@@ -923,12 +923,177 @@ class EventStore:
             rows = connection.execute(sql, params).fetchall()
         return [self._outbox_record(row) for row in rows]
 
-    def outbox_counts(self) -> dict[str, int]:
+    def retry_failed_outbox(self, outbox_id: int, *, now_utc: datetime) -> None:
+        """Move one definitely failed item to retry_wait; uncertain is forbidden."""
+        now = self._iso(now_utc)
         with self.connection() as connection:
-            rows = connection.execute(
-                "SELECT status, COUNT(*) AS count FROM outbox GROUP BY status"
-            ).fetchall()
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = connection.execute(
+                    """UPDATE outbox SET status='retry_wait', not_before=?,
+                           claimed_at=NULL, last_error=NULL
+                       WHERE outbox_id=? AND status='failed'""",
+                    (now, outbox_id),
+                )
+                if cursor.rowcount != 1:
+                    current = connection.execute(
+                        "SELECT status FROM outbox WHERE outbox_id=?", (outbox_id,)
+                    ).fetchone()
+                    state = current["status"] if current is not None else "missing"
+                    raise AlertStoreError(
+                        f"outbox {outbox_id} is not definitely failed (status {state})"
+                    )
+                connection.execute(
+                    """INSERT INTO operator_audit(
+                           action, target_type, target_id, details_json, created_at
+                       ) VALUES ('retry_failed_outbox', 'outbox', ?, '{}', ?)""",
+                    (str(outbox_id), now),
+                )
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+
+    def reset_query_baseline(
+        self, query_id: str, *, now_utc: datetime, reason: str
+    ) -> None:
+        """Make the next successful collection silent and record the action."""
+        now = self._iso(now_utc)
+        reason_text = reason.strip() or "owner requested from dashboard"
+        with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                in_flight = connection.execute(
+                    """SELECT COUNT(*) FROM source_runs
+                       WHERE query_id=? AND (
+                           status IN ('reserved', 'running') OR
+                           (status='succeeded' AND processed_at IS NULL)
+                       )""",
+                    (query_id,),
+                ).fetchone()[0]
+                if in_flight:
+                    raise AlertStoreError(
+                        "cannot reset a baseline while its source run is open or unprocessed"
+                    )
+                cursor = connection.execute(
+                    """UPDATE query_scopes SET baseline_state='reset_pending',
+                           baseline_established_at=NULL, updated_at=?
+                       WHERE query_id=?""",
+                    (now, query_id),
+                )
+                if cursor.rowcount != 1:
+                    raise AlertStoreError(f"unknown query scope: {query_id}")
+                connection.execute(
+                    """INSERT INTO operator_audit(
+                           action, target_type, target_id, details_json, created_at
+                       ) VALUES ('reset_baseline', 'query_scope', ?, ?, ?)""",
+                    (query_id, json.dumps({"reason": reason_text}), now),
+                )
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+
+    def outbox_counts(self, *, telegram_id: int | None = None) -> dict[str, int]:
+        sql = "SELECT status, COUNT(*) AS count FROM outbox"
+        params: tuple[Any, ...] = ()
+        if telegram_id is not None:
+            sql += " WHERE telegram_id=?"
+            params = (telegram_id,)
+        sql += " GROUP BY status"
+        with self.connection() as connection:
+            rows = connection.execute(sql, params).fetchall()
         return {str(row["status"]): int(row["count"]) for row in rows}
+
+    def health_snapshot(self) -> dict[str, Any]:
+        """Read-only incremental scheduler, source-run, cost, and outbox health."""
+        with self.connection() as connection:
+            scope = connection.execute(
+                """SELECT COUNT(*) AS active_scopes,
+                          SUM(CASE WHEN baseline_state!='established' THEN 1 ELSE 0 END)
+                              AS pending_baselines,
+                          MIN(next_due_at) AS next_due_at
+                   FROM query_scopes WHERE active=1"""
+            ).fetchone()
+            latest = connection.execute(
+                "SELECT * FROM source_runs ORDER BY started_at DESC, run_id DESC LIMIT 1"
+            ).fetchone()
+            success = connection.execute(
+                """SELECT finished_at FROM source_runs
+                   WHERE status='succeeded'
+                   ORDER BY finished_at DESC, run_id DESC LIMIT 1"""
+            ).fetchone()
+            running = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM source_runs WHERE status IN ('reserved', 'running')"
+                ).fetchone()[0]
+            )
+            cost = connection.execute(
+                """SELECT COALESCE(SUM(charge_usd), 0) AS known_cost,
+                          SUM(CASE WHEN charge_known=0 THEN 1 ELSE 0 END) AS unknown_charges
+                   FROM source_runs"""
+            ).fetchone()
+            query_rows = connection.execute(
+                "SELECT * FROM query_scopes WHERE active=1 ORDER BY query_id"
+            ).fetchall()
+            scopes = []
+            for row in query_rows:
+                latest_row = connection.execute(
+                    """SELECT * FROM source_runs WHERE query_id=?
+                       ORDER BY started_at DESC, run_id DESC LIMIT 1""",
+                    (row["query_id"],),
+                ).fetchone()
+                latest_scope_run = (
+                    self._source_run(latest_row) if latest_row is not None else None
+                )
+                scopes.append(
+                    {
+                        "query_id": str(row["query_id"]),
+                        "source": str(row["source"]),
+                        "baseline_state": str(row["baseline_state"]),
+                        "last_success_at": row["last_success_at"],
+                        "next_due_at": row["next_due_at"],
+                        "consecutive_failures": int(row["consecutive_failures"]),
+                        "run_id": latest_scope_run.run_id if latest_scope_run else None,
+                        "apify_run_id": (
+                            latest_scope_run.apify_run_id if latest_scope_run else None
+                        ),
+                        "run_status": (
+                            latest_scope_run.status if latest_scope_run else None
+                        ),
+                        "result_count": (
+                            latest_scope_run.result_count if latest_scope_run else None
+                        ),
+                        "truncated": (
+                            latest_scope_run.truncated if latest_scope_run else False
+                        ),
+                        "error": (
+                            latest_scope_run.error_message
+                            or latest_scope_run.error_class
+                            if latest_scope_run
+                            else None
+                        ),
+                    }
+                )
+        latest_run = self._source_run(latest) if latest is not None else None
+        return {
+            "active_scopes": int(scope["active_scopes"] or 0),
+            "pending_baselines": int(scope["pending_baselines"] or 0),
+            "next_due_at": scope["next_due_at"],
+            "running_runs": running,
+            "last_attempt_at": latest_run.started_at if latest_run else None,
+            "last_status": latest_run.status if latest_run else None,
+            "last_result_count": latest_run.result_count if latest_run else None,
+            "last_truncated": latest_run.truncated if latest_run else False,
+            "last_error": (
+                latest_run.error_message or latest_run.error_class if latest_run else None
+            ),
+            "last_success_at": success["finished_at"] if success is not None else None,
+            "known_cost_usd": float(cost["known_cost"] or 0),
+            "unknown_charges": int(cost["unknown_charges"] or 0),
+            "outbox": self.outbox_counts(),
+            "scopes": scopes,
+        }
 
     @contextmanager
     def connection(self) -> Iterator[sqlite3.Connection]:
