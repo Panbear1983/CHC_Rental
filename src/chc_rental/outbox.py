@@ -115,6 +115,7 @@ def plan_shadow_notifications(
                     key=event.identity_key,
                     listing=event.listing,
                 ).render()
+                message = "Newly observed rental (first seen by CHC)\n" + message
                 window_start, window_end = local_day_window_utc(person.profile, now_utc)
                 outcome = store.event_store().enqueue_shadow(
                     idempotency_key=_idempotency_key(event, person.telegram_id),

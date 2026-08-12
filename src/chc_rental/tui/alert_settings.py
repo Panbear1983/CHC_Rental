@@ -73,6 +73,11 @@ class IncrementalSettingsScreen(ModalScreen[Optional[dict]]):
                     value=settings.incremental_active_end,
                     id="incremental_active_end",
                 )
+                yield Label("Live-delivery canary Telegram IDs (comma-separated)")
+                yield Input(
+                    value=", ".join(map(str, settings.incremental_canary_telegram_ids)),
+                    id="incremental_canary_telegram_ids",
+                )
             with Horizontal():
                 yield Button("Save", id="submit", variant="primary")
                 yield Button("Cancel", id="cancel")
@@ -108,6 +113,9 @@ class IncrementalSettingsScreen(ModalScreen[Optional[dict]]):
             "incremental_active_end": self.query_one(
                 "#incremental_active_end", Input
             ).value,
+            "incremental_canary_telegram_ids": self.query_one(
+                "#incremental_canary_telegram_ids", Input
+            ).value,
         }
 
     def _validated(self) -> dict:
@@ -117,6 +125,11 @@ class IncrementalSettingsScreen(ModalScreen[Optional[dict]]):
             daily_budget = int(raw["zillow_daily_budget"].strip())
             results_limit = int(raw["zillow_results_limit"].strip())
             max_charge = float(raw["zillow_max_charge_usd"].strip())
+            canary_ids = [
+                int(item.strip())
+                for item in raw["incremental_canary_telegram_ids"].split(",")
+                if item.strip()
+            ]
         except ValueError as exc:
             raise ValueError("interval, limits, and costs must be valid numbers") from exc
         if raw["zillow_enabled"] and not self._settings.zillow_enabled:
@@ -138,6 +151,7 @@ class IncrementalSettingsScreen(ModalScreen[Optional[dict]]):
                 "zillow_max_charge_usd": max_charge,
                 "incremental_active_start": raw["incremental_active_start"].strip(),
                 "incremental_active_end": raw["incremental_active_end"].strip(),
+                "incremental_canary_telegram_ids": canary_ids,
             }
         )
         return {
@@ -153,6 +167,9 @@ class IncrementalSettingsScreen(ModalScreen[Optional[dict]]):
             "zillow_max_charge_usd": candidate.zillow_max_charge_usd,
             "incremental_active_start": candidate.incremental_active_start,
             "incremental_active_end": candidate.incremental_active_end,
+            "incremental_canary_telegram_ids": (
+                candidate.incremental_canary_telegram_ids
+            ),
         }
 
     @on(Input.Submitted)

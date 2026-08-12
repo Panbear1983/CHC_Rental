@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 
-LATEST_ALERT_SCHEMA_VERSION = 4
+LATEST_ALERT_SCHEMA_VERSION = 5
 
 
 class AlertStoreError(RuntimeError):
@@ -931,7 +931,8 @@ class EventStore:
             try:
                 cursor = connection.execute(
                     """UPDATE outbox SET status='retry_wait', not_before=?,
-                           claimed_at=NULL, last_error=NULL
+                           claimed_at=NULL, last_error=NULL, last_error_class=NULL,
+                           operator_alerted_at=NULL
                        WHERE outbox_id=? AND status='failed'""",
                     (now, outbox_id),
                 )
@@ -953,6 +954,256 @@ class EventStore:
             except BaseException:
                 connection.rollback()
                 raise
+
+    def outbox_listing_json(self, outbox_id: int) -> str:
+        with self.connection() as connection:
+            row = connection.execute(
+                """SELECT lv.canonical_json FROM outbox o
+                   JOIN listing_versions lv
+                     ON lv.identity_key=o.identity_key
+                    AND lv.version_hash=o.version_hash
+                   WHERE o.outbox_id=?""",
+                (outbox_id,),
+            ).fetchone()
+        if row is None:
+            raise AlertStoreError(f"outbox listing context is missing: {outbox_id}")
+        return str(row["canonical_json"])
+
+    def promote_shadow(self, outbox_id: int, *, now_utc: datetime) -> bool:
+        now = self._iso(now_utc)
+        with self.connection() as connection:
+            cursor = connection.execute(
+                """UPDATE outbox SET status='pending', last_error=NULL
+                   WHERE outbox_id=? AND status='shadow'""",
+                (outbox_id,),
+            )
+            if cursor.rowcount:
+                connection.execute(
+                    """INSERT INTO operator_audit(
+                           action, target_type, target_id, details_json, created_at
+                       ) VALUES ('promote_canary_outbox', 'outbox', ?, '{}', ?)""",
+                    (str(outbox_id), now),
+                )
+            connection.commit()
+        return cursor.rowcount == 1
+
+    def cancel_outbox(
+        self, outbox_id: int, *, now_utc: datetime, reason: str
+    ) -> bool:
+        now = self._iso(now_utc)
+        with self.connection() as connection:
+            cursor = connection.execute(
+                """UPDATE outbox SET status='cancelled', claimed_at=NULL,
+                       last_error_class='ineligible', last_error=?
+                   WHERE outbox_id=?
+                   AND status IN ('shadow', 'pending', 'sending', 'retry_wait', 'failed')""",
+                (reason[:500], outbox_id),
+            )
+            connection.commit()
+        return cursor.rowcount == 1
+
+    def release_due_retries(
+        self, *, now_utc: datetime, telegram_ids: set[int]
+    ) -> int:
+        if not telegram_ids:
+            return 0
+        now = self._iso(now_utc)
+        placeholders = ",".join("?" for _ in telegram_ids)
+        params: tuple[Any, ...] = (now, *sorted(telegram_ids))
+        with self.connection() as connection:
+            cursor = connection.execute(
+                f"""UPDATE outbox SET status='pending'
+                    WHERE status='retry_wait' AND not_before<=?
+                    AND telegram_id IN ({placeholders})""",
+                params,
+            )
+            connection.commit()
+        return cursor.rowcount
+
+    def claim_due_outbox(
+        self,
+        *,
+        now_utc: datetime,
+        telegram_ids: set[int],
+        outbox_id: int | None = None,
+    ) -> OutboxRecord | None:
+        if not telegram_ids:
+            return None
+        now = self._iso(now_utc)
+        placeholders = ",".join("?" for _ in telegram_ids)
+        params: list[Any] = [now, *sorted(telegram_ids)]
+        selected_filter = ""
+        if outbox_id is not None:
+            selected_filter = " AND outbox_id=?"
+            params.append(outbox_id)
+        with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                selected = connection.execute(
+                    f"""SELECT outbox_id FROM outbox
+                        WHERE status='pending' AND not_before<=?
+                        AND telegram_id IN ({placeholders})
+                        {selected_filter}
+                        ORDER BY not_before, outbox_id LIMIT 1""",
+                    tuple(params),
+                ).fetchone()
+                if selected is None:
+                    connection.commit()
+                    return None
+                outbox_id = int(selected["outbox_id"])
+                cursor = connection.execute(
+                    """UPDATE outbox SET status='sending', attempts=attempts+1,
+                           claimed_at=?, last_error=NULL, last_error_class=NULL
+                       WHERE outbox_id=? AND status='pending'""",
+                    (now, outbox_id),
+                )
+                if cursor.rowcount != 1:
+                    connection.rollback()
+                    return None
+                row = connection.execute(
+                    "SELECT * FROM outbox WHERE outbox_id=?", (outbox_id,)
+                ).fetchone()
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+        return self._outbox_record(row) if row is not None else None
+
+    def mark_outbox_sent(
+        self,
+        outbox_id: int,
+        *,
+        now_utc: datetime,
+        telegram_message_id: str | None,
+    ) -> None:
+        now = self._iso(now_utc)
+        with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = connection.execute(
+                    """UPDATE outbox SET status='sent', sent_at=?, claimed_at=NULL,
+                           last_error=NULL, last_error_class=NULL
+                       WHERE outbox_id=? AND status='sending'""",
+                    (now, outbox_id),
+                )
+                if cursor.rowcount != 1:
+                    raise AlertStoreError(f"outbox {outbox_id} is not sending")
+                connection.execute(
+                    """INSERT INTO delivery_receipts(
+                           outbox_id, telegram_message_id, accepted_at
+                       ) VALUES (?, ?, ?)""",
+                    (outbox_id, telegram_message_id, now),
+                )
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+
+    def mark_outbox_failure(
+        self,
+        outbox_id: int,
+        *,
+        now_utc: datetime,
+        error_class: str,
+        error_message: str,
+        retry_at_utc: datetime | None,
+        uncertain: bool = False,
+    ) -> str:
+        now = self._iso(now_utc)
+        if uncertain:
+            status = "uncertain"
+            not_before = now
+        elif retry_at_utc is not None:
+            status = "retry_wait"
+            not_before = self._iso(retry_at_utc)
+        else:
+            status = "failed"
+            not_before = now
+        with self.connection() as connection:
+            cursor = connection.execute(
+                """UPDATE outbox SET status=?, not_before=?, claimed_at=NULL,
+                       last_error_class=?, last_error=?
+                   WHERE outbox_id=? AND status='sending'""",
+                (status, not_before, error_class[:100], error_message[:500], outbox_id),
+            )
+            connection.commit()
+        if cursor.rowcount != 1:
+            raise AlertStoreError(f"outbox {outbox_id} is not sending")
+        return status
+
+    def return_outbox_to_pending(
+        self,
+        outbox_id: int,
+        *,
+        now_utc: datetime,
+        reason: str,
+        not_before_utc: datetime | None = None,
+    ) -> None:
+        now = self._iso(now_utc)
+        not_before = self._iso(not_before_utc) if not_before_utc is not None else now
+        with self.connection() as connection:
+            cursor = connection.execute(
+                """UPDATE outbox SET status='pending', not_before=?, claimed_at=NULL,
+                       last_error_class='gate_changed', last_error=?
+                   WHERE outbox_id=? AND status='sending'""",
+                (not_before, reason[:500], outbox_id),
+            )
+            connection.commit()
+        if cursor.rowcount != 1:
+            raise AlertStoreError(f"outbox {outbox_id} is not sending")
+
+    def recover_stale_sending(
+        self,
+        *,
+        now_utc: datetime,
+        stale_before_utc: datetime,
+        telegram_ids: set[int],
+    ) -> int:
+        if not telegram_ids:
+            return 0
+        now = self._iso(now_utc)
+        stale_before = self._iso(stale_before_utc)
+        placeholders = ",".join("?" for _ in telegram_ids)
+        params: tuple[Any, ...] = (
+            "worker restarted while Telegram acceptance was unknown",
+            now,
+            stale_before,
+            *sorted(telegram_ids),
+        )
+        with self.connection() as connection:
+            cursor = connection.execute(
+                f"""UPDATE outbox SET status='uncertain', claimed_at=NULL,
+                           last_error_class='stale_sending', last_error=?, updated_at=?
+                       WHERE status='sending' AND claimed_at<?
+                       AND telegram_id IN ({placeholders})""",
+                params,
+            )
+            connection.commit()
+        return cursor.rowcount
+
+    def terminal_failures_needing_alert(self) -> list[OutboxRecord]:
+        with self.connection() as connection:
+            rows = connection.execute(
+                """SELECT * FROM outbox WHERE status IN ('failed', 'uncertain')
+                   AND operator_alerted_at IS NULL ORDER BY outbox_id"""
+            ).fetchall()
+        return [self._outbox_record(row) for row in rows]
+
+    def mark_terminal_failure_alerted(
+        self, outbox_ids: list[int], *, now_utc: datetime
+    ) -> None:
+        if not outbox_ids:
+            return
+        now = self._iso(now_utc)
+        placeholders = ",".join("?" for _ in outbox_ids)
+        with self.connection() as connection:
+            connection.execute(
+                f"""UPDATE outbox SET operator_alerted_at=?
+                    WHERE outbox_id IN ({placeholders})
+                    AND status IN ('failed', 'uncertain')""",
+                (now, *outbox_ids),
+            )
+            connection.commit()
 
     def reset_query_baseline(
         self, query_id: str, *, now_utc: datetime, reason: str

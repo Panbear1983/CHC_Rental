@@ -34,7 +34,7 @@ from chc_rental.store import Store
 class PushSender(Protocol):
     """Outbound-only send boundary. Implementations must raise on failure."""
 
-    def send(self, *, telegram_id: int, text: str) -> None: ...
+    def send(self, *, telegram_id: int, text: str) -> Any: ...
 
 
 @dataclass(frozen=True)

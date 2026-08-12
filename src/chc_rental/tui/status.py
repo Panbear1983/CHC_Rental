@@ -179,7 +179,8 @@ class StatusScreen(Screen[None]):
             f"{status['interval_minutes']}m · runs {status['used_today']}/"
             f"{status['daily_budget']} ({status['remaining_today']} left) · "
             f"{status['results_limit']} rows/run · "
-            f"${status['max_charge_usd']:.2f}/run max · {status['active_window']}"
+            f"${status['max_charge_usd']:.2f}/run max · {status['active_window']} · "
+            f"canaries {status['canary_ids'] or 'none'}"
         )
         health = status.get("health")
         if not health:

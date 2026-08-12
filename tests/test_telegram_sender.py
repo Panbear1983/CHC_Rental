@@ -5,6 +5,9 @@ No test here performs network I/O; `_post` is substituted.
 
 from __future__ import annotations
 
+import io
+import urllib.error
+
 import pytest
 
 from chc_rental.notify.telegram import (
@@ -60,11 +63,12 @@ def test_send_posts_to_sendmessage_with_the_recipient(monkeypatch):
     monkeypatch.setattr(
         TelegramSender, "_post", lambda self, m, p: calls.append((m, p)) or {"message_id": 1}
     )
-    sender.send(telegram_id=111, text="hello")
+    receipt = sender.send(telegram_id=111, text="hello")
     method, payload = calls[0]
     assert method == "sendMessage"
     assert payload["chat_id"] == 111
     assert payload["text"] == "hello"
+    assert receipt.message_id == "1"
 
 
 def test_a_refused_send_raises_so_the_listing_stays_retryable(monkeypatch):
@@ -76,6 +80,43 @@ def test_a_refused_send_raises_so_the_listing_stays_retryable(monkeypatch):
     monkeypatch.setattr(TelegramSender, "_post", boom)
     with pytest.raises(TelegramSendError):
         TelegramSender(token=FAKE).send(telegram_id=999, text="hi")
+
+
+def test_http_chat_rejection_is_classified_terminal(monkeypatch):
+    def opener(request, timeout, context):
+        raise urllib.error.HTTPError(
+            request.full_url,
+            403,
+            "Forbidden",
+            {},
+            io.BytesIO(b'{"ok":false,"description":"bot was blocked"}'),
+        )
+
+    monkeypatch.setattr("urllib.request.urlopen", opener)
+    with pytest.raises(TelegramSendError) as captured:
+        TelegramSender(token=FAKE).send(telegram_id=999, text="hi")
+    assert captured.value.terminal is True
+    assert captured.value.ambiguous is False
+
+
+def test_http_rate_limit_is_definite_and_exposes_retry_after(monkeypatch):
+    def opener(request, timeout, context):
+        raise urllib.error.HTTPError(
+            request.full_url,
+            429,
+            "Too Many Requests",
+            {},
+            io.BytesIO(
+                b'{"ok":false,"description":"retry","parameters":{"retry_after":12}}'
+            ),
+        )
+
+    monkeypatch.setattr("urllib.request.urlopen", opener)
+    with pytest.raises(TelegramSendError) as captured:
+        TelegramSender(token=FAKE).send(telegram_id=999, text="hi")
+    assert captured.value.terminal is False
+    assert captured.value.ambiguous is False
+    assert captured.value.retry_after == 12
 
 
 def test_can_reach_is_false_when_the_chat_is_unknown(monkeypatch):

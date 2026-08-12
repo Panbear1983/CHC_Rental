@@ -156,6 +156,7 @@ class TuiController:
         zillow_max_charge_usd: float,
         incremental_active_start: str,
         incremental_active_end: str,
+        incremental_canary_telegram_ids: list[int],
     ) -> Settings:
         if zillow_enabled and load_apify_token(str(self.store.root / ".env")) is None:
             raise ValueError("APIFY_TOKEN is required before Zillow can be enabled")
@@ -166,6 +167,13 @@ class TuiController:
                 raise ValueError("config migration is required before incremental alerts can run")
             if not self.store.alert_migration_status().ready:
                 raise ValueError("alert-ledger migration is required before incremental alerts can run")
+        allowlist_ids = {person.telegram_id for person in self.store.load_allowlist().people}
+        unknown_canaries = set(incremental_canary_telegram_ids) - allowlist_ids
+        if unknown_canaries:
+            raise ValueError(
+                "incremental canaries must already be on the allowlist: "
+                + ", ".join(map(str, sorted(unknown_canaries)))
+            )
 
         with self.store.edit_settings() as settings:
             if zillow_enabled and not settings.zillow_enabled and not zillow_terms_confirmed:
@@ -186,6 +194,7 @@ class TuiController:
                     "zillow_max_charge_usd": zillow_max_charge_usd,
                     "incremental_active_start": incremental_active_start,
                     "incremental_active_end": incremental_active_end,
+                    "incremental_canary_telegram_ids": incremental_canary_telegram_ids,
                 }
             )
             for field in (
@@ -198,6 +207,7 @@ class TuiController:
                 "zillow_max_charge_usd",
                 "incremental_active_start",
                 "incremental_active_end",
+                "incremental_canary_telegram_ids",
             ):
                 setattr(settings, field, getattr(candidate, field))
         return self.store.load_settings()
@@ -325,6 +335,7 @@ class TuiController:
                 f"{settings.incremental_active_start}-{settings.incremental_active_end} "
                 f"{settings.scrape_timezone}"
             ),
+            "canary_ids": settings.incremental_canary_telegram_ids,
             "health": None,
         }
         status["remaining_today"] = max(

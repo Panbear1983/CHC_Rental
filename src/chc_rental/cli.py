@@ -23,6 +23,7 @@ from typing import Any, Optional, Sequence
 from uuid import uuid4
 
 from chc_rental.event_store import AlertStoreError
+from chc_rental.delivery_worker import DeliveryWorker
 from chc_rental.fetch import fetch_many_daily
 from chc_rental.incremental import IncrementalCollector
 from chc_rental.notify.telegram import build_sender
@@ -36,7 +37,7 @@ from chc_rental.store import Store, StoreError
 FIXTURE_SOURCE = "fixture"
 
 
-def _alert_owner(store: Store, env_file: str, text: str) -> None:
+def _alert_owner(store: Store, env_file: str, text: str) -> bool:
     """Best-effort Telegram alert to the operator. Must never break the run.
 
     Independent of `live_push_enabled`: that flag gates pushes to recipients,
@@ -45,13 +46,14 @@ def _alert_owner(store: Store, env_file: str, text: str) -> None:
     try:
         settings = store.load_settings()
         if not settings.owner_telegram_id:
-            return
+            return False
         sender = build_sender(env_file)
         if sender is None:
-            return
+            return False
         sender.send(telegram_id=settings.owner_telegram_id, text=f"[chc-rental] {text}")
+        return True
     except Exception:
-        pass
+        return False
 
 
 def _parse_now(value: str) -> datetime:
@@ -336,6 +338,7 @@ def _alert_operational_status(store: Store, *, env_file: str) -> dict[str, Any]:
         "remaining_today": max(0, budget - used),
         "results_limit": settings.zillow_results_limit,
         "max_charge_usd": settings.zillow_max_charge_usd,
+        "canary_ids": settings.incremental_canary_telegram_ids,
         "health": (
             store.event_store().health_snapshot()
             if payload["ledger"]["ready"]
@@ -449,6 +452,79 @@ def _cmd_alerts_cycle(args: argparse.Namespace) -> int:
     return 0 if not any(item.error for item in report.collections) else 1
 
 
+def _cmd_alerts_deliver(args: argparse.Namespace) -> int:
+    """Inspect or explicitly run the canary-only incremental outbox worker."""
+    store = Store(args.root)
+    store.initialize()
+    if not store.alert_migration_status().ready:
+        raise ValueError("alert-ledger migration is required before delivery")
+    if not args.live:
+        payload = {
+            "mode": "dry-run",
+            "outbox": store.event_store().outbox_counts(),
+            "note": "no outbox state changed and no Telegram call was made",
+        }
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return 0
+    if args.confirm_telegram_id is None:
+        raise ValueError("--live requires --confirm-telegram-id for one configured canary")
+    if args.confirm_telegram_id <= 0:
+        raise ValueError("--confirm-telegram-id must be positive")
+    if args.max_messages <= 0:
+        raise ValueError("--max-messages must be positive")
+    if args.outbox_id is not None:
+        selected = next(
+            (
+                row
+                for row in store.event_store().outbox_records()
+                if row.outbox_id == args.outbox_id
+            ),
+            None,
+        )
+        if selected is None:
+            raise ValueError(f"unknown outbox row: {args.outbox_id}")
+        if selected.telegram_id != args.confirm_telegram_id:
+            raise ValueError("the selected outbox row belongs to a different recipient")
+        if selected.status in {"sent", "uncertain", "cancelled", "failed"}:
+            raise ValueError(
+                f"outbox {selected.outbox_id} cannot be auto-delivered from status "
+                f"{selected.status}"
+            )
+    sender = build_sender(args.env_file)
+    if sender is None:
+        raise ValueError(f"no usable TELEGRAM_BOT_TOKEN in {args.env_file}")
+    now_utc = _parse_now(args.now) if args.now else datetime.now(timezone.utc)
+    with store.try_run_lock() as acquired:
+        if not acquired:
+            raise ValueError("another rental workflow is already running")
+        report = DeliveryWorker(store, sender=sender).run(
+            now_utc=now_utc,
+            telegram_ids={args.confirm_telegram_id},
+            outbox_id=args.outbox_id,
+            max_messages=args.max_messages,
+        )
+    # Never follow an ambiguous recipient send with another automatic Telegram
+    # call: the first message may already have been accepted. Definite failures
+    # may alert a distinct operator; if Peter is both recipient and owner, the
+    # dashboard remains the safe review channel for his own failed canary.
+    terminal = [
+        row
+        for row in store.event_store().terminal_failures_needing_alert()
+        if row.status == "failed"
+    ]
+    owner_id = store.load_settings().owner_telegram_id
+    if terminal and owner_id != args.confirm_telegram_id:
+        text = "incremental delivery needs review: " + ", ".join(
+            f"outbox {row.outbox_id}={row.status}" for row in terminal[:10]
+        )
+        if _alert_owner(store, args.env_file, text):
+            store.event_store().mark_terminal_failure_alerted(
+                [row.outbox_id for row in terminal], now_utc=now_utc
+            )
+    print(json.dumps(report.summary(), indent=2, sort_keys=True))
+    return 1 if report.failed or report.uncertain or report.retry_wait else 0
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(prog="chc-rental", description="CHC Rental daily runner.")
     parser.add_argument("--root", default=".", help="Data directory (default: %(default)s)")
@@ -522,6 +598,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     cycle_parser.add_argument("--now", help="Override the current instant (ISO 8601 with offset)")
     cycle_parser.add_argument("--env-file", default=".env")
     cycle_parser.set_defaults(func=_cmd_alerts_cycle)
+    deliver_parser = alerts_sub.add_parser(
+        "deliver", help="Inspect or explicitly deliver canary outbox rows"
+    )
+    deliver_parser.add_argument("--live", action="store_true")
+    deliver_parser.add_argument(
+        "--confirm-telegram-id",
+        type=int,
+        help="Explicit configured canary recipient required with --live",
+    )
+    deliver_parser.add_argument(
+        "--outbox-id", type=int, help="Promote only this shadow row before delivery"
+    )
+    deliver_parser.add_argument("--max-messages", type=int, default=1)
+    deliver_parser.add_argument("--now", help="Override instant (ISO 8601 with offset)")
+    deliver_parser.add_argument("--env-file", default=".env")
+    deliver_parser.set_defaults(func=_cmd_alerts_deliver)
 
     args = parser.parse_args(argv)
     try:

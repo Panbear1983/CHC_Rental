@@ -112,7 +112,8 @@ class AlertsScreen(Screen[None]):
             f"{'token ready' if status['token_ready'] else 'APIFY_TOKEN missing'} · "
             f"actor {status['actor']} · runs {status['used_today']}/"
             f"{status['daily_budget']} ({status['remaining_today']} left) · "
-            f"interval {status['interval_minutes']}m"
+            f"interval {status['interval_minutes']}m · "
+            f"canaries {status['canary_ids'] or 'none'}"
         )
         health = status.get("health") or {}
         for scope in health.get("scopes", []):

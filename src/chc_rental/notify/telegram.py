@@ -42,6 +42,25 @@ class TelegramSendError(RuntimeError):
     listing as seen, so it stays retryable tomorrow.
     """
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        terminal: bool = False,
+        ambiguous: bool = False,
+        retry_after: float | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.terminal = terminal
+        self.ambiguous = ambiguous
+        self.retry_after = retry_after
+
+
+@dataclass(frozen=True)
+class TelegramReceipt:
+    message_id: str | None
+    chat_id: str | None
+
 
 def _ssl_context() -> ssl.SSLContext:
     for bundle in _SYSTEM_CA_BUNDLES:
@@ -78,22 +97,49 @@ class TelegramSender:
             try:
                 body = json.loads(exc.read().decode("utf-8"))
             except Exception:
-                raise TelegramSendError(f"{method} failed with HTTP {exc.code}") from None
+                raise TelegramSendError(
+                    f"{method} failed with HTTP {exc.code}",
+                    terminal=exc.code in (400, 401, 403),
+                ) from None
+            description = (
+                str(body.get("description", "unknown error"))
+                if isinstance(body, dict)
+                else "unknown error"
+            )
+            retry_after = None
+            parameters = body.get("parameters") if isinstance(body, dict) else None
+            if isinstance(parameters, dict):
+                try:
+                    retry_after = float(parameters.get("retry_after"))
+                except (TypeError, ValueError):
+                    retry_after = None
             raise TelegramSendError(
-                f"{method} refused: {body.get('description', 'unknown error')}"
+                f"{method} refused: {description}",
+                terminal=exc.code in (400, 401, 403),
+                retry_after=retry_after,
             ) from None
         except urllib.error.URLError as exc:
             # str(exc) can include the URL, which carries the token.
-            raise TelegramSendError(f"{method} could not reach Telegram: {exc.reason}") from None
+            raise TelegramSendError(
+                f"{method} could not reach Telegram: {exc.reason}", ambiguous=True
+            ) from None
         except OSError as exc:
             # Read timeouts (TimeoutError) and socket resets surface here, not
             # as URLError; str(exc) carries no URL and therefore no token.
-            raise TelegramSendError(f"{method} failed mid-request: {exc}") from None
+            raise TelegramSendError(
+                f"{method} failed mid-request: {exc}", ambiguous=True
+            ) from None
         except ValueError:
             # json.JSONDecodeError / UnicodeDecodeError: an HTTP 200 whose body
             # is not Telegram's JSON. Callers rely on seeing only
             # TelegramSendError, so it must not escape raw.
-            raise TelegramSendError(f"{method} returned an unreadable response body") from None
+            raise TelegramSendError(
+                f"{method} returned an unreadable response body", ambiguous=True
+            ) from None
+        if not isinstance(body, dict):
+            raise TelegramSendError(
+                f"{method} returned an unreadable response body", ambiguous=True
+            )
         if not body.get("ok"):
             raise TelegramSendError(f"{method} refused: {body.get('description', 'unknown error')}")
         return body.get("result", {})
@@ -109,14 +155,28 @@ class TelegramSender:
     def whoami(self) -> dict:
         return self._post("getMe", {})
 
-    def send(self, *, telegram_id: int, text: str) -> None:
-        self._post(
+    def send(self, *, telegram_id: int, text: str) -> TelegramReceipt:
+        result = self._post(
             "sendMessage",
             {
                 "chat_id": telegram_id,
                 "text": text,
                 "disable_web_page_preview": str(self.disable_web_page_preview).lower(),
             },
+        )
+        if not isinstance(result, dict) or result.get("message_id") is None:
+            raise TelegramSendError(
+                "sendMessage succeeded without a usable message receipt",
+                ambiguous=True,
+            )
+        chat = result.get("chat") if isinstance(result, dict) else None
+        return TelegramReceipt(
+            message_id=str(result["message_id"]),
+            chat_id=(
+                str(chat["id"])
+                if isinstance(chat, dict) and chat.get("id") is not None
+                else None
+            ),
         )
 
 

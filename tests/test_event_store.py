@@ -29,7 +29,7 @@ def test_legacy_store_initialization_does_not_create_sqlite(tmp_path):
     store.initialize()
     assert store.alert_db_path.exists() is False
     status = store.alert_migration_status()
-    assert status.exists is False and status.pending_versions == (1, 2, 3, 4)
+    assert status.exists is False and status.pending_versions == (1, 2, 3, 4, 5)
     assert store.alert_db_path.exists() is False
 
 
@@ -86,6 +86,9 @@ def test_failed_first_migration_removes_the_partial_database(tmp_path):
         "BEGIN IMMEDIATE; COMMIT;", encoding="utf-8"
     )
     (migrations / "0004_never_reached.sql").write_text(
+        "BEGIN IMMEDIATE; COMMIT;", encoding="utf-8"
+    )
+    (migrations / "0005_never_reached.sql").write_text(
         "BEGIN IMMEDIATE; COMMIT;", encoding="utf-8"
     )
     database = tmp_path / "state" / "alerts.sqlite3"

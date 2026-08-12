@@ -420,6 +420,14 @@ class Store:
             "sent_at": stamp.isoformat(),
         }
         with self._locked(f"seen-{telegram_id}"):
+            path = self.seen_path(telegram_id)
+            if path.exists():
+                for line in path.read_text(encoding="utf-8").splitlines():
+                    try:
+                        if json.loads(line).get("key") == key:
+                            return
+                    except (AttributeError, json.JSONDecodeError, TypeError):
+                        continue
             self._atomic_append(self.seen_path(telegram_id), json.dumps(record, ensure_ascii=False))
 
     def mark_notified(self, telegram_id: int, *, now_utc: Optional[datetime] = None) -> None:
