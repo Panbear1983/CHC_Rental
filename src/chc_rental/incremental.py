@@ -56,6 +56,7 @@ class IncrementalCycleReport:
     planned_scopes: int = 0
     started: int = 0
     resumed: int = 0
+    recovered: int = 0
     warnings: list[str] = field(default_factory=list)
     collections: list[IncrementalCollection] = field(default_factory=list)
 
@@ -68,6 +69,7 @@ class IncrementalCycleReport:
             "planned_scopes": self.planned_scopes,
             "started": self.started,
             "resumed": self.resumed,
+            "recovered": self.recovered,
             "warnings": self.warnings,
             "collections": [item.summary() for item in self.collections],
             "records": len(self.records),
@@ -146,15 +148,31 @@ class IncrementalCollector:
             return report
 
         open_runs = self.events.open_source_runs()
+        open_run_ids = {run.run_id for run in open_runs}
         for run in open_runs:
             report.resumed += 1
             report.collections.append(self._resume(run, planned_by_id, now))
+
+        # A resumed run may have changed from open to succeeded during this
+        # cycle. Its dataset is already represented by the resume collection,
+        # so recovery is only for successes that predated this process cycle.
+        recoverable_runs = [
+            run
+            for run in self.events.unprocessed_source_runs()
+            if run.run_id not in open_run_ids
+        ]
+        for run in recoverable_runs:
+            report.recovered += 1
+            report.collections.append(self._recover_succeeded(run))
 
         if not _inside_active_window(self.settings, now):
             report.warnings.append("outside the incremental collection active window")
             return report
 
         still_open = {run.query_id for run in self.events.open_source_runs()}
+        still_open.update(
+            run.query_id for run in self.events.unprocessed_source_runs()
+        )
         starts_left = self.settings.incremental_max_new_starts_per_cycle
         for scope in self.events.due_query_scopes(now_utc=now):
             if starts_left <= 0:
@@ -396,6 +414,7 @@ class IncrementalCollector:
             truncated=truncated,
             charge_usd=remote.usage_total_usd,
             charge_known=remote.usage_total_usd is not None,
+            default_dataset_id=dataset_id,
         )
         self.events.release_query_scope(
             run.query_id,
@@ -411,4 +430,34 @@ class IncrementalCollector:
             raw_result_count=len(raw),
             truncated=truncated,
             cost_usd=remote.usage_total_usd,
+        )
+
+    def _recover_succeeded(self, run: SourceRunRecord) -> IncrementalCollection:
+        if not run.default_dataset_id:
+            return IncrementalCollection(
+                query_id=run.query_id,
+                run_id=run.run_id,
+                status="dataset_failed",
+                cost_usd=run.charge_usd,
+                error="unprocessed successful run has no dataset id",
+            )
+        try:
+            raw = self.client.get_dataset(run.default_dataset_id)
+            records = self.adapter.normalize_dataset(raw)
+        except SourceError as exc:
+            return IncrementalCollection(
+                query_id=run.query_id,
+                run_id=run.run_id,
+                status="dataset_failed",
+                cost_usd=run.charge_usd,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+        return IncrementalCollection(
+            query_id=run.query_id,
+            run_id=run.run_id,
+            status="succeeded",
+            records=records,
+            raw_result_count=len(raw),
+            truncated=run.truncated,
+            cost_usd=run.charge_usd,
         )

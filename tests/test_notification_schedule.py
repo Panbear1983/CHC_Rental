@@ -4,13 +4,17 @@ No Telegram, no daemon, no wall-clock reads: every instant is passed in
 explicitly so these tests are fully deterministic.
 """
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import pytest
 
-from chc_rental.models import Profile
-from chc_rental.notification_schedule import is_profile_due
+from chc_rental.models import DeliveryMode, Profile
+from chc_rental.notification_schedule import (
+    is_profile_due,
+    local_day_window_utc,
+    notification_not_before,
+)
 
 
 def make_profile(**overrides) -> Profile:
@@ -112,3 +116,46 @@ def test_helper_is_deterministic_for_same_inputs():
     profile = make_profile()
     now_utc = datetime(2026, 1, 15, 14, 0, tzinfo=timezone.utc)
     assert is_profile_due(profile, now_utc) == is_profile_due(profile, now_utc)
+
+
+def test_immediate_mode_outside_quiet_hours_is_due_now():
+    profile = make_profile(
+        delivery_mode=DeliveryMode.IMMEDIATE,
+        quiet_hours_start="22:00",
+        quiet_hours_end="08:00",
+        timezone="UTC",
+    )
+    now = datetime(2026, 1, 15, 12, 0, tzinfo=timezone.utc)
+    assert notification_not_before(profile, now) == now
+
+
+def test_cross_midnight_quiet_hours_defer_to_local_end():
+    profile = make_profile(
+        delivery_mode=DeliveryMode.IMMEDIATE,
+        quiet_hours_start="22:00",
+        quiet_hours_end="08:00",
+        timezone="America/New_York",
+    )
+    now = datetime(2026, 1, 16, 4, 0, tzinfo=timezone.utc)  # 23:00 prior local day
+    assert notification_not_before(profile, now) == datetime(
+        2026, 1, 16, 13, 0, tzinfo=timezone.utc
+    )
+
+
+def test_daily_mode_after_delivery_time_waits_until_tomorrow():
+    profile = make_profile(
+        delivery_mode=DeliveryMode.DAILY,
+        delivery_time="09:00",
+        timezone="UTC",
+    )
+    now = datetime(2026, 1, 15, 10, 0, tzinfo=timezone.utc)
+    assert notification_not_before(profile, now) == datetime(
+        2026, 1, 16, 9, 0, tzinfo=timezone.utc
+    )
+
+
+def test_local_day_cap_window_tracks_dst_length():
+    profile = make_profile(timezone="America/New_York")
+    now = datetime(2026, 3, 8, 16, 0, tzinfo=timezone.utc)
+    start, end = local_day_window_utc(profile, now)
+    assert end - start == timedelta(hours=23)

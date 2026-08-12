@@ -11,6 +11,7 @@ connection. The file is created only by the explicit alert migration command.
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import sqlite3
@@ -21,7 +22,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 
-LATEST_ALERT_SCHEMA_VERSION = 2
+LATEST_ALERT_SCHEMA_VERSION = 3
 
 
 class AlertStoreError(RuntimeError):
@@ -88,6 +89,56 @@ class SourceRunRecord:
     error_message: str | None
     charge_usd: float | None
     charge_known: bool
+    processed_at: str | None
+
+
+@dataclass(frozen=True)
+class ObservationInput:
+    identity_key: str
+    version_hash: str
+    canonical_json: str
+    source: str
+    source_listing_id: str | None
+    source_url: str
+    source_posted_at: str | None
+
+
+@dataclass(frozen=True)
+class ObservationOutcome:
+    identity_key: str
+    version_hash: str
+    baseline: bool
+    new_to_scope: bool
+    new_identity: bool
+    new_version: bool
+    previous_canonical_json: str | None
+    event_type: str
+
+
+@dataclass(frozen=True)
+class OutboxRecord:
+    outbox_id: int
+    idempotency_key: str
+    telegram_id: int
+    search_id: str
+    primary_search_name: str
+    matching_search_ids: tuple[str, ...]
+    identity_key: str
+    version_hash: str
+    event_type: str
+    status: str
+    message_text: str
+    not_before: str
+    attempts: int
+    last_error: str | None
+    created_at: str
+    sent_at: str | None
+
+
+@dataclass(frozen=True)
+class OutboxEnqueueResult:
+    outcome: str
+    record: OutboxRecord | None
 
 
 class EventStore:
@@ -292,6 +343,7 @@ class EventStore:
             error_message=row["error_message"],
             charge_usd=row["charge_usd"],
             charge_known=bool(row["charge_known"]),
+            processed_at=row["processed_at"],
         )
 
     def sync_query_scopes(
@@ -473,6 +525,15 @@ class EventStore:
             ).fetchall()
         return [self._source_run(row) for row in rows]
 
+    def unprocessed_source_runs(self) -> list[SourceRunRecord]:
+        with self.connection() as connection:
+            rows = connection.execute(
+                """SELECT * FROM source_runs
+                   WHERE status='succeeded' AND processed_at IS NULL
+                   ORDER BY finished_at, run_id"""
+            ).fetchall()
+        return [self._source_run(row) for row in rows]
+
     def attach_apify_run(
         self,
         run_id: str,
@@ -505,6 +566,7 @@ class EventStore:
         error_message: str | None = None,
         charge_usd: float | None = None,
         charge_known: bool = False,
+        default_dataset_id: str | None = None,
     ) -> None:
         if status not in {"succeeded", "failed", "timed_out", "cancelled"}:
             raise ValueError(f"invalid terminal source-run status: {status}")
@@ -513,7 +575,8 @@ class EventStore:
             cursor = connection.execute(
                 """UPDATE source_runs SET status=?, finished_at=?, result_count=?,
                        truncated=?, error_class=?, error_message=?, charge_usd=?,
-                       charge_known=?, updated_at=?
+                       charge_known=?, default_dataset_id=COALESCE(?, default_dataset_id),
+                       updated_at=?
                    WHERE run_id=? AND status IN ('reserved', 'running')""",
                 (
                     status,
@@ -524,6 +587,7 @@ class EventStore:
                     error_message,
                     charge_usd,
                     int(charge_known),
+                    default_dataset_id,
                     now,
                     run_id,
                 ),
@@ -531,6 +595,340 @@ class EventStore:
             connection.commit()
         if cursor.rowcount != 1:
             raise AlertStoreError(f"source run is not finishable: {run_id}")
+
+    def query_baseline_states(self) -> dict[str, str]:
+        with self.connection() as connection:
+            rows = connection.execute(
+                "SELECT query_id, baseline_state FROM query_scopes"
+            ).fetchall()
+        return {str(row["query_id"]): str(row["baseline_state"]) for row in rows}
+
+    def record_observations(
+        self,
+        *,
+        run_id: str,
+        items: list[ObservationInput],
+        now_utc: datetime,
+    ) -> list[ObservationOutcome]:
+        """Atomically persist one successful run and establish its baseline."""
+        now = self._iso(now_utc)
+        outcomes: list[ObservationOutcome] = []
+        with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                run = connection.execute(
+                    "SELECT query_id, source, status FROM source_runs WHERE run_id=?",
+                    (run_id,),
+                ).fetchone()
+                if run is None:
+                    raise AlertStoreError(f"cannot observe unknown source run: {run_id}")
+                if run["status"] != "succeeded":
+                    raise AlertStoreError(
+                        f"cannot observe non-successful source run {run_id}: {run['status']}"
+                    )
+                query_id = str(run["query_id"])
+                scope = connection.execute(
+                    "SELECT baseline_state FROM query_scopes WHERE query_id=?",
+                    (query_id,),
+                ).fetchone()
+                if scope is None:
+                    raise AlertStoreError(f"source run has no query scope: {query_id}")
+                is_baseline = scope["baseline_state"] != "established"
+
+                for item in items:
+                    persisted_event = connection.execute(
+                        """SELECT event_type FROM listing_events
+                           WHERE run_id=? AND identity_key=? AND version_hash=?""",
+                        (run_id, item.identity_key, item.version_hash),
+                    ).fetchone()
+                    if persisted_event is not None:
+                        outcomes.append(
+                            ObservationOutcome(
+                                identity_key=item.identity_key,
+                                version_hash=item.version_hash,
+                                baseline=persisted_event["event_type"] == "baseline",
+                                new_to_scope=persisted_event["event_type"] == "new",
+                                new_identity=False,
+                                new_version=False,
+                                previous_canonical_json=None,
+                                event_type=str(persisted_event["event_type"]),
+                            )
+                        )
+                        continue
+                    scope_seen = connection.execute(
+                        """SELECT 1 FROM observations o
+                           JOIN source_runs r ON r.run_id=o.run_id
+                           WHERE r.query_id=? AND o.identity_key=? LIMIT 1""",
+                        (query_id, item.identity_key),
+                    ).fetchone() is not None
+                    identity_exists = connection.execute(
+                        "SELECT 1 FROM listing_identities WHERE identity_key=?",
+                        (item.identity_key,),
+                    ).fetchone() is not None
+                    version_exists = connection.execute(
+                        """SELECT 1 FROM listing_versions
+                           WHERE identity_key=? AND version_hash=?""",
+                        (item.identity_key, item.version_hash),
+                    ).fetchone() is not None
+                    scope_version_seen = connection.execute(
+                        """SELECT 1 FROM observations o
+                           JOIN source_runs r ON r.run_id=o.run_id
+                           WHERE r.query_id=? AND o.identity_key=?
+                           AND o.version_hash=? LIMIT 1""",
+                        (query_id, item.identity_key, item.version_hash),
+                    ).fetchone() is not None
+                    previous = connection.execute(
+                        """SELECT lv.canonical_json FROM observations o
+                           JOIN source_runs r ON r.run_id=o.run_id
+                           JOIN listing_versions lv
+                             ON lv.identity_key=o.identity_key
+                            AND lv.version_hash=o.version_hash
+                           WHERE r.query_id=? AND o.identity_key=?
+                           ORDER BY o.observed_at DESC, r.started_at DESC LIMIT 1""",
+                        (query_id, item.identity_key),
+                    ).fetchone()
+                    previous_json = str(previous[0]) if previous is not None else None
+
+                    connection.execute(
+                        """INSERT INTO listing_identities(
+                               identity_key, first_observed_at, last_observed_at
+                           ) VALUES (?, ?, ?)
+                           ON CONFLICT(identity_key) DO UPDATE SET
+                               last_observed_at=excluded.last_observed_at""",
+                        (item.identity_key, now, now),
+                    )
+                    connection.execute(
+                        """INSERT INTO listing_versions(
+                               identity_key, version_hash, canonical_json,
+                               source_posted_at, first_observed_at, last_observed_at
+                           ) VALUES (?, ?, ?, ?, ?, ?)
+                           ON CONFLICT(identity_key, version_hash) DO UPDATE SET
+                               canonical_json=excluded.canonical_json,
+                               last_observed_at=excluded.last_observed_at""",
+                        (
+                            item.identity_key,
+                            item.version_hash,
+                            item.canonical_json,
+                            item.source_posted_at,
+                            now,
+                            now,
+                        ),
+                    )
+                    connection.execute(
+                        """INSERT OR IGNORE INTO observations(
+                               run_id, identity_key, version_hash, source,
+                               source_listing_id, source_url, observed_at
+                           ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            run_id,
+                            item.identity_key,
+                            item.version_hash,
+                            item.source,
+                            item.source_listing_id,
+                            item.source_url,
+                            now,
+                        ),
+                    )
+                    if is_baseline:
+                        event_type = "baseline"
+                    elif not scope_seen:
+                        event_type = "new"
+                    elif not scope_version_seen:
+                        previous_price = None
+                        if previous_json:
+                            try:
+                                previous_price = json.loads(previous_json).get("price")
+                            except (AttributeError, TypeError, ValueError):
+                                previous_price = None
+                        try:
+                            current_price = json.loads(item.canonical_json).get("price")
+                        except (AttributeError, TypeError, ValueError):
+                            current_price = None
+                        event_type = (
+                            "price_change"
+                            if previous_price != current_price
+                            else "material_change"
+                        )
+                    else:
+                        event_type = "duplicate"
+                    connection.execute(
+                        """INSERT INTO listing_events(
+                               run_id, query_id, identity_key, version_hash,
+                               event_type, created_at
+                           ) VALUES (?, ?, ?, ?, ?, ?)""",
+                        (
+                            run_id,
+                            query_id,
+                            item.identity_key,
+                            item.version_hash,
+                            event_type,
+                            now,
+                        ),
+                    )
+                    outcomes.append(
+                        ObservationOutcome(
+                            identity_key=item.identity_key,
+                            version_hash=item.version_hash,
+                            baseline=is_baseline,
+                            new_to_scope=not scope_seen,
+                            new_identity=not identity_exists,
+                            new_version=not version_exists,
+                            previous_canonical_json=previous_json,
+                            event_type=event_type,
+                        )
+                    )
+
+                if is_baseline:
+                    connection.execute(
+                        """UPDATE query_scopes SET baseline_state='established',
+                               baseline_established_at=?, updated_at=?
+                           WHERE query_id=?""",
+                        (now, now, query_id),
+                    )
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+        return outcomes
+
+    def mark_source_run_processed(self, run_id: str, *, now_utc: datetime) -> None:
+        now = self._iso(now_utc)
+        with self.connection() as connection:
+            cursor = connection.execute(
+                """UPDATE source_runs SET processed_at=?, updated_at=?
+                   WHERE run_id=? AND status='succeeded' AND processed_at IS NULL""",
+                (now, now, run_id),
+            )
+            connection.commit()
+        if cursor.rowcount not in (0, 1):  # pragma: no cover - PK makes >1 impossible
+            raise AlertStoreError(f"unexpected processed row count for {run_id}")
+
+    @staticmethod
+    def _outbox_record(row: sqlite3.Row) -> OutboxRecord:
+        return OutboxRecord(
+            outbox_id=int(row["outbox_id"]),
+            idempotency_key=str(row["idempotency_key"]),
+            telegram_id=int(row["telegram_id"]),
+            search_id=str(row["search_id"]),
+            primary_search_name=str(row["primary_search_name"]),
+            matching_search_ids=tuple(json.loads(row["matching_search_ids_json"])),
+            identity_key=str(row["identity_key"]),
+            version_hash=str(row["version_hash"]),
+            event_type=str(row["event_type"]),
+            status=str(row["status"]),
+            message_text=str(row["message_text"]),
+            not_before=str(row["not_before"]),
+            attempts=int(row["attempts"]),
+            last_error=row["last_error"],
+            created_at=str(row["created_at"]),
+            sent_at=row["sent_at"],
+        )
+
+    def enqueue_shadow(
+        self,
+        *,
+        idempotency_key: str,
+        telegram_id: int,
+        search_id: str,
+        primary_search_name: str,
+        matching_search_ids: list[str],
+        identity_key: str,
+        version_hash: str,
+        event_type: str,
+        message_text: str,
+        not_before_utc: datetime,
+        created_at_utc: datetime,
+        cap_window_start_utc: datetime,
+        cap_window_end_utc: datetime,
+        daily_cap: int,
+    ) -> OutboxEnqueueResult:
+        """Reserve one search-cap slot and insert idempotent shadow intent."""
+        created = self._iso(created_at_utc)
+        not_before = self._iso(not_before_utc)
+        window_start = self._iso(cap_window_start_utc)
+        window_end = self._iso(cap_window_end_utc)
+        with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                existing = connection.execute(
+                    "SELECT * FROM outbox WHERE idempotency_key=?",
+                    (idempotency_key,),
+                ).fetchone()
+                if existing is not None:
+                    connection.commit()
+                    return OutboxEnqueueResult(
+                        "duplicate", self._outbox_record(existing)
+                    )
+                used = int(
+                    connection.execute(
+                        """SELECT COUNT(*) FROM outbox
+                           WHERE search_id=? AND created_at>=? AND created_at<?
+                           AND status!='cancelled'""",
+                        (search_id, window_start, window_end),
+                    ).fetchone()[0]
+                )
+                if used >= daily_cap:
+                    connection.commit()
+                    return OutboxEnqueueResult("cap_reached", None)
+                cursor = connection.execute(
+                    """INSERT INTO outbox(
+                           idempotency_key, telegram_id, search_id,
+                           primary_search_name, matching_search_ids_json,
+                           identity_key, version_hash, event_type, message_text,
+                           not_before, status, created_at
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'shadow', ?)""",
+                    (
+                        idempotency_key,
+                        telegram_id,
+                        search_id,
+                        primary_search_name,
+                        json.dumps(matching_search_ids, separators=(",", ":")),
+                        identity_key,
+                        version_hash,
+                        event_type,
+                        message_text,
+                        not_before,
+                        created,
+                    ),
+                )
+                row = connection.execute(
+                    "SELECT * FROM outbox WHERE outbox_id=?", (cursor.lastrowid,)
+                ).fetchone()
+                connection.commit()
+            except sqlite3.IntegrityError:
+                connection.rollback()
+                with self.connection() as reader:
+                    row = reader.execute(
+                        "SELECT * FROM outbox WHERE idempotency_key=?",
+                        (idempotency_key,),
+                    ).fetchone()
+                if row is not None:
+                    return OutboxEnqueueResult("duplicate", self._outbox_record(row))
+                raise
+            except BaseException:
+                connection.rollback()
+                raise
+        if row is None:  # pragma: no cover - defensive after INSERT
+            raise AlertStoreError("outbox row disappeared after insert")
+        return OutboxEnqueueResult("queued", self._outbox_record(row))
+
+    def outbox_records(self, *, status: str | None = None) -> list[OutboxRecord]:
+        sql = "SELECT * FROM outbox"
+        params: tuple[Any, ...] = ()
+        if status is not None:
+            sql += " WHERE status=?"
+            params = (status,)
+        sql += " ORDER BY outbox_id"
+        with self.connection() as connection:
+            rows = connection.execute(sql, params).fetchall()
+        return [self._outbox_record(row) for row in rows]
+
+    def outbox_counts(self) -> dict[str, int]:
+        with self.connection() as connection:
+            rows = connection.execute(
+                "SELECT status, COUNT(*) AS count FROM outbox GROUP BY status"
+            ).fetchall()
+        return {str(row["status"]): int(row["count"]) for row in rows}
 
     @contextmanager
     def connection(self) -> Iterator[sqlite3.Connection]:

@@ -26,6 +26,7 @@ from chc_rental.event_store import AlertStoreError
 from chc_rental.fetch import fetch_many_daily
 from chc_rental.incremental import IncrementalCollector
 from chc_rental.notify.telegram import build_sender
+from chc_rental.outbox import process_incremental_report
 from chc_rental.pipeline import PipelineResult, deliver, plan_pushes, validate_records
 from chc_rental.sources import configured_adapters
 from chc_rental.sources.apify import ApifyClient, ApifyRunState
@@ -408,7 +409,10 @@ def _cmd_alerts_cycle(args: argparse.Namespace) -> int:
         allow_disabled=allow_disabled,
         meter_requests=meter_requests,
     ).cycle(now_utc=now_utc)
-    print(json.dumps(report.summary(), indent=2, sort_keys=True))
+    processing = process_incremental_report(store, report, now_utc=now_utc)
+    summary = report.summary()
+    summary["processing"] = processing.summary()
+    print(json.dumps(summary, indent=2, sort_keys=True))
     return 0 if not any(item.error for item in report.collections) else 1
 
 

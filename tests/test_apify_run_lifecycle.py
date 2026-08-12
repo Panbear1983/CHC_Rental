@@ -85,10 +85,18 @@ def test_apify_client_maps_auth_and_rate_errors(code, error):
 
 
 class FakeClient:
-    def __init__(self, *, start_status="RUNNING", poll_status="SUCCEEDED", raw=None):
+    def __init__(
+        self,
+        *,
+        start_status="RUNNING",
+        poll_status="SUCCEEDED",
+        raw=None,
+        start_dataset_id="dataset-1",
+    ):
         self.start_status = start_status
         self.poll_status = poll_status
         self.raw = list(raw if raw is not None else [RAW])
+        self.start_dataset_id = start_dataset_id
         self.start_calls = 0
         self.poll_calls = 0
         self.dataset_calls = 0
@@ -96,7 +104,7 @@ class FakeClient:
     def start_actor(self, actor, payload, *, max_total_charge_usd):
         self.start_calls += 1
         return ApifyRunState(
-            f"remote-{self.start_calls}", self.start_status, "dataset-1", None
+            f"remote-{self.start_calls}", self.start_status, self.start_dataset_id, None
         )
 
     def get_run(self, run_id):
@@ -173,6 +181,16 @@ def test_terminal_start_response_can_finish_in_the_same_cycle(store):
     assert client.dataset_calls == 1
 
 
+def test_terminal_poll_persists_dataset_id_discovered_after_start(store):
+    settings = prepared_store(store)
+    client = FakeClient(start_status="RUNNING", start_dataset_id=None)
+    first = collector(store, settings, client).cycle(now_utc=NOW)
+    run_id = first.collections[0].run_id
+    collector(store, settings, client).cycle(now_utc=NOW + timedelta(minutes=15))
+    persisted = store.event_store().source_run(run_id)
+    assert persisted is not None and persisted.default_dataset_id == "dataset-1"
+
+
 def test_result_limit_marks_positive_window_truncated(store):
     settings = prepared_store(store)
     client = FakeClient(start_status="SUCCEEDED", raw=[RAW])
@@ -197,6 +215,9 @@ def test_many_missed_intervals_collapse_into_one_new_start(store):
     first_client = FakeClient(start_status="SUCCEEDED")
     first = collector(store, settings, first_client).cycle(now_utc=NOW)
     assert first.started == 1
+    store.event_store().mark_source_run_processed(
+        first.collections[0].run_id, now_utc=NOW
+    )
 
     first_client.start_status = "RUNNING"
     later = collector(store, settings, first_client).cycle(now_utc=NOW + timedelta(hours=12))
