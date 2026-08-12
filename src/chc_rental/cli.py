@@ -28,7 +28,9 @@ from chc_rental.fetch import fetch_many_daily
 from chc_rental.incremental import IncrementalCollector
 from chc_rental.notify.telegram import build_sender
 from chc_rental.outbox import process_incremental_report
+from chc_rental.operations import incremental_cost_status
 from chc_rental.pipeline import PipelineResult, deliver, plan_pushes, validate_records
+from chc_rental.scheduler import IncrementalScheduler
 from chc_rental.sources import configured_adapters
 from chc_rental.sources.apify import ApifyClient, ApifyRunState
 from chc_rental.sources.zillow import ZillowRentalAdapter, load_apify_token
@@ -345,6 +347,13 @@ def _alert_operational_status(store: Store, *, env_file: str) -> dict[str, Any]:
             else None
         ),
     }
+    payload["incremental"]["cost"] = (
+        incremental_cost_status(
+            store, settings, now_utc=datetime.now(timezone.utc)
+        )
+        if payload["ledger"]["ready"]
+        else None
+    )
     return payload
 
 
@@ -437,19 +446,130 @@ def _cmd_alerts_cycle(args: argparse.Namespace) -> int:
         )
         allow_disabled = False
         meter_requests = True
-    report = IncrementalCollector(
-        store,
-        settings=settings,
-        adapter=adapter,
-        client=client,
-        allow_disabled=allow_disabled,
-        meter_requests=meter_requests,
-    ).cycle(now_utc=now_utc)
-    processing = process_incremental_report(store, report, now_utc=now_utc)
+    with store.try_run_lock() as acquired:
+        if not acquired:
+            print(json.dumps({"skipped_locked": True}, sort_keys=True))
+            return 0
+        report = IncrementalCollector(
+            store,
+            settings=settings,
+            adapter=adapter,
+            client=client,
+            allow_disabled=allow_disabled,
+            meter_requests=meter_requests,
+        ).cycle(now_utc=now_utc)
+        processing = process_incremental_report(store, report, now_utc=now_utc)
     summary = report.summary()
     summary["processing"] = processing.summary()
     print(json.dumps(summary, indent=2, sort_keys=True))
     return 0 if not any(item.error for item in report.collections) else 1
+
+
+def _cmd_alerts_tick(args: argparse.Namespace) -> int:
+    """Run one locked unattended scheduler tick or an offline fixture tick."""
+    store = Store(args.root)
+    store.initialize()
+    if not store.config_v2_status()["ready"]:
+        raise ValueError("config migration is required before an incremental tick")
+    if not store.alert_migration_status().ready:
+        raise ValueError("alert-ledger migration is required before an incremental tick")
+    if not args.live and not args.fixture:
+        print(
+            json.dumps(
+                {
+                    "mode": "dry-run",
+                    "note": "no source, outbox, backup, or Telegram state changed",
+                },
+                sort_keys=True,
+            )
+        )
+        return 0
+    if args.max_messages <= 0:
+        raise ValueError("--max-messages must be positive")
+    now_utc = _parse_now(args.now) if args.now else datetime.now(timezone.utc)
+    settings = store.load_settings()
+    env_file = args.env_file or str(store.root / ".env")
+    collector = None
+    sender = None
+    source_reason = None
+    if args.fixture:
+        raw = _load_fixture(Path(args.fixture))
+        collector = IncrementalCollector(
+            store,
+            settings=settings,
+            adapter=ZillowRentalAdapter(
+                token="fixture",
+                results_limit=max(25, len(raw) + 1),
+                bounds_resolver=lambda query: {
+                    "west": -180.0,
+                    "east": 180.0,
+                    "south": -85.0,
+                    "north": 85.0,
+                },
+            ),
+            client=_FixtureApifyClient(raw),
+            allow_disabled=True,
+            meter_requests=False,
+        )
+    else:
+        token = load_apify_token(env_file)
+        if token:
+            collector = IncrementalCollector(
+                store,
+                settings=settings,
+                adapter=ZillowRentalAdapter(
+                    token=token,
+                    actor=settings.zillow_actor,
+                    results_limit=settings.zillow_results_limit,
+                    timeout=settings.zillow_timeout_seconds,
+                    max_charge_usd=settings.zillow_max_charge_usd,
+                ),
+                client=ApifyClient(
+                    token=token, timeout=settings.zillow_timeout_seconds
+                ),
+            )
+        else:
+            source_reason = "APIFY_TOKEN is missing; no source request was attempted"
+        sender = build_sender(env_file)
+    report = IncrementalScheduler(
+        store,
+        collector=collector,
+        sender=sender,
+        source_unavailable_reason=source_reason,
+        owner_alert=(
+            None
+            if args.fixture
+            else lambda text: _alert_owner(store, env_file, text)
+        ),
+    ).tick(now_utc=now_utc, max_delivery_messages=args.max_messages)
+    print(json.dumps(report.summary(), indent=2, sort_keys=True))
+    return 1 if report.warnings and not report.skipped_locked else 0
+
+
+def _cmd_alerts_backup(args: argparse.Namespace) -> int:
+    """Create/verify a backup or perform a disposable restore drill."""
+    store = Store(args.root)
+    store.initialize()
+    if not store.alert_migration_status().ready:
+        raise ValueError("alert-ledger migration is required before backup operations")
+    events = store.event_store()
+    if args.verify:
+        payload = events.verify_backup(args.verify)
+    elif args.drill:
+        payload = events.restore_drill(args.drill)
+    else:
+        now_utc = _parse_now(args.now) if args.now else datetime.now(timezone.utc)
+        with store.try_run_lock() as acquired:
+            if not acquired:
+                raise ValueError("another rental workflow is already running")
+            path = events.create_daily_backup(now_utc=now_utc)
+            payload = {
+                "backup": str(path),
+                "verification": events.verify_backup(path),
+                "restore_drill": events.restore_drill(path),
+            }
+    print(json.dumps(payload, indent=2, sort_keys=True))
+    return 0
 
 
 def _cmd_alerts_deliver(args: argparse.Namespace) -> int:
@@ -614,6 +734,30 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     deliver_parser.add_argument("--now", help="Override instant (ISO 8601 with offset)")
     deliver_parser.add_argument("--env-file", default=".env")
     deliver_parser.set_defaults(func=_cmd_alerts_deliver)
+    tick_parser = alerts_sub.add_parser(
+        "tick", help="Run one locked incremental scheduler tick"
+    )
+    tick_mode = tick_parser.add_mutually_exclusive_group()
+    tick_mode.add_argument(
+        "--live", action="store_true", help="Use gated live Apify and Telegram transports"
+    )
+    tick_mode.add_argument("--fixture", help="Offline Zillow actor JSON fixture")
+    tick_parser.add_argument("--now", help="Override instant (ISO 8601 with offset)")
+    tick_parser.add_argument("--max-messages", type=int, default=10)
+    tick_parser.add_argument(
+        "--env-file", help="Credential file (default: ROOT/.env)"
+    )
+    tick_parser.set_defaults(func=_cmd_alerts_tick)
+    backup_parser = alerts_sub.add_parser(
+        "backup", help="Create, verify, or drill an incremental-ledger backup"
+    )
+    backup_mode = backup_parser.add_mutually_exclusive_group()
+    backup_mode.add_argument("--verify", help="Verify an existing SQLite backup")
+    backup_mode.add_argument(
+        "--drill", help="Restore an existing backup into a disposable database and verify it"
+    )
+    backup_parser.add_argument("--now", help="Override instant for daily backup naming")
+    backup_parser.set_defaults(func=_cmd_alerts_backup)
 
     args = parser.parse_args(argv)
     try:

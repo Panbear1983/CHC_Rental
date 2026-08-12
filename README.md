@@ -1,14 +1,15 @@
 # CHC_Rental
 
-A daily rental-listing scraper with a terminal dashboard. Each allowlisted person
-has one profile holding several independent saved searches; the daily run matches
-new listings against every search and pushes the **links** to that person on
-Telegram.
+A rental-listing notifier with a terminal dashboard. The preserved daily path
+combines configured sources into a digest; the disabled-by-default incremental
+path observes bounded Zillow/Apify query windows and can alert a controlled
+Telegram canary after a silent baseline.
 
-There is no database. Configuration and state are plain files, which makes both
-easy to read, back up and hand-edit.
+Human-controlled configuration remains plain YAML. Incremental run recovery,
+baselines and notification receipts use a private SQLite operational ledger;
+it is not a property database and has no historical property-search UI.
 
-Plan: `.hermes/plans/2026-08-10_210000-chc-rental-filebased-scraper.md`.
+Current plan: `.hermes/plans/2026-08-12_120000-chc-rental-incremental-apify-alerts.md`.
 
 ## Architecture note: one-way notification, no inbound poller
 
@@ -30,6 +31,8 @@ interaction of any kind.
 | 4 — TUI dashboard | **built** — saved-filter refresh plus per-source status/quota/cache visibility |
 | 5 — Telegram push | **built** — @Panbear_Buddy_bot, outbound only |
 | 6 — daily automation | **built** — hourly launchd job via tmux, daily prune, operator alerts |
+| Incremental 0–6 | **built, paused** — durable Apify runs, silent baselines, shadow outbox, canary delivery, dashboard, breaker/cost/backup operations |
+| Incremental 7 | **not activated** — controlled Peter message and 48-hour canary gate remain |
 
 `chc-rental run` combines every usable configured source into one daily pool.
 RentCast activates when `RENTCAST_API_KEY` is usable. Zillow requires both an
@@ -44,7 +47,7 @@ notices are suppressed while coverage is incomplete.
 
 ```
 config/        allowlist.yaml, settings.yaml     (gitignored: holds real Telegram IDs)
-state/         seen/, quota/, runs/, rejected/, cache/
+state/         seen/, quota/, runs/, rejected/, cache/, alerts.sqlite3
 backups/       timestamped copy taken before every config write
 examples/      allowlist.example.yaml, listings.sample.json
 ```
@@ -69,6 +72,9 @@ what keeps the allowlist rule from being bypassed.
 - `fetch.py` — daily fetch orchestration: scrape-time gate, query-aware raw
   cache, per-request budget metering, bounded 429/transient retry.
 - `cli.py` — `chc-rental init | run | prune`.
+- `incremental.py`, `events.py`, `outbox.py`, `delivery_worker.py` — durable
+  source runs, observation classification and canary-only delivery.
+- `scheduler.py`, `operations.py` — locked ticks, breaker/cost policy and health.
 - `tui/` — the owner dashboard.
 
 ## Setup
@@ -93,12 +99,15 @@ pip install -e ".[dev]"
 ./chc.sh job status      # is the hourly job loaded?
 ./chc.sh job stop|start  # unload / load it
 ./chc.sh logs -f         # follow the daily job log
+./chc.sh alerts status   # incremental gates, health, cost and queues
+./chc.sh alerts-job status # separate job; not loaded by default
 ./chc.sh help
 ```
 
-Manage the allowlist, each person's searches, their delivery time and timezone,
-and view a read-only status screen (per-source readiness, quota, cache and last
-result, plus the latest delivery run and rejected records).
+Manage the allowlist, each person's searches, their delivery mode/timezone, and
+view source readiness, quota, cache, health and the latest delivery run. The
+additive Alerts screen exposes real persisted gates, query health, canaries and
+outbox actions.
 
 The per-person preference table shows location, property types, price, bed/bath,
 square-footage and feature filters. Saving, editing, toggling or deleting a
@@ -193,3 +202,8 @@ launchctl load ~/Library/LaunchAgents/com.chcrental.daily.plist
 With no source configured the run logs "no listing source configured" and does
 nothing, rather than inventing listings. A whole-run lock also prevents a slow
 managed scrape from overlapping a scheduled or manually-started cycle.
+
+The incremental job is a separate disabled plist at
+`scripts/com.chcrental.alerts.plist`; it is not installed or loaded as part of
+the build. See [docs/INCREMENTAL_OPERATIONS.md](docs/INCREMENTAL_OPERATIONS.md)
+for shadow validation, one-row canary delivery, backups, activation and rollback.

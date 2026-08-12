@@ -396,6 +396,8 @@ class Settings(BaseModel):
     incremental_query_lease_minutes: int = 20
     incremental_max_new_starts_per_cycle: int = 1
     incremental_event_retention_days: int = 180
+    incremental_source_breaker_failures: int = 3
+    incremental_source_breaker_cooldown_minutes: int = 360
     zillow_incremental_interval_minutes: int = 180
     incremental_canary_telegram_ids: list[int] = []
     incremental_monthly_budget_usd: Optional[float] = None
@@ -432,6 +434,8 @@ class Settings(BaseModel):
         "incremental_query_lease_minutes",
         "incremental_max_new_starts_per_cycle",
         "incremental_event_retention_days",
+        "incremental_source_breaker_failures",
+        "incremental_source_breaker_cooldown_minutes",
         "zillow_incremental_interval_minutes",
         "zillow_results_limit",
         "zillow_timeout_seconds",
@@ -454,6 +458,10 @@ class Settings(BaseModel):
             raise ValueError("incremental_max_new_starts_per_cycle must be positive")
         if self.incremental_event_retention_days <= 0:
             raise ValueError("incremental_event_retention_days must be positive")
+        if self.incremental_source_breaker_failures <= 0:
+            raise ValueError("incremental_source_breaker_failures must be positive")
+        if self.incremental_source_breaker_cooldown_minutes <= 0:
+            raise ValueError("incremental_source_breaker_cooldown_minutes must be positive")
         if self.zillow_incremental_interval_minutes <= 0:
             raise ValueError("zillow_incremental_interval_minutes must be positive")
         if self.incremental_active_start == self.incremental_active_end:

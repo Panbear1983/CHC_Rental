@@ -11,9 +11,12 @@
 #   ./chc.sh check           verify the bot can reach each allowlisted person
 #   ./chc.sh prune           delete state past its retention window
 #   ./chc.sh logs [-f]       show the daily job log (-f to follow)
+#   ./chc.sh alerts ...       incremental migrate/status/tick/deliver/backup
+#   ./chc.sh alerts-logs [-f] show the incremental job log
 #   ./chc.sh job status      is the hourly launchd job loaded?
 #   ./chc.sh job start|stop  load / unload the hourly job
 #   ./chc.sh job run         run the hourly job once, right now
+#   ./chc.sh alerts-job ...   control the separate incremental LaunchAgent
 #   ./chc.sh help            this message
 #
 set -euo pipefail
@@ -25,11 +28,13 @@ CLI="$REPO/.venv/bin/chc-rental"
 
 LAUNCHD_LABEL="com.chcrental.daily"
 LAUNCHD_PLIST="$HOME/Library/LaunchAgents/${LAUNCHD_LABEL}.plist"
+ALERTS_LAUNCHD_LABEL="com.chcrental.alerts"
+ALERTS_LAUNCHD_PLIST="$HOME/Library/LaunchAgents/${ALERTS_LAUNCHD_LABEL}.plist"
 DOMAIN="gui/$(id -u)"
 
 die() { echo "chc: $*" >&2; exit 1; }
 
-usage() { sed -n '2,18p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,21p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 [[ -x "$PY" ]] || die "venv not found at $REPO/.venv — create it, then: $PY -m pip install -e ."
 
@@ -43,10 +48,18 @@ case "$cmd" in
   run|check|prune|init)
     exec "$CLI" --root "$REPO" "$cmd" "$@"
     ;;
+  alerts)
+    exec "$CLI" --root "$REPO" alerts "$@"
+    ;;
   logs)
     log="$REPO/state/daily.log"
     [[ -f "$log" ]] || die "no log yet at $log (the job has not run)"
     if [[ "${1:-}" == "-f" ]]; then exec tail -f "$log"; else exec tail -n 40 "$log"; fi
+    ;;
+  alerts-logs)
+    log="$REPO/state/alerts.log"
+    [[ -f "$log" ]] || die "no incremental log yet at $log (the alerts job has not run)"
+    if [[ "${1:-}" == "-f" ]]; then exec tail -f "$log"; else exec tail -n 60 "$log"; fi
     ;;
   job)
     action="${1:-status}"; [[ $# -gt 0 ]] && shift || true
@@ -70,6 +83,34 @@ case "$cmd" in
         ;;
       *)
         die "unknown job action '$action' (status|start|stop|run)"
+        ;;
+    esac
+    ;;
+  alerts-job)
+    action="${1:-status}"; [[ $# -gt 0 ]] && shift || true
+    case "$action" in
+      status)
+        if launchctl print "${DOMAIN}/${ALERTS_LAUNCHD_LABEL}" >/dev/null 2>&1; then
+          echo "job ${ALERTS_LAUNCHD_LABEL}: LOADED (15-minute gated tick)"
+        else
+          echo "job ${ALERTS_LAUNCHD_LABEL}: not loaded (safe default)"
+        fi
+        ;;
+      start)
+        [[ -f "$ALERTS_LAUNCHD_PLIST" ]] || die "plist not installed at $ALERTS_LAUNCHD_PLIST (copy scripts/${ALERTS_LAUNCHD_LABEL}.plist there after canary approval)"
+        launchctl enable "${DOMAIN}/${ALERTS_LAUNCHD_LABEL}"
+        launchctl bootstrap "$DOMAIN" "$ALERTS_LAUNCHD_PLIST" && echo "incremental alerts job started"
+        ;;
+      stop)
+        launchctl bootout "${DOMAIN}/${ALERTS_LAUNCHD_LABEL}" 2>/dev/null || true
+        launchctl disable "${DOMAIN}/${ALERTS_LAUNCHD_LABEL}"
+        echo "incremental alerts job stopped and disabled"
+        ;;
+      run|kick)
+        launchctl kickstart -k "${DOMAIN}/${ALERTS_LAUNCHD_LABEL}" && echo "incremental alerts tick requested (see: ./chc.sh alerts-logs)"
+        ;;
+      *)
+        die "unknown alerts-job action '$action' (status|start|stop|run)"
         ;;
     esac
     ;;

@@ -107,7 +107,7 @@ class AlertsScreen(Screen[None]):
             self.query_one("#alerts-config", Label).update(f"Unavailable: {exc}")
             return
         settings_state = "RUNNING" if status["enabled"] else "PAUSED"
-        self.query_one("#alerts-config", Label).update(
+        config_text = (
             f"{settings_state} · Zillow {'ON' if status['zillow_enabled'] else 'OFF'} · "
             f"{'token ready' if status['token_ready'] else 'APIFY_TOKEN missing'} · "
             f"actor {status['actor']} · runs {status['used_today']}/"
@@ -116,6 +116,21 @@ class AlertsScreen(Screen[None]):
             f"canaries {status['canary_ids'] or 'none'}"
         )
         health = status.get("health") or {}
+        cost = status.get("cost") or {}
+        breakers = health.get("breakers", [])
+        breaker_text = ", ".join(
+            f"{item['source']}={item['state']}" for item in breakers
+        ) or "none"
+        monthly_budget = cost.get("monthly_budget_usd")
+        budget_text = "unset" if monthly_budget is None else f"${monthly_budget:.2f}"
+        projection = cost.get("projected_monthly_cost_usd")
+        projection_text = "unknown" if projection is None else f"${projection:.2f}"
+        self.query_one("#alerts-config", Label).update(
+            f"{config_text} · breakers {breaker_text} · month "
+            f"${cost.get('known_cost_usd', 0):.2f}/{budget_text} · "
+            f"projection {projection_text} · "
+            f"cost_unknown {cost.get('cost_unknown', False)}"
+        )
         for scope in health.get("scopes", []):
             query_id = scope["query_id"]
             age = (

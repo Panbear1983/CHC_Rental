@@ -508,6 +508,7 @@ def test_incremental_settings_control_writes_real_gates_and_limits(tmp_path):
             form.query_one("#zillow_daily_budget", Input).value = "7"
             form.query_one("#zillow_results_limit", Input).value = "30"
             form.query_one("#zillow_max_charge_usd", Input).value = "0.30"
+            form.query_one("#incremental_monthly_budget_usd", Input).value = "12.50"
             form.query_one("#incremental_canary_telegram_ids", Input).value = "111"
             await pilot.click("#submit")
             await pilot.pause()
@@ -519,6 +520,7 @@ def test_incremental_settings_control_writes_real_gates_and_limits(tmp_path):
             assert saved.source_request_budget("zillow") == 7
             assert saved.zillow_results_limit == 30
             assert saved.zillow_max_charge_usd == 0.30
+            assert saved.incremental_monthly_budget_usd == 12.50
             assert saved.incremental_canary_telegram_ids == [111]
             confirmation = str(
                 app.screen.query_one("#incremental-action", Label).render()
@@ -546,6 +548,7 @@ def test_zillow_first_enable_requires_explicit_warning_confirmation(tmp_path):
             incremental_active_start="08:00",
             incremental_active_end="23:00",
             incremental_canary_telegram_ids=[],
+            incremental_monthly_budget_usd=None,
         )
     except ValueError as exc:
         assert "confirm" in str(exc)
@@ -563,6 +566,7 @@ def test_dashboard_opens_incremental_alert_operations_screen(tmp_path):
             assert isinstance(app.screen, AlertsScreen)
             state = str(app.screen.query_one("#alerts-config", Label).render())
             assert "PAUSED" in state and "APIFY_TOKEN missing" in state
+            assert "projection" in state and "breakers" in state
 
     run(scenario())
 

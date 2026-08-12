@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.chcrental.alerts</string>
+  <!-- This job is intentionally separate from com.chcrental.daily and ships
+       disabled. Installing or starting it is an explicit post-canary action.
+
+       The frequent tick is free unless a query is actually due. The runtime
+       owns the daily/monthly/source ceilings and starts at most the configured
+       number of actors. tmux preserves the Desktop TCC grant used by the
+       existing daily job; the shared run lock prevents overlap. -->
+  <key>Disabled</key><true/>
+  <key>StartInterval</key><integer>900</integer>
+  <key>RunAtLoad</key><false/>
+  <key>ProcessType</key><string>Background</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/tmux</string>
+    <string>new-session</string><string>-d</string>
+    <string>-s</string><string>chcrental-alerts</string>
+    <string>cd /Users/peter/Desktop/Old_Projects/GitHub/CHC_Rental &amp;&amp; .venv/bin/chc-rental --root /Users/peter/Desktop/Old_Projects/GitHub/CHC_Rental alerts tick --live &gt;&gt; state/alerts.log 2&gt;&amp;1</string>
+  </array>
+  <key>StandardOutPath</key><string>/Users/peter/Desktop/Old_Projects/GitHub/CHC_Rental/state/alerts-launchd.out.log</string>
+  <key>StandardErrorPath</key><string>/Users/peter/Desktop/Old_Projects/GitHub/CHC_Rental/state/alerts-launchd.err.log</string>
+</dict>
+</plist>

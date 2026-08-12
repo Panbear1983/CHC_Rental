@@ -15,6 +15,7 @@ import json
 import os
 import shutil
 import sqlite3
+import tempfile
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -22,7 +23,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 
-LATEST_ALERT_SCHEMA_VERSION = 5
+LATEST_ALERT_SCHEMA_VERSION = 6
 
 
 class AlertStoreError(RuntimeError):
@@ -139,6 +140,20 @@ class OutboxRecord:
 class OutboxEnqueueResult:
     outcome: str
     record: OutboxRecord | None
+
+
+@dataclass(frozen=True)
+class SourceBreakerRecord:
+    source: str
+    state: str
+    consecutive_failures: int
+    last_error_class: str | None
+    last_error_message: str | None
+    opened_at: str | None
+    retry_at: str | None
+    last_success_at: str | None
+    pending_alert: str | None
+    failure_alerted_at: str | None
 
 
 class EventStore:
@@ -1344,7 +1359,388 @@ class EventStore:
             "unknown_charges": int(cost["unknown_charges"] or 0),
             "outbox": self.outbox_counts(),
             "scopes": scopes,
+            "breakers": [
+                {
+                    "source": item.source,
+                    "state": item.state,
+                    "consecutive_failures": item.consecutive_failures,
+                    "last_error_class": item.last_error_class,
+                    "last_error_message": item.last_error_message,
+                    "opened_at": item.opened_at,
+                    "retry_at": item.retry_at,
+                    "last_success_at": item.last_success_at,
+                    "pending_alert": item.pending_alert,
+                }
+                for item in self.source_breakers()
+            ],
         }
+
+    @staticmethod
+    def _breaker(row: sqlite3.Row) -> SourceBreakerRecord:
+        return SourceBreakerRecord(
+            source=str(row["source"]),
+            state=str(row["state"]),
+            consecutive_failures=int(row["consecutive_failures"]),
+            last_error_class=row["last_error_class"],
+            last_error_message=row["last_error_message"],
+            opened_at=row["opened_at"],
+            retry_at=row["retry_at"],
+            last_success_at=row["last_success_at"],
+            pending_alert=row["pending_alert"],
+            failure_alerted_at=row["failure_alerted_at"],
+        )
+
+    def source_breakers(self) -> list[SourceBreakerRecord]:
+        with self.connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM source_breakers ORDER BY source"
+            ).fetchall()
+        return [self._breaker(row) for row in rows]
+
+    def source_start_allowed(self, source: str, *, now_utc: datetime) -> bool:
+        """Claim one half-open probe after cooldown; closed sources pass freely."""
+        now = self._iso(now_utc)
+        with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = connection.execute(
+                    "SELECT * FROM source_breakers WHERE source=?", (source,)
+                ).fetchone()
+                if row is None or row["state"] == "closed":
+                    connection.commit()
+                    return True
+                if row["state"] == "half_open" or not row["retry_at"]:
+                    connection.commit()
+                    return False
+                if str(row["retry_at"]) > now:
+                    connection.commit()
+                    return False
+                cursor = connection.execute(
+                    """UPDATE source_breakers SET state='half_open', updated_at=?
+                       WHERE source=? AND state='open' AND retry_at<=?""",
+                    (now, source, now),
+                )
+                connection.commit()
+                return cursor.rowcount == 1
+            except BaseException:
+                connection.rollback()
+                raise
+
+    def release_source_probe(self, source: str, *, now_utc: datetime) -> None:
+        """Return an unspent half-open probe when a local budget blocks its start."""
+        now = self._iso(now_utc)
+        with self.connection() as connection:
+            connection.execute(
+                """UPDATE source_breakers SET state='open', updated_at=?
+                   WHERE source=? AND state='half_open'""",
+                (now, source),
+            )
+            connection.commit()
+
+    def record_source_failure(
+        self,
+        source: str,
+        *,
+        now_utc: datetime,
+        error_class: str,
+        error_message: str | None,
+        threshold: int,
+        cooldown_minutes: int,
+        immediate_open: bool = False,
+    ) -> SourceBreakerRecord:
+        now = self._iso(now_utc)
+        retry_at = self._iso(now_utc + timedelta(minutes=cooldown_minutes))
+        with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = connection.execute(
+                    "SELECT * FROM source_breakers WHERE source=?", (source,)
+                ).fetchone()
+                previous_state = str(row["state"]) if row is not None else "closed"
+                previous_class = row["last_error_class"] if row is not None else None
+                previous_pending = row["pending_alert"] if row is not None else None
+                previous_alerted = row["failure_alerted_at"] if row is not None else None
+                failures = int(row["consecutive_failures"] if row is not None else 0) + 1
+                should_open = (
+                    immediate_open
+                    or failures >= threshold
+                    or previous_state in {"open", "half_open"}
+                )
+                state = "open" if should_open else "closed"
+                pending = previous_pending
+                failure_alerted_at = previous_alerted
+                opened_at = row["opened_at"] if row is not None else None
+                if failures == 1 and not should_open:
+                    pending = "failure_started"
+                    failure_alerted_at = None
+                elif should_open and previous_state == "closed":
+                    pending = "opened"
+                    failure_alerted_at = None
+                    opened_at = now
+                elif (
+                    should_open
+                    and previous_state in {"open", "half_open"}
+                    and previous_class is not None
+                    and previous_class != error_class
+                ):
+                    pending = "escalated"
+                    failure_alerted_at = None
+                connection.execute(
+                    """INSERT INTO source_breakers(
+                           source, state, consecutive_failures, last_error_class,
+                           last_error_message, opened_at, retry_at, pending_alert,
+                           failure_alerted_at, updated_at
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(source) DO UPDATE SET
+                           state=excluded.state,
+                           consecutive_failures=excluded.consecutive_failures,
+                           last_error_class=excluded.last_error_class,
+                           last_error_message=excluded.last_error_message,
+                           opened_at=excluded.opened_at,
+                           retry_at=excluded.retry_at,
+                           pending_alert=excluded.pending_alert,
+                           failure_alerted_at=excluded.failure_alerted_at,
+                           updated_at=excluded.updated_at""",
+                    (
+                        source,
+                        state,
+                        failures,
+                        error_class[:100],
+                        (error_message or "")[:500] or None,
+                        opened_at,
+                        retry_at if should_open else None,
+                        pending,
+                        failure_alerted_at,
+                        now,
+                    ),
+                )
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+        return next(item for item in self.source_breakers() if item.source == source)
+
+    def record_source_success(
+        self, source: str, *, now_utc: datetime
+    ) -> SourceBreakerRecord:
+        now = self._iso(now_utc)
+        with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                row = connection.execute(
+                    "SELECT * FROM source_breakers WHERE source=?", (source,)
+                ).fetchone()
+                recovered = bool(
+                    row is not None
+                    and int(row["consecutive_failures"]) > 0
+                    and row["failure_alerted_at"] is not None
+                )
+                connection.execute(
+                    """INSERT INTO source_breakers(
+                           source, state, consecutive_failures, last_success_at,
+                           pending_alert, updated_at
+                       ) VALUES (?, 'closed', 0, ?, ?, ?)
+                       ON CONFLICT(source) DO UPDATE SET
+                           state='closed', consecutive_failures=0,
+                           last_error_class=NULL, last_error_message=NULL,
+                           opened_at=NULL, retry_at=NULL, last_success_at=excluded.last_success_at,
+                           pending_alert=excluded.pending_alert, updated_at=excluded.updated_at""",
+                    (source, now, "recovered" if recovered else None, now),
+                )
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+        return next(item for item in self.source_breakers() if item.source == source)
+
+    def pending_source_alerts(self) -> list[SourceBreakerRecord]:
+        return [item for item in self.source_breakers() if item.pending_alert]
+
+    def acknowledge_source_alert(self, source: str, *, now_utc: datetime) -> None:
+        now = self._iso(now_utc)
+        with self.connection() as connection:
+            row = connection.execute(
+                "SELECT pending_alert FROM source_breakers WHERE source=?", (source,)
+            ).fetchone()
+            if row is None or row["pending_alert"] is None:
+                return
+            failure_alerted = (
+                now
+                if row["pending_alert"]
+                in {"failure_started", "opened", "escalated"}
+                else None
+            )
+            connection.execute(
+                """UPDATE source_breakers SET pending_alert=NULL,
+                       failure_alerted_at=?, updated_at=? WHERE source=?""",
+                (failure_alerted, now, source),
+            )
+            connection.commit()
+
+    def monthly_source_cost(self, source: str, *, now_utc: datetime) -> dict[str, Any]:
+        now = now_utc.astimezone(timezone.utc)
+        start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        if start.month == 12:
+            end = start.replace(year=start.year + 1, month=1)
+        else:
+            end = start.replace(month=start.month + 1)
+        with self.connection() as connection:
+            rows = connection.execute(
+                """SELECT charge_usd, charge_known FROM source_runs
+                   WHERE source=? AND started_at>=? AND started_at<?""",
+                (source, self._iso(start), self._iso(end)),
+            ).fetchall()
+        known_values = sorted(
+            float(row["charge_usd"])
+            for row in rows
+            if row["charge_known"] and row["charge_usd"] is not None
+        )
+        p95 = None
+        if known_values:
+            index = max(0, min(len(known_values) - 1, (95 * len(known_values) - 1) // 100))
+            p95 = known_values[index]
+        return {
+            "month": start.strftime("%Y-%m"),
+            "known_cost_usd": sum(known_values),
+            "known_runs": len(known_values),
+            "unknown_runs": sum(not bool(row["charge_known"]) for row in rows),
+            "p95_cost_usd": p95,
+        }
+
+    def create_daily_backup(self, *, now_utc: datetime) -> Path:
+        """Create or verify one consistent SQLite backup per UTC day."""
+        if not self.path.exists():
+            raise AlertStoreError("cannot back up a missing alert ledger")
+        self.backup_dir.mkdir(parents=True, exist_ok=True)
+        target = self.backup_dir / f"alerts-daily-{now_utc.astimezone(timezone.utc).date()}.sqlite3"
+        if target.exists():
+            self.verify_backup(target)
+            return target
+        fd, temp_name = tempfile.mkstemp(
+            dir=self.backup_dir, prefix=".alerts-backup-", suffix=".sqlite3"
+        )
+        os.close(fd)
+        temp = Path(temp_name)
+        try:
+            with self._connect(read_only=True) as source:
+                with sqlite3.connect(temp) as destination:
+                    source.backup(destination)
+            self.verify_backup(temp)
+            os.chmod(temp, 0o600)
+            os.replace(temp, target)
+        except BaseException:
+            temp.unlink(missing_ok=True)
+            raise
+        return target
+
+    def verify_backup(self, path: str | Path) -> dict[str, Any]:
+        backup = Path(path)
+        if not backup.is_file():
+            raise AlertStoreError(f"alert backup does not exist: {backup}")
+        try:
+            uri = f"file:{backup.resolve()}?mode=ro"
+            with sqlite3.connect(uri, uri=True, timeout=5.0) as connection:
+                integrity = self._integrity(connection)
+                version = self._current_version(connection)
+        except sqlite3.Error as exc:
+            raise AlertStoreError(f"cannot verify alert backup {backup}: {exc}") from exc
+        if integrity != "ok" or version != LATEST_ALERT_SCHEMA_VERSION:
+            raise AlertStoreError(
+                f"invalid alert backup {backup}: integrity={integrity}, version={version}"
+            )
+        return {"path": str(backup), "integrity": integrity, "version": version}
+
+    def restore_drill(self, path: str | Path) -> dict[str, Any]:
+        """Restore into a disposable database and verify it, never touching live state."""
+        verified = self.verify_backup(path)
+        fd, temp_name = tempfile.mkstemp(
+            dir=self.backup_dir, prefix=".alerts-restore-drill-", suffix=".sqlite3"
+        )
+        os.close(fd)
+        temp = Path(temp_name)
+        try:
+            with sqlite3.connect(Path(path)) as source:
+                with sqlite3.connect(temp) as destination:
+                    source.backup(destination)
+            drill = self.verify_backup(temp)
+        finally:
+            temp.unlink(missing_ok=True)
+        return {
+            "source": verified["path"],
+            "integrity": drill["integrity"],
+            "version": drill["version"],
+            "live_database_untouched": True,
+        }
+
+    def prune_history(self, *, before_utc: datetime) -> dict[str, int]:
+        """Prune completed operational history; active/problem rows are retained."""
+        before = self._iso(before_utc)
+        removed: dict[str, int] = {}
+        with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = connection.execute(
+                    """DELETE FROM delivery_receipts WHERE outbox_id IN (
+                           SELECT outbox_id FROM outbox
+                           WHERE status IN ('sent', 'cancelled') AND created_at<?
+                       )""",
+                    (before,),
+                )
+                removed["delivery_receipts"] = cursor.rowcount
+                cursor = connection.execute(
+                    """DELETE FROM outbox WHERE status IN ('sent', 'cancelled')
+                       AND created_at<?""",
+                    (before,),
+                )
+                removed["outbox"] = cursor.rowcount
+                cursor = connection.execute(
+                    """DELETE FROM source_runs WHERE finished_at<? AND (
+                           status IN ('failed', 'timed_out', 'cancelled') OR
+                           (status='succeeded' AND processed_at IS NOT NULL)
+                       )""",
+                    (before,),
+                )
+                removed["source_runs"] = cursor.rowcount
+                cursor = connection.execute(
+                    """DELETE FROM query_scopes WHERE active=0 AND retired_at<?
+                       AND NOT EXISTS (
+                           SELECT 1 FROM source_runs r
+                           WHERE r.query_id=query_scopes.query_id
+                           AND (r.status IN ('reserved', 'running') OR r.processed_at IS NULL)
+                       )""",
+                    (before,),
+                )
+                removed["query_scopes"] = cursor.rowcount
+                cursor = connection.execute(
+                    """DELETE FROM listing_versions
+                       WHERE NOT EXISTS (
+                           SELECT 1 FROM observations o
+                           WHERE o.identity_key=listing_versions.identity_key
+                           AND o.version_hash=listing_versions.version_hash
+                       ) AND NOT EXISTS (
+                           SELECT 1 FROM outbox o
+                           WHERE o.identity_key=listing_versions.identity_key
+                           AND o.version_hash=listing_versions.version_hash
+                       )"""
+                )
+                removed["listing_versions"] = cursor.rowcount
+                cursor = connection.execute(
+                    """DELETE FROM listing_identities
+                       WHERE NOT EXISTS (
+                           SELECT 1 FROM listing_versions v
+                           WHERE v.identity_key=listing_identities.identity_key
+                       )"""
+                )
+                removed["listing_identities"] = cursor.rowcount
+                cursor = connection.execute(
+                    "DELETE FROM operator_audit WHERE created_at<?", (before,)
+                )
+                removed["operator_audit"] = cursor.rowcount
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+        return removed
 
     @contextmanager
     def connection(self) -> Iterator[sqlite3.Connection]:

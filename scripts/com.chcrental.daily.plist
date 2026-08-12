@@ -18,7 +18,7 @@
     <string>/opt/homebrew/bin/tmux</string>
     <string>new-session</string><string>-d</string>
     <string>-s</string><string>chcrental-daily</string>
-    <string>cd /Users/peter/Desktop/Old_Projects/GitHub/CHC_Rental && .venv/bin/chc-rental --root /Users/peter/Desktop/Old_Projects/GitHub/CHC_Rental run --live >> state/daily.log 2>&1; .venv/bin/chc-rental --root /Users/peter/Desktop/Old_Projects/GitHub/CHC_Rental prune >> state/daily.log 2>&1</string>
+    <string>cd /Users/peter/Desktop/Old_Projects/GitHub/CHC_Rental &amp;&amp; .venv/bin/chc-rental --root /Users/peter/Desktop/Old_Projects/GitHub/CHC_Rental run --live &gt;&gt; state/daily.log 2&gt;&amp;1; .venv/bin/chc-rental --root /Users/peter/Desktop/Old_Projects/GitHub/CHC_Rental prune &gt;&gt; state/daily.log 2&gt;&amp;1</string>
   </array>
   <key>StandardOutPath</key><string>/Users/peter/Desktop/Old_Projects/GitHub/CHC_Rental/state/launchd.out.log</string>
   <key>StandardErrorPath</key><string>/Users/peter/Desktop/Old_Projects/GitHub/CHC_Rental/state/launchd.err.log</string>

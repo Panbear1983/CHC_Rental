@@ -13,6 +13,7 @@ from uuid import uuid4
 from chc_rental.models import AllowlistEntry, DeliveryMode, Profile, Search, Settings
 from chc_rental.incremental import IncrementalCollector
 from chc_rental.outbox import process_incremental_report
+from chc_rental.operations import incremental_cost_status
 from chc_rental.pipeline import PipelineResult, plan_pushes
 from chc_rental.sources.apify import ApifyClient
 from chc_rental.sources import KNOWN_SOURCES
@@ -157,6 +158,7 @@ class TuiController:
         incremental_active_start: str,
         incremental_active_end: str,
         incremental_canary_telegram_ids: list[int],
+        incremental_monthly_budget_usd: float | None,
     ) -> Settings:
         if zillow_enabled and load_apify_token(str(self.store.root / ".env")) is None:
             raise ValueError("APIFY_TOKEN is required before Zillow can be enabled")
@@ -195,6 +197,7 @@ class TuiController:
                     "incremental_active_start": incremental_active_start,
                     "incremental_active_end": incremental_active_end,
                     "incremental_canary_telegram_ids": incremental_canary_telegram_ids,
+                    "incremental_monthly_budget_usd": incremental_monthly_budget_usd,
                 }
             )
             for field in (
@@ -208,6 +211,7 @@ class TuiController:
                 "incremental_active_start",
                 "incremental_active_end",
                 "incremental_canary_telegram_ids",
+                "incremental_monthly_budget_usd",
             ):
                 setattr(settings, field, getattr(candidate, field))
         return self.store.load_settings()
@@ -377,6 +381,11 @@ class TuiController:
                     scope["age_minutes"] = None
                     scope["stale"] = True
             status["health"] = health
+            status["cost"] = incremental_cost_status(
+                self.store, settings, now_utc=datetime.now(timezone.utc)
+            )
+        else:
+            status["cost"] = None
         return status
 
     def recipient_outbox_counts(self, telegram_id: int) -> dict[str, int]:

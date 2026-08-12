@@ -126,3 +126,25 @@ quarterly terms/source review cadence and own it.
 - Rollout: fixture -> shadow collection -> shadow outbox -> dashboard control ->
   one controlled Peter notification -> 48-hour canary -> one recipient at a
   time. See `.hermes/plans/2026-08-12_120000-chc-rental-incremental-apify-alerts.md`.
+
+## 11. Incremental operations and activation — DECIDED 2026-08-12
+
+- The existing daily LaunchAgent stays intact. Incremental work has its own
+  `com.chcrental.alerts` job, which ships disabled and is not installed or
+  loaded by the build.
+- One shared whole-run lock prevents daily, manual shadow and incremental
+  scheduler overlap. Persisted Apify run IDs are resumed rather than restarted.
+- Per-run, source-daily and global-daily ceilings are hard stops. The monthly
+  ceiling is a configurable soft stop for new paid starts; running actors and
+  queued delivery still recover. Unknown charge data blocks automatic cadence
+  increases.
+- Source health uses a persisted circuit breaker. Auth failures open it
+  immediately; other failures use the configured threshold. The owner is
+  notified once at failure-streak start, on meaningful escalation/open, and on
+  recovery.
+- Incremental operational history defaults to 180 days. Problem outbox rows and
+  active query scopes are retained. The ledger is backed up daily, verified,
+  and restore-tested only into a disposable database.
+- Activation remains a separate operational decision after a controlled Peter
+  canary. This implementation does not load the job, enable the gates, or make
+  an external call by itself.

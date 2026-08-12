@@ -201,13 +201,28 @@ class StatusScreen(Screen[None]):
             f"results {health['last_result_count'] or 0}{truncated}{error}"
         )
         outbox = health["outbox"]
+        breakers = health.get("breakers", [])
+        breaker_text = ", ".join(
+            f"{item['source']}={item['state']}({item['consecutive_failures']})"
+            for item in breakers
+        ) or "none"
+        cost = status.get("cost") or {}
+        projection = cost.get("projected_monthly_cost_usd")
+        projection_text = "unknown" if projection is None else f"${projection:.2f}"
+        monthly_budget = cost.get("monthly_budget_usd")
+        monthly_budget_text = (
+            "no ceiling" if monthly_budget is None else f"${monthly_budget:.2f}"
+        )
         self.query_one("#incremental-outbox-summary", Label).update(
             f"Outbox: shadow {outbox.get('shadow', 0)} · pending "
             f"{outbox.get('pending', 0)} · retry {outbox.get('retry_wait', 0)} · "
             f"failed {outbox.get('failed', 0)} · uncertain "
             f"{outbox.get('uncertain', 0)} · sent {outbox.get('sent', 0)} · "
             f"known source cost ${health['known_cost_usd']:.2f} · "
-            f"unknown-charge runs {health['unknown_charges']}"
+            f"unknown-charge runs {health['unknown_charges']} · breakers {breaker_text} · "
+            f"month ${cost.get('known_cost_usd', 0):.2f} / "
+            f"{monthly_budget_text} · projection "
+            f"{projection_text} · cost_unknown {cost.get('cost_unknown', False)}"
         )
 
     @on(Button.Pressed, "#refresh")

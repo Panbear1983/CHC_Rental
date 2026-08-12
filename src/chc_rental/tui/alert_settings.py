@@ -63,6 +63,15 @@ class IncrementalSettingsScreen(ModalScreen[Optional[dict]]):
                 yield Input(
                     value=str(settings.zillow_max_charge_usd), id="zillow_max_charge_usd"
                 )
+                yield Label("Monthly incremental soft budget (USD; blank = unset)")
+                yield Input(
+                    value=(
+                        ""
+                        if settings.incremental_monthly_budget_usd is None
+                        else str(settings.incremental_monthly_budget_usd)
+                    ),
+                    id="incremental_monthly_budget_usd",
+                )
                 yield Label("Active-window start (HH:MM)")
                 yield Input(
                     value=settings.incremental_active_start,
@@ -107,6 +116,9 @@ class IncrementalSettingsScreen(ModalScreen[Optional[dict]]):
             "zillow_max_charge_usd": self.query_one(
                 "#zillow_max_charge_usd", Input
             ).value,
+            "incremental_monthly_budget_usd": self.query_one(
+                "#incremental_monthly_budget_usd", Input
+            ).value,
             "incremental_active_start": self.query_one(
                 "#incremental_active_start", Input
             ).value,
@@ -125,6 +137,8 @@ class IncrementalSettingsScreen(ModalScreen[Optional[dict]]):
             daily_budget = int(raw["zillow_daily_budget"].strip())
             results_limit = int(raw["zillow_results_limit"].strip())
             max_charge = float(raw["zillow_max_charge_usd"].strip())
+            monthly_text = raw["incremental_monthly_budget_usd"].strip()
+            monthly_budget = float(monthly_text) if monthly_text else None
             canary_ids = [
                 int(item.strip())
                 for item in raw["incremental_canary_telegram_ids"].split(",")
@@ -149,6 +163,7 @@ class IncrementalSettingsScreen(ModalScreen[Optional[dict]]):
                 "source_daily_request_budgets": source_budgets,
                 "zillow_results_limit": results_limit,
                 "zillow_max_charge_usd": max_charge,
+                "incremental_monthly_budget_usd": monthly_budget,
                 "incremental_active_start": raw["incremental_active_start"].strip(),
                 "incremental_active_end": raw["incremental_active_end"].strip(),
                 "incremental_canary_telegram_ids": canary_ids,
@@ -165,6 +180,9 @@ class IncrementalSettingsScreen(ModalScreen[Optional[dict]]):
             "zillow_daily_request_budget": candidate.source_request_budget("zillow"),
             "zillow_results_limit": candidate.zillow_results_limit,
             "zillow_max_charge_usd": candidate.zillow_max_charge_usd,
+            "incremental_monthly_budget_usd": (
+                candidate.incremental_monthly_budget_usd
+            ),
             "incremental_active_start": candidate.incremental_active_start,
             "incremental_active_end": candidate.incremental_active_end,
             "incremental_canary_telegram_ids": (

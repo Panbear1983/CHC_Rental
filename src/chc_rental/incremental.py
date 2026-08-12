@@ -21,7 +21,7 @@ from zoneinfo import ZoneInfo
 from chc_rental.event_store import QueryScopeRecord, SourceRunRecord
 from chc_rental.models import Settings
 from chc_rental.sources.apify import ApifyClient, ApifyRunState
-from chc_rental.sources.base import SourceError
+from chc_rental.sources.base import SourceAuthError, SourceError, SourceRateLimitError
 from chc_rental.sources.planner import PlannedSourceQuery, plan_incremental_queries
 from chc_rental.sources.zillow import ZillowRentalAdapter
 from chc_rental.store import Store
@@ -151,7 +151,9 @@ class IncrementalCollector:
         open_run_ids = {run.run_id for run in open_runs}
         for run in open_runs:
             report.resumed += 1
-            report.collections.append(self._resume(run, planned_by_id, now))
+            collection = self._resume(run, planned_by_id, now)
+            report.collections.append(collection)
+            self._record_collection_health(collection, now)
 
         # A resumed run may have changed from open to succeeded during this
         # cycle. Its dataset is already represented by the resume collection,
@@ -163,7 +165,9 @@ class IncrementalCollector:
         ]
         for run in recoverable_runs:
             report.recovered += 1
-            report.collections.append(self._recover_succeeded(run))
+            collection = self._recover_succeeded(run)
+            report.collections.append(collection)
+            self._record_collection_health(collection, now)
 
         if not _inside_active_window(self.settings, now):
             report.warnings.append("outside the incremental collection active window")
@@ -173,8 +177,37 @@ class IncrementalCollector:
         still_open.update(
             run.query_id for run in self.events.unprocessed_source_runs()
         )
+        due_scopes = [
+            scope
+            for scope in self.events.due_query_scopes(now_utc=now)
+            if scope.query_id not in still_open and scope.query_id in planned_by_id
+        ]
+        if not due_scopes:
+            return report
+        if self.meter_requests and self.settings.incremental_monthly_budget_usd is not None:
+            cost = self.events.monthly_source_cost("zillow", now_utc=now)
+            if cost["known_cost_usd"] >= self.settings.incremental_monthly_budget_usd:
+                report.warnings.append(
+                    "incremental monthly soft budget reached; no new Apify run started"
+                )
+                return report
+        if self.meter_requests and not self.events.source_start_allowed(
+            "zillow", now_utc=now
+        ):
+            report.warnings.append("Zillow source circuit breaker is open")
+            return report
         starts_left = self.settings.incremental_max_new_starts_per_cycle
-        for scope in self.events.due_query_scopes(now_utc=now):
+        breaker = next(
+            (
+                item
+                for item in self.events.source_breakers()
+                if item.source == "zillow"
+            ),
+            None,
+        )
+        if breaker is not None and breaker.state == "half_open":
+            starts_left = 1
+        for scope in due_scopes:
             if starts_left <= 0:
                 break
             if scope.query_id in still_open:
@@ -191,9 +224,15 @@ class IncrementalCollector:
                 continue
             collection = self._start(scope, planned_scope, now)
             report.collections.append(collection)
-            if collection.status != "budget_deferred":
+            self._record_collection_health(collection, now)
+            if collection.run_id is not None:
                 report.started += 1
                 starts_left -= 1
+            if any(
+                item.source == "zillow" and item.state == "open"
+                for item in self.events.source_breakers()
+            ):
+                break
         return report
 
     def _start(
@@ -260,6 +299,49 @@ class IncrementalCollector:
                 default_dataset_id=remote.default_dataset_id,
                 now_utc=now,
             )
+        except SourceAuthError as exc:
+            self.events.finish_source_run(
+                run_id,
+                status="failed",
+                now_utc=now,
+                error_class="auth",
+                error_message=f"{type(exc).__name__}: {str(exc)[:500]}",
+            )
+            self.events.release_query_scope(
+                scope.query_id,
+                now_utc=now,
+                next_due_at=now + interval,
+                succeeded=False,
+            )
+            return IncrementalCollection(
+                query_id=scope.query_id,
+                run_id=run_id,
+                status="auth_failed",
+                error=f"{type(exc).__name__}: {exc}",
+            )
+        except SourceRateLimitError as exc:
+            retry_seconds = exc.retry_after or (
+                self.settings.incremental_scheduler_tick_minutes * 60
+            )
+            self.events.finish_source_run(
+                run_id,
+                status="failed",
+                now_utc=now,
+                error_class="rate_limited",
+                error_message=f"{type(exc).__name__}: {str(exc)[:500]}",
+            )
+            self.events.release_query_scope(
+                scope.query_id,
+                now_utc=now,
+                next_due_at=now + timedelta(seconds=retry_seconds),
+                succeeded=False,
+            )
+            return IncrementalCollection(
+                query_id=scope.query_id,
+                run_id=run_id,
+                status="rate_limited",
+                error=f"{type(exc).__name__}: {exc}",
+            )
         except SourceError as exc:
             # A network error can occur after Apify accepted the run but before
             # the response reached us. Do not immediately retry this uncertain
@@ -316,6 +398,20 @@ class IncrementalCollector:
             )
         try:
             remote = self.client.get_run(run.apify_run_id)
+        except SourceAuthError as exc:
+            return IncrementalCollection(
+                query_id=run.query_id,
+                run_id=run.run_id,
+                status="auth_failed",
+                error=f"{type(exc).__name__}: {exc}",
+            )
+        except SourceRateLimitError as exc:
+            return IncrementalCollection(
+                query_id=run.query_id,
+                run_id=run.run_id,
+                status="rate_limited",
+                error=f"{type(exc).__name__}: {exc}",
+            )
         except SourceError as exc:
             # Leave the run open: a read failure says nothing about remote state.
             return IncrementalCollection(
@@ -396,6 +492,22 @@ class IncrementalCollector:
         try:
             raw = self.client.get_dataset(dataset_id)
             records = self.adapter.normalize_dataset(raw)
+        except SourceAuthError as exc:
+            return IncrementalCollection(
+                query_id=run.query_id,
+                run_id=run.run_id,
+                status="auth_failed",
+                cost_usd=remote.usage_total_usd,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+        except SourceRateLimitError as exc:
+            return IncrementalCollection(
+                query_id=run.query_id,
+                run_id=run.run_id,
+                status="rate_limited",
+                cost_usd=remote.usage_total_usd,
+                error=f"{type(exc).__name__}: {exc}",
+            )
         except SourceError as exc:
             # Dataset reads are safe to retry; leave the paid run open.
             return IncrementalCollection(
@@ -444,6 +556,22 @@ class IncrementalCollector:
         try:
             raw = self.client.get_dataset(run.default_dataset_id)
             records = self.adapter.normalize_dataset(raw)
+        except SourceAuthError as exc:
+            return IncrementalCollection(
+                query_id=run.query_id,
+                run_id=run.run_id,
+                status="auth_failed",
+                cost_usd=run.charge_usd,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+        except SourceRateLimitError as exc:
+            return IncrementalCollection(
+                query_id=run.query_id,
+                run_id=run.run_id,
+                status="rate_limited",
+                cost_usd=run.charge_usd,
+                error=f"{type(exc).__name__}: {exc}",
+            )
         except SourceError as exc:
             return IncrementalCollection(
                 query_id=run.query_id,
@@ -461,3 +589,39 @@ class IncrementalCollector:
             truncated=run.truncated,
             cost_usd=run.charge_usd,
         )
+
+    def _record_collection_health(
+        self, collection: IncrementalCollection, now: datetime
+    ) -> None:
+        if not self.meter_requests:
+            return
+        if collection.status == "succeeded":
+            self.events.record_source_success("zillow", now_utc=now)
+            return
+        if collection.status in {
+            "running",
+        }:
+            return
+        if collection.status in {"budget_deferred", "rate_limited"}:
+            self.events.release_source_probe("zillow", now_utc=now)
+            return
+        if collection.status in {
+            "failed",
+            "timed_out",
+            "cancelled",
+            "start_uncertain",
+            "dataset_failed",
+            "poll_failed",
+            "auth_failed",
+        }:
+            self.events.record_source_failure(
+                "zillow",
+                now_utc=now,
+                error_class=collection.status,
+                error_message=collection.error,
+                threshold=self.settings.incremental_source_breaker_failures,
+                cooldown_minutes=(
+                    self.settings.incremental_source_breaker_cooldown_minutes
+                ),
+                immediate_open=collection.status == "auth_failed",
+            )
