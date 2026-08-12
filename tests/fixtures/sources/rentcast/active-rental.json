@@ -1,0 +1,17 @@
+{
+  "id": "3821-Hargis-St,-Austin,-TX-78723",
+  "formattedAddress": "3821 Hargis St, Austin, TX 78723",
+  "addressLine1": "3821 Hargis St",
+  "addressLine2": "Apt 12",
+  "city": "Austin",
+  "state": "TX",
+  "zipCode": "78723",
+  "county": "Travis",
+  "propertyType": "Single Family",
+  "bedrooms": 3,
+  "bathrooms": 2,
+  "squareFootage": 1428,
+  "status": "Active",
+  "price": 2100,
+  "listedDate": "2026-01-10T00:00:00.000Z"
+}

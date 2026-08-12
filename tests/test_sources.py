@@ -10,6 +10,7 @@ import io
 import json
 import urllib.error
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
 
@@ -74,6 +75,12 @@ RAW_ZILLOW_RENTAL = {
     "area": 900,
     "homeType": "APARTMENT",
 }
+
+FIXTURE_ROOT = Path(__file__).parent / "fixtures" / "sources"
+
+
+def source_fixture(source: str, name: str) -> dict:
+    return json.loads((FIXTURE_ROOT / source / name).read_text(encoding="utf-8"))
 
 
 # --- planner ----------------------------------------------------------------
@@ -253,6 +260,45 @@ def test_zillow_rental_maps_to_a_valid_canonical_listing():
     assert listing.price == 2200 and listing.property_type.value == "apartment"
     assert listing.beds == 2 and listing.baths == 1.5 and listing.sqft == 900
     assert listing.url.startswith("https://www.zillow.com/homedetails/")
+
+
+def test_checked_in_zillow_unit_fixture_matches_the_source_contract():
+    adapter = ZillowRentalAdapter(token="secret")
+    raw = source_fixture("zillow", "unit-rental.json")
+    assert adapter._is_rental(raw) is True
+    listing = Listing.model_validate(adapter._canonical(raw))
+    assert listing.source_listing_id == "123456"
+    assert (listing.address, listing.unit, listing.price) == ("100 Main St", "4B", 2200)
+
+
+@pytest.mark.parametrize(
+    "fixture_name",
+    ["building-summary.json", "no-results-control.json", "explicit-sale.json"],
+)
+def test_checked_in_zillow_non_listing_fixtures_are_never_admitted(fixture_name):
+    adapter = ZillowRentalAdapter(token="secret")
+    assert adapter._is_rental(source_fixture("zillow", fixture_name)) is False
+
+
+def test_checked_in_malformed_zillow_fixture_is_rejected_not_fabricated():
+    adapter = ZillowRentalAdapter(token="secret")
+    raw = source_fixture("zillow", "malformed-rental.json")
+    assert adapter._is_rental(raw) is True
+    with pytest.raises(ValueError) as excinfo:
+        Listing.model_validate(adapter._canonical(raw))
+    message = str(excinfo.value)
+    assert "address" in message and "price" in message
+
+
+def test_checked_in_rentcast_fixture_matches_the_source_contract():
+    raw = source_fixture("rentcast", "active-rental.json")
+    listing = Listing.model_validate(RentCastAdapter(api_key="k")._canonical(raw))
+    assert listing.source_listing_id == raw["id"]
+    assert (listing.address, listing.unit, listing.price) == (
+        "3821 Hargis St",
+        "Apt 12",
+        2100,
+    )
 
 
 def test_zillow_adapter_filters_an_explicit_sale_record(monkeypatch):

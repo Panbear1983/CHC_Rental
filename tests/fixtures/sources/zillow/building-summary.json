@@ -1,0 +1,13 @@
+{
+  "id": "building-1",
+  "statusType": "FOR_RENT",
+  "isBuilding": true,
+  "addressStreet": "23 Menahan St # 1E",
+  "detailUrl": "https://www.zillow.com/apartments/brooklyn-ny/example/",
+  "units": [
+    {
+      "price": "$3,000+",
+      "beds": "1"
+    }
+  ]
+}

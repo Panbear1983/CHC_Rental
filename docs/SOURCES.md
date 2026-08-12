@@ -71,3 +71,22 @@ Trulia, Zumper, PadMapper and Apartments.com consumer sites remain refused:
 no appropriate public consumer API and/or terms prohibit automated collection.
 The tightly bounded managed Zillow exception above does not generalize to these
 sites or authorize a direct scraper.
+
+## Incremental-source policy — DECIDED 2026-08-12
+
+The first incremental-alert build uses only the pinned Zillow actor above. Its
+results are treated as bounded observations, not as a complete representation
+of the market:
+
+- the first usable result window establishes a silent baseline;
+- hitting `resultsLimit` marks the window truncated;
+- a truncated or failed run never proves that no matching listing exists;
+- newly observed post-baseline records may produce positive alerts after local
+  deterministic matching;
+- actor output changes are admitted only after fixture/contract tests pass;
+- credentials, login sessions, CAPTCHA solving and local bot-bypass code remain
+  outside the project.
+
+RentCast stays available during the incremental canary but is not the primary
+link/freshness source. Facebook Marketplace and Craigslist require new, explicit
+source decisions and do not enter the initial implementation.

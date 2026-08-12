@@ -1,0 +1,14 @@
+{
+  "zpid": "sale-123",
+  "detailUrl": "/homedetails/9-Sale-St-Austin-TX/sale-123_zpid/",
+  "statusType": "FOR_SALE",
+  "addressStreet": "9 Sale St",
+  "addressCity": "Austin",
+  "addressState": "TX",
+  "addressZipcode": "78701",
+  "unformattedPrice": 450000,
+  "beds": 3,
+  "baths": 2,
+  "area": 1500,
+  "homeType": "SINGLE_FAMILY"
+}

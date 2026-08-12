@@ -1,0 +1,14 @@
+{
+  "zpid": "123456",
+  "detailUrl": "/homedetails/100-Main-St-APT-4B-Austin-TX/123456_zpid/",
+  "statusType": "FOR_RENT",
+  "addressStreet": "100 Main St Apt 4B",
+  "addressCity": "Austin",
+  "addressState": "TX",
+  "addressZipcode": "78701",
+  "unformattedPrice": 2200,
+  "beds": 2,
+  "baths": 1.5,
+  "area": 900,
+  "homeType": "APARTMENT"
+}

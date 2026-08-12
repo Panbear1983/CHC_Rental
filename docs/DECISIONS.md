@@ -99,3 +99,30 @@ removing/emptying `RENTCAST_API_KEY` (or the per-source ceiling set to 0)
 stops RentCast; `zillow_enabled: false`, an absent `APIFY_TOKEN`, or a Zillow
 request budget of 0 stops Zillow. Still needed from Peter: commit to a
 quarterly terms/source review cadence and own it.
+
+## 10. Incremental alert architecture — DECIDED 2026-08-12
+
+- Product mode: add a passive, near-real-time alert path for listings first
+  observed after a silent source/query baseline. The current daily workflow
+  remains available until an explicit cutover.
+- Initial incremental source: the existing flagged Zillow/Apify route only.
+  RentCast remains installed as the licensed daily fallback/control source.
+- Facebook Marketplace and Craigslist remain refused. The Zillow exception is
+  not a general approval for Apify actors or consumer-site collection.
+- Existing profiles retain daily delivery by default. Immediate delivery must
+  be selected explicitly and initially applies only to the Peter canary.
+- Runtime state: YAML remains the owner-controlled configuration authority. A
+  local SQLite operational ledger may hold source runs, observations, baselines,
+  notification intent and delivery receipts; it is not a property database and
+  has no property-search UI.
+- Notification event for the first release: new listing only. Price changes,
+  material changes and repost candidates may be recorded but are not pushed.
+- First usable run for a source/query is silent. Failed runs cannot establish a
+  baseline; truncated runs provide positive evidence only and never justify a
+  no-results conclusion.
+- Budget truth: the current five Zillow actor starts per day are shared by all
+  active incremental query scopes. A shorter advertised freshness target is
+  blocked until measured actor cost and a monthly ceiling are approved.
+- Rollout: fixture -> shadow collection -> shadow outbox -> dashboard control ->
+  one controlled Peter notification -> 48-hour canary -> one recipient at a
+  time. See `.hermes/plans/2026-08-12_120000-chc-rental-incremental-apify-alerts.md`.
