@@ -284,6 +284,7 @@ class IncrementalCollector:
             run_id=run_id,
             query_id=scope.query_id,
             source="zillow",
+            execution_mode="live" if self.meter_requests else "fixture",
             input_fingerprint=fingerprint,
             now_utc=now,
         )

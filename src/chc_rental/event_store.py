@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 
-LATEST_ALERT_SCHEMA_VERSION = 6
+LATEST_ALERT_SCHEMA_VERSION = 7
 
 
 class AlertStoreError(RuntimeError):
@@ -78,6 +78,7 @@ class SourceRunRecord:
     run_id: str
     query_id: str
     source: str
+    execution_mode: str
     apify_run_id: str | None
     default_dataset_id: str | None
     status: str
@@ -91,6 +92,13 @@ class SourceRunRecord:
     charge_usd: float | None
     charge_known: bool
     processed_at: str | None
+
+
+@dataclass(frozen=True)
+class RolloutAttestation:
+    gate: str
+    evidence: str
+    attested_at: str
 
 
 @dataclass(frozen=True)
@@ -346,6 +354,7 @@ class EventStore:
             run_id=str(row["run_id"]),
             query_id=str(row["query_id"]),
             source=str(row["source"]),
+            execution_mode=str(row["execution_mode"]),
             apify_run_id=row["apify_run_id"],
             default_dataset_id=row["default_dataset_id"],
             status=str(row["status"]),
@@ -504,18 +513,30 @@ class EventStore:
         run_id: str,
         query_id: str,
         source: str,
+        execution_mode: str,
         input_fingerprint: str,
         now_utc: datetime,
     ) -> SourceRunRecord:
+        if execution_mode not in {"live", "fixture"}:
+            raise ValueError("source run execution mode must be live or fixture")
         now = self._iso(now_utc)
         try:
             with self.connection() as connection:
                 connection.execute(
                     """INSERT INTO source_runs(
-                           run_id, query_id, source, status, input_fingerprint,
+                           run_id, query_id, source, execution_mode, status, input_fingerprint,
                            started_at, created_at, updated_at
-                       ) VALUES (?, ?, ?, 'reserved', ?, ?, ?, ?)""",
-                    (run_id, query_id, source, input_fingerprint, now, now, now),
+                       ) VALUES (?, ?, ?, ?, 'reserved', ?, ?, ?, ?)""",
+                    (
+                        run_id,
+                        query_id,
+                        source,
+                        execution_mode,
+                        input_fingerprint,
+                        now,
+                        now,
+                        now,
+                    ),
                 )
                 connection.commit()
         except sqlite3.IntegrityError as exc:
@@ -1297,7 +1318,7 @@ class EventStore:
             cost = connection.execute(
                 """SELECT COALESCE(SUM(charge_usd), 0) AS known_cost,
                           SUM(CASE WHEN charge_known=0 THEN 1 ELSE 0 END) AS unknown_charges
-                   FROM source_runs"""
+                   FROM source_runs WHERE execution_mode='live'"""
             ).fetchone()
             query_rows = connection.execute(
                 "SELECT * FROM query_scopes WHERE active=1 ORDER BY query_id"
@@ -1587,7 +1608,8 @@ class EventStore:
         with self.connection() as connection:
             rows = connection.execute(
                 """SELECT charge_usd, charge_known FROM source_runs
-                   WHERE source=? AND started_at>=? AND started_at<?""",
+                   WHERE source=? AND execution_mode='live'
+                   AND started_at>=? AND started_at<?""",
                 (source, self._iso(start), self._iso(end)),
             ).fetchall()
         known_values = sorted(
@@ -1606,6 +1628,209 @@ class EventStore:
             "unknown_runs": sum(not bool(row["charge_known"]) for row in rows),
             "p95_cost_usd": p95,
         }
+
+    def source_rollout_metrics(self, source: str) -> dict[str, Any]:
+        """Return retained duration/cost/coverage evidence for rollout gates."""
+        with self.connection() as connection:
+            rows = connection.execute(
+                """SELECT started_at, finished_at, status, result_count, truncated,
+                          charge_usd, charge_known
+                   FROM source_runs
+                   WHERE source=? AND execution_mode='live' ORDER BY started_at""",
+                (source,),
+            ).fetchall()
+        durations: list[float] = []
+        known_costs: list[float] = []
+        for row in rows:
+            if row["finished_at"]:
+                started = datetime.fromisoformat(str(row["started_at"]).replace("Z", "+00:00"))
+                finished = datetime.fromisoformat(
+                    str(row["finished_at"]).replace("Z", "+00:00")
+                )
+                durations.append(max(0.0, (finished - started).total_seconds()))
+            if row["charge_known"] and row["charge_usd"] is not None:
+                known_costs.append(float(row["charge_usd"]))
+
+        def p95(values: list[float]) -> float | None:
+            if not values:
+                return None
+            ordered = sorted(values)
+            index = max(0, min(len(ordered) - 1, (95 * len(ordered) - 1) // 100))
+            return ordered[index]
+
+        return {
+            "retained_runs": len(rows),
+            "successful_runs": sum(row["status"] == "succeeded" for row in rows),
+            "failed_runs": sum(
+                row["status"] in {"failed", "timed_out", "cancelled"}
+                for row in rows
+            ),
+            "known_cost_runs": len(known_costs),
+            "unknown_cost_runs": sum(not bool(row["charge_known"]) for row in rows),
+            "p95_cost_usd": p95(known_costs),
+            "p95_duration_seconds": p95(durations),
+            "truncated_runs": sum(bool(row["truncated"]) for row in rows),
+            "last_result_count": rows[-1]["result_count"] if rows else None,
+            "last_success_at": next(
+                (
+                    row["finished_at"]
+                    for row in reversed(rows)
+                    if row["status"] == "succeeded"
+                ),
+                None,
+            ),
+        }
+
+    def record_scheduler_tick(
+        self,
+        *,
+        mode: str,
+        status: str,
+        source_started: int,
+        source_succeeded: int,
+        source_failed: int,
+        delivery_sent: int,
+        delivery_failed: int,
+        delivery_uncertain: int,
+        warning_count: int,
+        details: dict[str, Any],
+        now_utc: datetime,
+    ) -> int:
+        if mode not in {"live", "fixture", "test"}:
+            raise ValueError("scheduler tick mode must be live, fixture, or test")
+        if status not in {"ok", "degraded"}:
+            raise ValueError("scheduler tick status must be ok or degraded")
+        now = self._iso(now_utc)
+        with self.connection() as connection:
+            cursor = connection.execute(
+                """INSERT INTO scheduler_ticks(
+                       mode, status, source_started, source_succeeded,
+                       source_failed, delivery_sent, delivery_failed,
+                       delivery_uncertain, warning_count, details_json, created_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    mode,
+                    status,
+                    source_started,
+                    source_succeeded,
+                    source_failed,
+                    delivery_sent,
+                    delivery_failed,
+                    delivery_uncertain,
+                    warning_count,
+                    json.dumps(details, sort_keys=True, default=str),
+                    now,
+                ),
+            )
+            connection.commit()
+            return int(cursor.lastrowid)
+
+    def scheduler_tick_window(
+        self, *, mode: str, since_utc: datetime
+    ) -> dict[str, Any]:
+        since = self._iso(since_utc)
+        with self.connection() as connection:
+            all_bounds = connection.execute(
+                """SELECT COUNT(*) AS count, MIN(created_at) AS first_at,
+                          MAX(created_at) AS last_at
+                   FROM scheduler_ticks WHERE mode=?""",
+                (mode,),
+            ).fetchone()
+            rows = connection.execute(
+                """SELECT * FROM scheduler_ticks
+                   WHERE mode=? AND created_at>=? ORDER BY created_at, tick_id""",
+                (mode, since),
+            ).fetchall()
+        timestamps = [
+            datetime.fromisoformat(str(row["created_at"]).replace("Z", "+00:00"))
+            for row in rows
+        ]
+        gaps = [
+            (right - left).total_seconds() / 60
+            for left, right in zip(timestamps, timestamps[1:])
+        ]
+        return {
+            "total_ticks": int(all_bounds["count"] or 0),
+            "first_tick_at": all_bounds["first_at"],
+            "last_tick_at": all_bounds["last_at"],
+            "window_ticks": len(rows),
+            "window_degraded": sum(row["status"] == "degraded" for row in rows),
+            "window_source_failures": sum(int(row["source_failed"]) for row in rows),
+            "window_delivery_failures": sum(int(row["delivery_failed"]) for row in rows),
+            "window_uncertain": sum(int(row["delivery_uncertain"]) for row in rows),
+            "max_gap_minutes": max(gaps) if gaps else None,
+        }
+
+    def rollout_attestations(self) -> dict[str, RolloutAttestation]:
+        with self.connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM rollout_attestations ORDER BY gate"
+            ).fetchall()
+        return {
+            str(row["gate"]): RolloutAttestation(
+                gate=str(row["gate"]),
+                evidence=str(row["evidence"]),
+                attested_at=str(row["attested_at"]),
+            )
+            for row in rows
+        }
+
+    def attest_rollout_gate(
+        self, gate: str, *, evidence: str, now_utc: datetime
+    ) -> RolloutAttestation:
+        gate_name = gate.strip()
+        evidence_text = evidence.strip()
+        if not gate_name or not evidence_text:
+            raise ValueError("rollout gate and evidence must not be blank")
+        now = self._iso(now_utc)
+        with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                connection.execute(
+                    """INSERT INTO rollout_attestations(gate, evidence, attested_at)
+                       VALUES (?, ?, ?)
+                       ON CONFLICT(gate) DO UPDATE SET
+                           evidence=excluded.evidence,
+                           attested_at=excluded.attested_at""",
+                    (gate_name[:100], evidence_text[:500], now),
+                )
+                connection.execute(
+                    """INSERT INTO operator_audit(
+                           action, target_type, target_id, details_json, created_at
+                       ) VALUES ('attest_rollout_gate', 'rollout_gate', ?, ?, ?)""",
+                    (
+                        gate_name[:100],
+                        json.dumps({"evidence": evidence_text[:500]}),
+                        now,
+                    ),
+                )
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+        return self.rollout_attestations()[gate_name[:100]]
+
+    def clear_rollout_attestation(self, gate: str, *, now_utc: datetime) -> bool:
+        gate_name = gate.strip()
+        now = self._iso(now_utc)
+        with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = connection.execute(
+                    "DELETE FROM rollout_attestations WHERE gate=?", (gate_name,)
+                )
+                if cursor.rowcount:
+                    connection.execute(
+                        """INSERT INTO operator_audit(
+                               action, target_type, target_id, details_json, created_at
+                           ) VALUES ('clear_rollout_gate', 'rollout_gate', ?, '{}', ?)""",
+                        (gate_name, now),
+                    )
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+        return bool(cursor.rowcount)
 
     def create_daily_backup(self, *, now_utc: datetime) -> Path:
         """Create or verify one consistent SQLite backup per UTC day."""
@@ -1732,6 +1957,10 @@ class EventStore:
                        )"""
                 )
                 removed["listing_identities"] = cursor.rowcount
+                cursor = connection.execute(
+                    "DELETE FROM scheduler_ticks WHERE created_at<?", (before,)
+                )
+                removed["scheduler_ticks"] = cursor.rowcount
                 cursor = connection.execute(
                     "DELETE FROM operator_audit WHERE created_at<?", (before,)
                 )

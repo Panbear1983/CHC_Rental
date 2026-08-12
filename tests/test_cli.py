@@ -58,7 +58,7 @@ def test_alert_status_is_read_only_and_reports_pending_migrations(tmp_path, caps
     assert cli.main(["--root", str(tmp_path), "alerts", "status", "--json"]) == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["config"]["ready"] is False
-    assert payload["ledger"]["pending_versions"] == [1, 2, 3, 4, 5, 6]
+    assert payload["ledger"]["pending_versions"] == [1, 2, 3, 4, 5, 6, 7]
     assert payload["incremental"]["health"] is None
     assert payload["incremental"]["token_ready"] is False
     assert (tmp_path / "state" / "alerts.sqlite3").exists() is False

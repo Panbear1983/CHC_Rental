@@ -14,6 +14,7 @@ from chc_rental.store import Store
 
 @dataclass
 class SchedulerReport:
+    tick_id: int | None = None
     skipped_locked: bool = False
     source: dict[str, Any] | None = None
     processing: dict[str, Any] | None = None
@@ -24,6 +25,7 @@ class SchedulerReport:
 
     def summary(self) -> dict[str, Any]:
         return {
+            "tick_id": self.tick_id,
             "skipped_locked": self.skipped_locked,
             "source": self.source,
             "processing": self.processing,
@@ -43,12 +45,62 @@ class IncrementalScheduler:
         sender: IncrementalSender | None,
         owner_alert: Callable[[str], bool] | None = None,
         source_unavailable_reason: str | None = None,
+        runtime_mode: str = "test",
     ) -> None:
         self.store = store
         self.collector = collector
         self.sender = sender
         self.owner_alert = owner_alert
         self.source_unavailable_reason = source_unavailable_reason
+        if runtime_mode not in {"live", "fixture", "test"}:
+            raise ValueError("scheduler runtime mode must be live, fixture, or test")
+        self.runtime_mode = runtime_mode
+
+    @staticmethod
+    def _expected_source_warning(message: str) -> bool:
+        return message == "outside the incremental collection active window"
+
+    def _record_tick(self, now: datetime, report: SchedulerReport) -> None:
+        source = report.source or {}
+        collections = source.get("collections") or []
+        source_failed = sum(
+            item.get("status")
+            not in {"succeeded", "running", "budget_deferred"}
+            for item in collections
+        )
+        delivery = report.delivery or {}
+        delivery_failed = int(delivery.get("failed", 0)) + int(
+            delivery.get("retry_wait", 0)
+        )
+        delivery_uncertain = int(delivery.get("uncertain", 0))
+        source_warnings = [
+            str(item)
+            for item in source.get("warnings", [])
+            if not self._expected_source_warning(str(item))
+        ]
+        warning_count = len(report.warnings) + len(source_warnings)
+        degraded = bool(
+            warning_count or source_failed or delivery_failed or delivery_uncertain
+        )
+        report.tick_id = self.store.event_store().record_scheduler_tick(
+            mode=self.runtime_mode,
+            status="degraded" if degraded else "ok",
+            source_started=int(source.get("started", 0)),
+            source_succeeded=sum(
+                item.get("status") == "succeeded" for item in collections
+            ),
+            source_failed=source_failed,
+            delivery_sent=int(delivery.get("sent", 0)),
+            delivery_failed=delivery_failed,
+            delivery_uncertain=delivery_uncertain,
+            warning_count=warning_count,
+            details={
+                "source_warnings": source_warnings,
+                "scheduler_warnings": report.warnings,
+                "source_statuses": [item.get("status") for item in collections],
+            },
+            now_utc=now,
+        )
 
     def _alert_operational_changes(self, now: datetime, report: SchedulerReport) -> None:
         events = self.store.event_store()
@@ -161,4 +213,10 @@ class IncrementalScheduler:
             report.pruned.update(
                 {f"incremental_{key}": value for key, value in incremental_removed.items()}
             )
+            try:
+                self._record_tick(now, report)
+            except Exception as exc:
+                report.warnings.append(
+                    f"scheduler evidence write failed: {type(exc).__name__}: {exc}"
+                )
         return report

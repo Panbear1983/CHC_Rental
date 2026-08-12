@@ -32,7 +32,7 @@ interaction of any kind.
 | 5 — Telegram push | **built** — @Panbear_Buddy_bot, outbound only |
 | 6 — daily automation | **built** — hourly launchd job via tmux, daily prune, operator alerts |
 | Incremental 0–6 | **built, paused** — durable Apify runs, silent baselines, shadow outbox, canary delivery, dashboard, breaker/cost/backup operations |
-| Incremental 7 | **not activated** — controlled Peter message and 48-hour canary gate remain |
+| Incremental 7 | **built, not activated** — readiness evidence and audited gates exist; controlled Peter message and 48-hour canary remain |
 
 `chc-rental run` combines every usable configured source into one daily pool.
 RentCast activates when `RENTCAST_API_KEY` is usable. Zillow requires both an
@@ -100,6 +100,7 @@ pip install -e ".[dev]"
 ./chc.sh job stop|start  # unload / load it
 ./chc.sh logs -f         # follow the daily job log
 ./chc.sh alerts status   # incremental gates, health, cost and queues
+./chc.sh alerts readiness --json # first-canary and expansion blockers
 ./chc.sh alerts-job status # separate job; not loaded by default
 ./chc.sh help
 ```
@@ -207,3 +208,5 @@ The incremental job is a separate disabled plist at
 `scripts/com.chcrental.alerts.plist`; it is not installed or loaded as part of
 the build. See [docs/INCREMENTAL_OPERATIONS.md](docs/INCREMENTAL_OPERATIONS.md)
 for shadow validation, one-row canary delivery, backups, activation and rollback.
+See [docs/SOURCE_ONBOARDING.md](docs/SOURCE_ONBOARDING.md) before considering
+another Apify-backed site.

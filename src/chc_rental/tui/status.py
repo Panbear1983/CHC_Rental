@@ -213,6 +213,12 @@ class StatusScreen(Screen[None]):
         monthly_budget_text = (
             "no ceiling" if monthly_budget is None else f"${monthly_budget:.2f}"
         )
+        rollout = status.get("rollout") or {}
+        rollout_text = (
+            "READY"
+            if rollout.get("ready_for_first_canary")
+            else f"BLOCKED ({len(rollout.get('blockers', []))} checks)"
+        )
         self.query_one("#incremental-outbox-summary", Label).update(
             f"Outbox: shadow {outbox.get('shadow', 0)} · pending "
             f"{outbox.get('pending', 0)} · retry {outbox.get('retry_wait', 0)} · "
@@ -223,6 +229,7 @@ class StatusScreen(Screen[None]):
             f"month ${cost.get('known_cost_usd', 0):.2f} / "
             f"{monthly_budget_text} · projection "
             f"{projection_text} · cost_unknown {cost.get('cost_unknown', False)}"
+            f" · first canary {rollout_text}"
         )
 
     @on(Button.Pressed, "#refresh")

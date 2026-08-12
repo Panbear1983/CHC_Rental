@@ -12,8 +12,9 @@ from uuid import uuid4
 
 from chc_rental.models import AllowlistEntry, DeliveryMode, Profile, Search, Settings
 from chc_rental.incremental import IncrementalCollector
+from chc_rental.notify.telegram import build_sender
 from chc_rental.outbox import process_incremental_report
-from chc_rental.operations import incremental_cost_status
+from chc_rental.operations import incremental_cost_status, incremental_rollout_readiness
 from chc_rental.pipeline import PipelineResult, plan_pushes
 from chc_rental.sources.apify import ApifyClient
 from chc_rental.sources import KNOWN_SOURCES
@@ -384,8 +385,22 @@ class TuiController:
             status["cost"] = incremental_cost_status(
                 self.store, settings, now_utc=datetime.now(timezone.utc)
             )
+            status["rollout"] = incremental_rollout_readiness(
+                self.store,
+                settings,
+                now_utc=datetime.now(timezone.utc),
+                token_ready=token_ready,
+                telegram_ready=build_sender(str(self.store.root / ".env")) is not None,
+            )
         else:
             status["cost"] = None
+            status["rollout"] = incremental_rollout_readiness(
+                self.store,
+                settings,
+                now_utc=datetime.now(timezone.utc),
+                token_ready=token_ready,
+                telegram_ready=build_sender(str(self.store.root / ".env")) is not None,
+            )
         return status
 
     def recipient_outbox_counts(self, telegram_id: int) -> dict[str, int]:

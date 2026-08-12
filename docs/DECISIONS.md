@@ -148,3 +148,17 @@ quarterly terms/source review cadence and own it.
 - Activation remains a separate operational decision after a controlled Peter
   canary. This implementation does not load the job, enable the gates, or make
   an external call by itself.
+
+## 12. Rollout evidence and future-source gate — DECIDED 2026-08-12
+
+- First-canary and recipient-expansion readiness are computed from the same
+  shared function used by CLI and dashboard. The check is read-only and cannot
+  enable a source, recipient or scheduler.
+- Live scheduler ticks persist compact success/degraded evidence. Expansion
+  requires a confirmed receipt plus a healthy retained 48-hour window; it does
+  not infer success merely because a process exists.
+- Human-only facts use named, confirmed, audited rollout attestations. Evidence
+  text must be short and non-secret, and any attestation can be revoked.
+- No Facebook Marketplace or Craigslist code is authorized. Every future source
+  must pass `docs/SOURCE_ONBOARDING.md` and receive its own terms decision,
+  schema fixtures, identity tests, budgets, breaker, baseline and canary.

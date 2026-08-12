@@ -90,3 +90,8 @@ of the market:
 RentCast stays available during the incremental canary but is not the primary
 link/freshness source. Facebook Marketplace and Craigslist require new, explicit
 source decisions and do not enter the initial implementation.
+
+The complete evidence and isolation checklist for any future source is
+[SOURCE_ONBOARDING.md](SOURCE_ONBOARDING.md). Passing it requires a fresh owner
+decision; no Zillow setting, Apify token, actor credential or rollout
+attestation can enable a different site.

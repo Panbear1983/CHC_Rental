@@ -31,6 +31,7 @@ rows.
 ./chc.sh alerts migrate --check
 ./chc.sh alerts migrate --apply
 ./chc.sh alerts status --json
+./chc.sh alerts readiness --json
 ./chc.sh alerts deliver                 # read-only outbox counts
 ```
 
@@ -59,6 +60,31 @@ Telegram:
 Before any canary message, establish a baseline, replay it to confirm zero
 outbox additions, then introduce or wait for one genuinely new match and inspect
 the exact `shadow` message in the dashboard.
+
+## Readiness and reviewed gates
+
+`alerts readiness` is read-only. It combines migrations, the four delivery
+gates, one active Immediate canary, baseline/recovery state, breaker state,
+measured p95 duration and cost, monthly projection, outbox failures, Telegram
+receipts and retained live scheduler ticks. The dashboard calls the same
+calculation and displays the blocker count.
+
+Facts that software cannot honestly infer require an owner attestation. Record
+one only after doing the named review, with short non-secret evidence:
+
+```bash
+./chc.sh alerts attest \
+  --gate source_terms_reviewed \
+  --evidence "Reviewed source record and links on YYYY-MM-DD" \
+  --confirm-gate source_terms_reviewed
+```
+
+Allowed gates are listed in `alerts readiness --json`. The first canary also
+requires `message_preview_approved`, `projected_cost_approved`, and
+`kill_switches_tested`. Expansion requires `canary_48h_reviewed` and
+`unattended_2d_reviewed`. An attestation can be revoked with `--clear` plus the
+same exact `--confirm-gate`. Every record/clear action is written to the
+operator audit ledger.
 
 ## One controlled Peter canary
 
@@ -122,8 +148,9 @@ Raw daily source caches continue to use their shorter independent retention.
 
 ## Scheduler activation and rollback
 
-The new job is separate and disabled by default. Only after the live canary
-gate passes:
+The new job is separate and disabled by default. After the one-message canary
+is confirmed, installing it begins the Peter-only 48-hour observation window;
+that activation is a separate explicit operator action:
 
 ```bash
 cp scripts/com.chcrental.alerts.plist ~/Library/LaunchAgents/
@@ -141,3 +168,9 @@ Immediate rollback does not touch the daily workflow:
 
 Do not install the alerts plist merely to test it. `./chc.sh alerts tick
 --fixture ...` and the dashboard shadow action cover the pre-activation path.
+Each live tick writes a compact success/degraded evidence row. Readiness refuses
+recipient expansion when the retained 48-hour window has unexplained gaps,
+source/delivery failures, uncertain sends, or no confirmed canary receipt.
+
+Future sources must pass [SOURCE_ONBOARDING.md](SOURCE_ONBOARDING.md); the
+Zillow approval does not authorize another site or actor.

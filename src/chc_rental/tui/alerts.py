@@ -125,11 +125,17 @@ class AlertsScreen(Screen[None]):
         budget_text = "unset" if monthly_budget is None else f"${monthly_budget:.2f}"
         projection = cost.get("projected_monthly_cost_usd")
         projection_text = "unknown" if projection is None else f"${projection:.2f}"
+        rollout = status.get("rollout") or {}
+        rollout_text = (
+            "canary READY"
+            if rollout.get("ready_for_first_canary")
+            else f"canary BLOCKED ({len(rollout.get('blockers', []))})"
+        )
         self.query_one("#alerts-config", Label).update(
             f"{config_text} · breakers {breaker_text} · month "
             f"${cost.get('known_cost_usd', 0):.2f}/{budget_text} · "
             f"projection {projection_text} · "
-            f"cost_unknown {cost.get('cost_unknown', False)}"
+            f"cost_unknown {cost.get('cost_unknown', False)} · {rollout_text}"
         )
         for scope in health.get("scopes", []):
             query_id = scope["query_id"]

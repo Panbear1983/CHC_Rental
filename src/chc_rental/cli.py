@@ -28,7 +28,11 @@ from chc_rental.fetch import fetch_many_daily
 from chc_rental.incremental import IncrementalCollector
 from chc_rental.notify.telegram import build_sender
 from chc_rental.outbox import process_incremental_report
-from chc_rental.operations import incremental_cost_status
+from chc_rental.operations import (
+    ROLLOUT_ATTESTATIONS,
+    incremental_cost_status,
+    incremental_rollout_readiness,
+)
 from chc_rental.pipeline import PipelineResult, deliver, plan_pushes, validate_records
 from chc_rental.scheduler import IncrementalScheduler
 from chc_rental.sources import configured_adapters
@@ -324,10 +328,11 @@ def _alert_operational_status(store: Store, *, env_file: str) -> dict[str, Any]:
     settings = store.load_settings()
     used = store.quota_used(datetime.now(timezone.utc).date(), "zillow")
     budget = settings.source_request_budget("zillow")
+    token_ready = load_apify_token(env_file) is not None
     payload["incremental"] = {
         "enabled": settings.incremental_alerts_enabled,
         "zillow_enabled": settings.zillow_enabled,
-        "token_ready": load_apify_token(env_file) is not None,
+        "token_ready": token_ready,
         "actor": settings.zillow_actor,
         "interval_minutes": settings.zillow_incremental_interval_minutes,
         "active_window": {
@@ -354,7 +359,71 @@ def _alert_operational_status(store: Store, *, env_file: str) -> dict[str, Any]:
         if payload["ledger"]["ready"]
         else None
     )
+    payload["incremental"]["rollout"] = incremental_rollout_readiness(
+        store,
+        settings,
+        now_utc=datetime.now(timezone.utc),
+        token_ready=token_ready,
+        telegram_ready=build_sender(env_file) is not None,
+    )
     return payload
+
+
+def _cmd_alerts_readiness(args: argparse.Namespace) -> int:
+    """Report rollout blockers without changing a gate or contacting a service."""
+    store = Store(args.root)
+    store.initialize()
+    settings = store.load_settings()
+    env_file = args.env_file or str(store.root / ".env")
+    now_utc = _parse_now(args.now) if args.now else datetime.now(timezone.utc)
+    payload = incremental_rollout_readiness(
+        store,
+        settings,
+        now_utc=now_utc,
+        token_ready=load_apify_token(env_file) is not None,
+        telegram_ready=build_sender(env_file) is not None,
+    )
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        print(
+            "first canary: "
+            f"{'READY' if payload['ready_for_first_canary'] else 'BLOCKED'}; "
+            "recipient expansion: "
+            f"{'READY' if payload['ready_for_recipient_expansion'] else 'BLOCKED'}"
+        )
+        for item in payload["checks"]:
+            marker = "ok" if item["ok"] else "BLOCK"
+            print(f"  [{marker}] {item['id']}: {item['detail']}")
+    return 0 if payload["ready_for_first_canary"] else 1
+
+
+def _cmd_alerts_attest(args: argparse.Namespace) -> int:
+    """Record or clear one explicit owner-reviewed rollout gate."""
+    store = Store(args.root)
+    store.initialize()
+    if not store.alert_migration_status().ready:
+        raise ValueError("alert-ledger migration is required before rollout attestation")
+    if args.confirm_gate != args.gate:
+        raise ValueError("--confirm-gate must exactly match --gate")
+    now_utc = _parse_now(args.now) if args.now else datetime.now(timezone.utc)
+    events = store.event_store()
+    if args.clear:
+        changed = events.clear_rollout_attestation(args.gate, now_utc=now_utc)
+        payload = {"gate": args.gate, "cleared": changed}
+    else:
+        if not args.evidence or not args.evidence.strip():
+            raise ValueError("--evidence is required when recording an attestation")
+        saved = events.attest_rollout_gate(
+            args.gate, evidence=args.evidence, now_utc=now_utc
+        )
+        payload = {
+            "gate": saved.gate,
+            "evidence": saved.evidence,
+            "attested_at": saved.attested_at,
+        }
+    print(json.dumps(payload, indent=2, sort_keys=True))
+    return 0
 
 
 def _cmd_alerts_migrate(args: argparse.Namespace) -> int:
@@ -541,6 +610,7 @@ def _cmd_alerts_tick(args: argparse.Namespace) -> int:
             if args.fixture
             else lambda text: _alert_owner(store, env_file, text)
         ),
+        runtime_mode="fixture" if args.fixture else "live",
     ).tick(now_utc=now_utc, max_delivery_messages=args.max_messages)
     print(json.dumps(report.summary(), indent=2, sort_keys=True))
     return 1 if report.warnings and not report.skipped_locked else 0
@@ -707,6 +777,28 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "--env-file", help="Credential file for readiness checks (default: ROOT/.env)"
     )
     alerts_status_parser.set_defaults(func=_cmd_alerts_status)
+    readiness_parser = alerts_sub.add_parser(
+        "readiness", help="Show first-canary and recipient-expansion blockers"
+    )
+    readiness_parser.add_argument("--json", action="store_true")
+    readiness_parser.add_argument("--now", help="Override instant (ISO 8601 with offset)")
+    readiness_parser.add_argument(
+        "--env-file", help="Credential file for readiness checks (default: ROOT/.env)"
+    )
+    readiness_parser.set_defaults(func=_cmd_alerts_readiness)
+    attest_parser = alerts_sub.add_parser(
+        "attest", help="Record or clear one explicitly reviewed rollout gate"
+    )
+    attest_parser.add_argument("--gate", required=True, choices=ROLLOUT_ATTESTATIONS)
+    attest_parser.add_argument("--evidence", help="Short, non-secret review evidence")
+    attest_parser.add_argument("--clear", action="store_true")
+    attest_parser.add_argument(
+        "--confirm-gate",
+        required=True,
+        help="Must exactly repeat --gate to confirm the local state change",
+    )
+    attest_parser.add_argument("--now", help="Override instant (ISO 8601 with offset)")
+    attest_parser.set_defaults(func=_cmd_alerts_attest)
     cycle_parser = alerts_sub.add_parser(
         "cycle", help="Run one source-only incremental shadow cycle"
     )

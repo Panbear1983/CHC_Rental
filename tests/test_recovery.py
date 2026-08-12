@@ -85,6 +85,13 @@ def test_offline_fixture_tick_processes_and_backs_up_without_telegram(
     assert payload["delivery"] is None
     assert Path(payload["backup"]).exists()
     assert store.quota_used(NOW.date(), "zillow") == 0
+    assert payload["tick_id"] is not None
+    with store.event_store().connection() as connection:
+        tick = connection.execute(
+            "SELECT mode, status FROM scheduler_ticks WHERE tick_id=?",
+            (payload["tick_id"],),
+        ).fetchone()
+    assert tuple(tick) == ("fixture", "ok")
 
 
 def test_offline_fixture_tick_disables_owner_alert_transport(

@@ -9,6 +9,11 @@ alter the currently working daily workflow. It supersedes the fetch and delivery
 parts of `2026-08-10_210000-chc-rental-filebased-scraper.md` only after the
 incremental path passes the Peter-only canary and an explicit cutover is made.
 
+Implementation status (2026-08-12): phases 0–7 are built behind disabled gates.
+The external exit gates are deliberately still open: no live source/canary call
+or LaunchAgent activation was performed by the build, and the 48-hour/two-day
+observation evidence must be earned in operation.
+
 ## Outcome
 
 Build a near-real-time, one-way Telegram alert pipeline that:
