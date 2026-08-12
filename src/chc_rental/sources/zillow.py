@@ -52,6 +52,16 @@ _PROPERTY_TYPES = {
     "LOT": "land",
 }
 
+_QUERY_TYPE_FILTERS = {
+    "apartment": "isApartment",
+    "condo": "isCondo",
+    "townhouse": "isTownhouse",
+    "single_family": "isSingleFamily",
+    "multi_family": "isMultiFamily",
+    "manufactured": "isManufactured",
+    "land": "isLotLand",
+}
+
 _UNIT_AT_END = re.compile(
     r"\s+(?:(?:apt|apartment|unit|suite|ste)\s+|#)([A-Za-z0-9-]+)\s*$",
     re.IGNORECASE,
@@ -84,6 +94,29 @@ def rental_search_url(
         "cmsn": {"value": False},
         "auc": {"value": False},
     }
+    if query.price_min is not None or query.price_max is not None:
+        price: dict[str, int] = {}
+        if query.price_min is not None:
+            price["min"] = int(query.price_min)
+        if query.price_max is not None:
+            price["max"] = int(query.price_max)
+        filter_state["price"] = price
+    if query.beds_min is not None or query.beds_max is not None:
+        beds: dict[str, int] = {}
+        if query.beds_min is not None:
+            beds["min"] = int(query.beds_min)
+        if query.beds_max is not None:
+            beds["max"] = int(query.beds_max)
+        filter_state["beds"] = beds
+    if query.baths_min is not None:
+        minimum = float(query.baths_min)
+        filter_state["baths"] = {
+            "min": int(minimum) if minimum.is_integer() else minimum
+        }
+    if query.property_types:
+        selected = set(query.property_types)
+        for property_type, filter_name in _QUERY_TYPE_FILTERS.items():
+            filter_state[filter_name] = {"value": property_type in selected}
     state = {
         "usersSearchTerm": f"{query.city}, {query.state}",
         "filterState": filter_state,
@@ -171,17 +204,28 @@ class ZillowRentalAdapter:
 
     name = SOURCE_NAME
 
+    def actor_input(self, query: SourceQuery) -> dict[str, Any]:
+        map_bounds = self.bounds_resolver(query)
+        return {
+            "searchUrls": [{"url": rental_search_url(query, map_bounds=map_bounds)}],
+            "extractionMethod": "PAGINATION_WITH_ZOOM_IN",
+            "resultsLimit": self.results_limit,
+        }
+
+    def normalize_dataset(self, body: list[Any]) -> list[dict[str, Any]]:
+        records: list[dict[str, Any]] = []
+        for item in body:
+            if not isinstance(item, dict) or not self._is_rental(item):
+                continue
+            records.append(self._canonical(item))
+        return records
+
     def fetch_page(
         self, query: SourceQuery, *, offset: int
     ) -> tuple[list[dict[str, Any]], bool]:
         if offset != 0:
             return [], False
-        map_bounds = self.bounds_resolver(query)
-        payload = {
-            "searchUrls": [{"url": rental_search_url(query, map_bounds=map_bounds)}],
-            "extractionMethod": "PAGINATION_WITH_ZOOM_IN",
-            "resultsLimit": self.results_limit,
-        }
+        payload = self.actor_input(query)
         actor = urllib.parse.quote(self.actor, safe="~")
         params = {"token": self.token}
         if self.max_charge_usd > 0:
@@ -223,12 +267,7 @@ class ZillowRentalAdapter:
 
         if not isinstance(body, list):
             raise SourceUnavailableError("apify Zillow source returned a non-list payload")
-        records: list[dict[str, Any]] = []
-        for item in body:
-            if not isinstance(item, dict) or not self._is_rental(item):
-                continue
-            records.append(self._canonical(item))
-        return records, False
+        return self.normalize_dataset(body), False
 
     @staticmethod
     def _is_rental(item: dict[str, Any]) -> bool:

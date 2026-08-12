@@ -29,7 +29,7 @@ from chc_rental.sources.base import (
     SourceUnavailableError,
 )
 from chc_rental.sources import configured_adapters
-from chc_rental.sources.planner import plan_queries
+from chc_rental.sources.planner import plan_incremental_queries, plan_queries
 from chc_rental.sources.rentcast import RentCastAdapter, _parse_retry_after
 from chc_rental.sources.zillow import (
     ZillowRentalAdapter,
@@ -110,6 +110,81 @@ def test_a_search_without_a_state_is_skipped_with_a_warning():
     queries, warnings = plan_queries(Allowlist(people=[person]))
     assert queries == []
     assert len(warnings) == 1 and "no state" in warnings[0]
+
+
+def test_identical_incremental_filter_envelopes_are_shared_across_people():
+    search_a = make_search(
+        name="A", state="TX", search_id="11111111-1111-4111-8111-111111111111"
+    )
+    search_b = make_search(
+        name="B", state="TX", search_id="22222222-2222-4222-8222-222222222222"
+    )
+    allowlist = Allowlist(
+        people=[
+            make_person(111, profile=Profile(searches=[search_a])),
+            make_person(222, profile=Profile(searches=[search_b])),
+        ]
+    )
+    planned, warnings = plan_incremental_queries(allowlist)
+    assert warnings == [] and len(planned) == 1
+    assert {watch.telegram_id for watch in planned[0].watches} == {111, 222}
+
+
+def test_incompatible_incremental_source_filters_remain_separate():
+    allowlist = Allowlist(
+        people=[
+            make_person(
+                111,
+                profile=Profile(
+                    searches=[
+                        make_search(
+                            name="Cheap",
+                            state="TX",
+                            price_max=1800,
+                            search_id="11111111-1111-4111-8111-111111111111",
+                        ),
+                        make_search(
+                            name="Larger",
+                            state="TX",
+                            bed_min=3,
+                            search_id="22222222-2222-4222-8222-222222222222",
+                        ),
+                    ]
+                ),
+            )
+        ]
+    )
+    planned, _ = plan_incremental_queries(allowlist)
+    assert len(planned) == 2
+    assert len({item.query_id for item in planned}) == 2
+
+
+def test_local_only_feature_difference_does_not_duplicate_actor_scope():
+    allowlist = Allowlist(
+        people=[
+            make_person(
+                111,
+                profile=Profile(
+                    searches=[
+                        make_search(
+                            name="Elevator",
+                            state="TX",
+                            required_features=["elevator"],
+                            search_id="11111111-1111-4111-8111-111111111111",
+                        ),
+                        make_search(
+                            name="Laundry",
+                            state="TX",
+                            required_features=["laundry"],
+                            search_id="22222222-2222-4222-8222-222222222222",
+                        ),
+                    ]
+                ),
+            )
+        ]
+    )
+    planned, _ = plan_incremental_queries(allowlist)
+    assert len(planned) == 1
 
 
 # --- RentCast adapter -------------------------------------------------------
@@ -219,6 +294,31 @@ def test_zillow_search_url_includes_actor_required_map_bounds():
     url = rental_search_url(SourceQuery("Brooklyn", "NY"), map_bounds=bounds)
     encoded = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)["searchQueryState"][0]
     assert json.loads(encoded)["mapBounds"] == bounds
+
+
+def test_incremental_zillow_url_pushes_supported_filters_to_the_actor():
+    import urllib.parse
+
+    query = SourceQuery(
+        "Austin",
+        "TX",
+        price_min=1500,
+        price_max=3000,
+        beds_min=2,
+        beds_max=3,
+        baths_min=1.5,
+        property_types=("apartment", "condo"),
+    )
+    encoded = urllib.parse.parse_qs(
+        urllib.parse.urlparse(rental_search_url(query)).query
+    )["searchQueryState"][0]
+    filters = json.loads(encoded)["filterState"]
+    assert filters["price"] == {"min": 1500, "max": 3000}
+    assert filters["beds"] == {"min": 2, "max": 3}
+    assert filters["baths"] == {"min": 1.5}
+    assert filters["isApartment"] == {"value": True}
+    assert filters["isCondo"] == {"value": True}
+    assert filters["isSingleFamily"] == {"value": False}
 
 
 def test_zillow_bounds_resolver_maps_nominatim_coordinate_order(monkeypatch):

@@ -48,10 +48,33 @@ class SourceUnavailableError(SourceError):
 
 @dataclass(frozen=True)
 class SourceQuery:
-    """One deduplicated fetch target: a US city."""
+    """One normalized provider query.
+
+    Daily adapters use only city/state. The incremental Zillow planner also
+    fills the source-supported filters so bounded actor result slots are not
+    consumed by listings every watcher would immediately reject.
+    """
 
     city: str
     state: str
+    price_min: int | None = None
+    price_max: int | None = None
+    beds_min: int | None = None
+    beds_max: int | None = None
+    baths_min: float | None = None
+    property_types: tuple[str, ...] = ()
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "city": self.city,
+            "state": self.state,
+            "price_min": self.price_min,
+            "price_max": self.price_max,
+            "beds_min": self.beds_min,
+            "beds_max": self.beds_max,
+            "baths_min": self.baths_min,
+            "property_types": list(self.property_types),
+        }
 
 
 class SourceAdapter(Protocol):

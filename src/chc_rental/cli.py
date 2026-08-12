@@ -20,12 +20,16 @@ import json
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Optional, Sequence
+from uuid import uuid4
 
 from chc_rental.event_store import AlertStoreError
 from chc_rental.fetch import fetch_many_daily
+from chc_rental.incremental import IncrementalCollector
 from chc_rental.notify.telegram import build_sender
 from chc_rental.pipeline import PipelineResult, deliver, plan_pushes, validate_records
 from chc_rental.sources import configured_adapters
+from chc_rental.sources.apify import ApifyClient, ApifyRunState
+from chc_rental.sources.zillow import ZillowRentalAdapter, load_apify_token
 from chc_rental.store import Store, StoreError
 
 FIXTURE_SOURCE = "fixture"
@@ -342,6 +346,72 @@ def _cmd_alerts_status(args: argparse.Namespace) -> int:
     return 0
 
 
+class _FixtureApifyClient:
+    """Offline actor-shaped transport used only by ``alerts cycle --fixture``."""
+
+    def __init__(self, payload: list[Any]) -> None:
+        self.payload = payload
+
+    def start_actor(self, actor, payload, *, max_total_charge_usd):
+        run_id = f"fixture-{uuid4()}"
+        return ApifyRunState(run_id, "SUCCEEDED", run_id, 0.0, "offline fixture")
+
+    def get_run(self, run_id):  # pragma: no cover - fixtures finish at start
+        return ApifyRunState(run_id, "SUCCEEDED", run_id, 0.0, "offline fixture")
+
+    def get_dataset(self, dataset_id):
+        return self.payload
+
+
+def _cmd_alerts_cycle(args: argparse.Namespace) -> int:
+    """Run one source-only incremental cycle; never sends Telegram."""
+    store = Store(args.root)
+    store.initialize()
+    now_utc = _parse_now(args.now) if args.now else datetime.now(timezone.utc)
+    settings = store.load_settings()
+    if args.fixture:
+        if store.alert_db_path.exists() and store.event_store().open_source_runs():
+            raise ValueError("fixture cycle refuses to impersonate an existing open live source run")
+        raw = _load_fixture(Path(args.fixture))
+        client = _FixtureApifyClient(raw)
+        adapter = ZillowRentalAdapter(
+            token="fixture",
+            results_limit=max(25, len(raw) + 1),
+            bounds_resolver=lambda query: {
+                "west": -180.0,
+                "east": 180.0,
+                "south": -85.0,
+                "north": 85.0,
+            },
+        )
+        allow_disabled = True
+        meter_requests = False
+    else:
+        token = load_apify_token(args.env_file)
+        if not token:
+            raise ValueError(f"no usable APIFY_TOKEN in {args.env_file}")
+        client = ApifyClient(token=token, timeout=settings.zillow_timeout_seconds)
+        adapter = ZillowRentalAdapter(
+            token=token,
+            actor=settings.zillow_actor,
+            results_limit=settings.zillow_results_limit,
+            timeout=settings.zillow_timeout_seconds,
+            max_charge_usd=settings.zillow_max_charge_usd,
+        )
+        allow_disabled = False
+        meter_requests = True
+    report = IncrementalCollector(
+        store,
+        settings=settings,
+        adapter=adapter,
+        client=client,
+        allow_disabled=allow_disabled,
+        meter_requests=meter_requests,
+    ).cycle(now_utc=now_utc)
+    print(json.dumps(report.summary(), indent=2, sort_keys=True))
+    return 0 if not any(item.error for item in report.collections) else 1
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(prog="chc-rental", description="CHC Rental daily runner.")
     parser.add_argument("--root", default=".", help="Data directory (default: %(default)s)")
@@ -401,6 +471,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     alerts_status_parser.add_argument("--json", action="store_true")
     alerts_status_parser.set_defaults(func=_cmd_alerts_status)
+    cycle_parser = alerts_sub.add_parser(
+        "cycle", help="Run one source-only incremental shadow cycle"
+    )
+    cycle_mode = cycle_parser.add_mutually_exclusive_group(required=True)
+    cycle_mode.add_argument("--fixture", help="Offline JSON list of raw Zillow actor items")
+    cycle_mode.add_argument(
+        "--shadow", action="store_true", help="Use the enabled live Zillow source; never send"
+    )
+    cycle_parser.add_argument("--now", help="Override the current instant (ISO 8601 with offset)")
+    cycle_parser.add_argument("--env-file", default=".env")
+    cycle_parser.set_defaults(func=_cmd_alerts_cycle)
 
     args = parser.parse_args(argv)
     try:

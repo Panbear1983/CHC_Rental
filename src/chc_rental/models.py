@@ -393,7 +393,10 @@ class Settings(BaseModel):
     incremental_active_start: str = "08:00"
     incremental_active_end: str = "23:00"
     incremental_scheduler_tick_minutes: int = 15
+    incremental_query_lease_minutes: int = 20
+    incremental_max_new_starts_per_cycle: int = 1
     incremental_event_retention_days: int = 180
+    zillow_incremental_interval_minutes: int = 180
     incremental_canary_telegram_ids: list[int] = []
     incremental_monthly_budget_usd: Optional[float] = None
     # Operator alert channel; None disables alerting entirely.
@@ -426,7 +429,10 @@ class Settings(BaseModel):
         "rejected_retention_days",
         "backup_retention_days",
         "incremental_scheduler_tick_minutes",
+        "incremental_query_lease_minutes",
+        "incremental_max_new_starts_per_cycle",
         "incremental_event_retention_days",
+        "zillow_incremental_interval_minutes",
         "zillow_results_limit",
         "zillow_timeout_seconds",
     )
@@ -442,8 +448,14 @@ class Settings(BaseModel):
     def incremental_policy_must_be_coherent(self) -> "Settings":
         if self.incremental_scheduler_tick_minutes <= 0:
             raise ValueError("incremental_scheduler_tick_minutes must be positive")
+        if self.incremental_query_lease_minutes <= 0:
+            raise ValueError("incremental_query_lease_minutes must be positive")
+        if self.incremental_max_new_starts_per_cycle <= 0:
+            raise ValueError("incremental_max_new_starts_per_cycle must be positive")
         if self.incremental_event_retention_days <= 0:
             raise ValueError("incremental_event_retention_days must be positive")
+        if self.zillow_incremental_interval_minutes <= 0:
+            raise ValueError("zillow_incremental_interval_minutes must be positive")
         if self.incremental_active_start == self.incremental_active_end:
             raise ValueError("incremental active window must not cover the entire day")
         return self
