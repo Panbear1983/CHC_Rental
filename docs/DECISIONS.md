@@ -12,9 +12,11 @@ every PENDING item below is DECIDED.
 - Listing qualification is deterministic. LLMs may never determine whether a
   listing is eligible, invent a feature, scrape a page, or bypass a source
   restriction.
-- Do not scrape: Zillow, Realtor.com, Craigslist, Facebook Marketplace,
-  Trulia, Zumper, PadMapper, Apartments.com consumer sites — no appropriate
-  public consumer API and/or terms prohibit automated collection.
+- No direct consumer-site scraping or bot-protection bypassing. Realtor.com,
+  Craigslist, Facebook Marketplace, Trulia, Zumper, PadMapper and
+  Apartments.com remain refused. Peter explicitly approved the separately
+  flagged, managed Apify Zillow rental route on 2026-08-11; it stays disabled
+  by default and does not represent Zillow authorization.
 - All source calls obey published API/contract limits and a local hard daily
   circuit breaker.
 - No external source credentials or Telegram tokens in tracked files.
@@ -34,39 +36,66 @@ Owner-controlled TUI only. Never self-enrollment through Telegram.
 `requires-python = ">=3.11,<3.12"` in `pyproject.toml` is authoritative (the
 working venv runs 3.11). The plan's "Python 3.12+" stack note is superseded.
 
-## 4. Primary licensed source + budget — PENDING
+## 4. Listing sources + budget — DECIDED 2026-08-11
 
-- Candidate primary source: RentCast paid/licensed API (recommended by the
-  plan, subject to Peter accepting plan/price/terms). Alternative: defer
-  individual listings until RESO/MLS vendor access exists.
-- Daily API-call ceiling: ______
-- Monthly spend ceiling: ______
-- Behavior at ceiling: stop fetching and flag operator (plan default) — confirm.
+- Scope: **US rentals only** (Peter, 2026-08-11). Taiwan portals out of scope.
+- Primary source: **RentCast** official API (`docs/SOURCES.md`), key already
+  provisioned in `.env`.
+- Additional source: owner-approved, terms-flagged Zillow rental collection
+  through the pinned Apify actor. It is opt-in (`zillow_enabled: false` by
+  default) and isolated so its failure cannot erase RentCast matches.
+- Daily API-call ceiling: 50/day legacy/default for RentCast, 5/day for Zillow,
+  100/day global
+  (`config/settings.yaml`, enforced by `store.reserve_request`).
+- Zillow per-query result limit: 25; per-actor-run charge ceiling: USD 0.25.
+- Zillow search URLs must contain geographic map bounds. Resolve US city/state
+  bounds through OpenStreetMap Nominatim, then day-cache the resulting source
+  pool. Do not treat actor error markers or incomplete building-summary cards
+  as listings.
+- Monthly spend ceiling: whatever the currently provisioned RentCast plan
+  includes — the daily ceilings above are set so the plan cap cannot be
+  exceeded; revisit if the plan tier changes.
+- Behavior at ceiling: stop fetching, deliver whatever the day cache already
+  holds, and alert the operator via Telegram.
+- Cache reuse requires an exact normalized city/state query scope. A changed
+  allowlist scope forces a refresh; local-only price/bed/filter edits continue
+  to reuse the existing city pool. Truncation and per-query errors survive
+  cache reuse and suppress no-results notices.
 
-## 5. Retention periods — PENDING
+## 5. Retention periods — DECIDED 2026-08-11 (defaults confirmed)
 
-- Telegram IDs / profile audit history: ______
-- Fetched listing cache: ______
-- Notification/dedup ledger: ______
-- Rejected/validation records: ______
+- Notification/dedup (seen) ledger: 90 days (`seen_retention_days`) — after
+  this, an old listing may notify again; accepted.
+- Fetched listing cache: 7 days. Rejected/validation records: 30 days;
+  identical source/reason/raw failures are retained once per UTC day.
+- Profile audit history: gitignored config + timestamped `backups/`, 30 days.
+- All values live in `config/settings.yaml` and are revisable without
+  migration.
 
-## 6. Excess-demand behavior — PENDING
+## 6. Excess-demand behavior — DECIDED 2026-08-11
 
-Proportional quotas vs strict equal round-robin.
-Plan recommendation: strict equal round-robin initially.
+Per-search daily caps only, no cross-person round-robin, while the allowlist
+holds two people. Revisit (plan recommends strict equal round-robin) before
+the allowlist grows or budget pressure appears.
 
-## 7. Notification policy — PENDING
+## 7. Notification policy — DECIDED 2026-08-11
 
-Plan default to confirm: Telegram delivery only after all validation; failed
-delivery remains retryable with bounded retries (delivery ledger already
-implements `max_attempts = 3`).
+Telegram delivery only after full validation. A failed listing push is not
+marked seen, so it retries on the next run — bounded to one attempt per run
+by design (the old ledger's `max_attempts = 3` is superseded by the daily
+cadence). No-results notices stamp the seen ledger so the due-gate advances
+and the hourly runner cannot repeat them within a day.
 
-## 8. Circuit-breaker limits — PENDING
+## 8. Circuit-breaker limits — DECIDED 2026-08-11
 
-Concrete daily global limit for the budget ledger (code default currently
-`DEFAULT_DAILY_BUDGET_LIMIT = 100` in `tui/controller.py`) — confirm or change.
+Global 100/day, legacy/default per-source 50/day, and explicit Zillow 5/day
+confirmed, enforced in `config/settings.yaml` + `store.reserve_request`. The
+Zillow result and per-run charge caps are additional hard controls.
 
-## 9. Quarterly terms review + kill switch — PENDING
+## 9. Quarterly terms review + kill switch — PENDING (owner needed)
 
-Approve a quarterly terms/source review cadence and a kill switch for each
-source adapter; name the owner of that review.
+Kill switches exist: `live_push_enabled: false` stops all sends;
+removing/emptying `RENTCAST_API_KEY` (or the per-source ceiling set to 0)
+stops RentCast; `zillow_enabled: false`, an absent `APIFY_TOKEN`, or a Zillow
+request budget of 0 stops Zillow. Still needed from Peter: commit to a
+quarterly terms/source review cadence and own it.

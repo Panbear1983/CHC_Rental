@@ -29,6 +29,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from chc_rental.envfile import read_env_key
+
 TELEGRAM_API = "https://api.telegram.org"
 _SYSTEM_CA_BUNDLES = ("/etc/ssl/cert.pem", "/private/etc/ssl/cert.pem")
 
@@ -53,20 +55,7 @@ def load_bot_token(env_path: str | Path = ".env") -> Optional[str]:
 
     Only that one key is taken from the file; everything else is ignored.
     """
-    token = None
-    path = Path(env_path)
-    if path.is_file():
-        for line in path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, _, value = line.partition("=")
-            if key.strip() == "TELEGRAM_BOT_TOKEN":
-                token = value.strip().strip("\"'")
-    token = os.environ.get("TELEGRAM_BOT_TOKEN", token)
-    if not token or token == "changeme":
-        return None
-    return token
+    return read_env_key(env_path, "TELEGRAM_BOT_TOKEN")
 
 
 @dataclass
@@ -96,6 +85,15 @@ class TelegramSender:
         except urllib.error.URLError as exc:
             # str(exc) can include the URL, which carries the token.
             raise TelegramSendError(f"{method} could not reach Telegram: {exc.reason}") from None
+        except OSError as exc:
+            # Read timeouts (TimeoutError) and socket resets surface here, not
+            # as URLError; str(exc) carries no URL and therefore no token.
+            raise TelegramSendError(f"{method} failed mid-request: {exc}") from None
+        except ValueError:
+            # json.JSONDecodeError / UnicodeDecodeError: an HTTP 200 whose body
+            # is not Telegram's JSON. Callers rely on seeing only
+            # TelegramSendError, so it must not escape raw.
+            raise TelegramSendError(f"{method} returned an unreadable response body") from None
         if not body.get("ok"):
             raise TelegramSendError(f"{method} refused: {body.get('description', 'unknown error')}")
         return body.get("result", {})

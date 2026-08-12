@@ -1,7 +1,7 @@
 [project]
 name = "chc-rental"
 version = "0.1.0"
-description = "CHC Rental — offline rental-notifier foundation: allowlist/profiles, owner TUI, deterministic matching and fair daily scheduling"
+description = "CHC Rental — file-based multi-source rental notifier with owner TUI and deterministic matching"
 requires-python = ">=3.11,<3.12"
 dependencies = [
     "pydantic>=2,<3",

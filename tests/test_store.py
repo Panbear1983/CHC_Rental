@@ -35,6 +35,19 @@ def test_initialize_creates_config_with_defaults(tmp_path):
     assert store.settings_path.exists()
     assert store.load_allowlist().people == []
     assert store.load_settings().global_daily_request_budget == 100
+    assert store.load_settings().source_request_budget("rentcast") == 50
+    assert store.load_settings().source_request_budget("zillow") == 5
+    assert store.load_settings().zillow_enabled is False
+
+
+def test_whole_run_lock_refuses_an_overlapping_cycle(store):
+    other = Store(store.root)
+    with store.try_run_lock() as first:
+        assert first is True
+        with other.try_run_lock() as second:
+            assert second is False
+    with other.try_run_lock() as after_release:
+        assert after_release is True
 
 
 def test_allowlist_round_trip_preserves_every_field(store):
@@ -171,6 +184,22 @@ def test_rejected_records_are_retained_and_counted(store):
     assert "bad price" in body and "bad url" in body
 
 
+def test_identical_rejected_record_is_logged_only_once_per_day(store):
+    raw = {"source_listing_id": "bad-1", "price": None}
+    store.record_rejected(DAY, source="feed", reason="bad price", raw=raw)
+    store.record_rejected(DAY, source="feed", reason="bad price", raw=raw)
+    assert store.rejected_count(DAY) == 1
+
+
+def test_rejected_dedup_recognizes_legacy_lines_without_a_fingerprint(store):
+    raw = {"source_listing_id": "bad-legacy", "price": None}
+    legacy = {"at": "2026-01-15T00:00:00+00:00", "source": "feed",
+              "reason": "bad price", "raw": raw}
+    store.rejected_path(DAY).write_text(json.dumps(legacy) + "\n", encoding="utf-8")
+    store.record_rejected(DAY, source="feed", reason="bad price", raw=raw)
+    assert store.rejected_count(DAY) == 1
+
+
 def test_run_log_round_trip(store):
     store.write_run_log(DAY, {"summary": {"planned_pushes": 3}})
     assert store.read_run_log(DAY)["summary"]["planned_pushes"] == 3
@@ -181,6 +210,21 @@ def test_cache_round_trip(store):
     store.cache_raw(DAY, "feed", [{"a": 1}])
     assert store.load_cached(DAY, "feed") == [{"a": 1}]
     assert store.load_cached(DAY, "other") is None
+
+
+def test_scoped_cache_requires_matching_query_metadata(store):
+    scope = [{"city": "austin", "state": "TX"}]
+    store.cache_raw(DAY, "feed", [{"a": 1}], metadata={"query_scope": scope})
+    assert store.load_cached(DAY, "feed", expected_query_scope=scope) == [{"a": 1}]
+    assert store.load_cached(
+        DAY, "feed", expected_query_scope=[{"city": "dallas", "state": "TX"}]
+    ) is None
+
+
+def test_legacy_cache_without_scope_is_not_reused_by_query_aware_fetch(store):
+    store.cache_raw(DAY, "feed", [{"stale": True}])
+    scope = [{"city": "austin", "state": "TX"}]
+    assert store.load_cached(DAY, "feed", expected_query_scope=scope) is None
 
 
 def test_prune_removes_only_expired_state(store):
@@ -194,3 +238,82 @@ def test_prune_removes_only_expired_state(store):
     assert removed["runs"] == 1 and removed["rejected"] == 1
     assert store.read_run_log(recent) is not None
     assert store.read_run_log(old) is None
+
+
+# --- per-run logs and pruning (2026-08-11 hardening) -------------------------
+
+
+def test_record_run_keeps_history_and_latest_wins(store):
+    from datetime import datetime, timezone
+
+    noon = datetime(2026, 1, 15, 12, 0, tzinfo=timezone.utc)
+    evening = datetime(2026, 1, 15, 19, 0, tzinfo=timezone.utc)
+    store.record_run(noon, {"summary": {"planned_pushes": 0}})
+    store.record_run(evening, {"summary": {"planned_pushes": 5}})
+    assert store.latest_run_log()["summary"]["planned_pushes"] == 5
+    runs = list((store.state_dir / "runs").glob("*.json"))
+    assert len(runs) == 2, "each run must keep its own file"
+
+
+def test_latest_run_log_prefers_a_per_run_file_over_the_same_days_daily_file(store):
+    from datetime import date, datetime, timezone
+
+    store.write_run_log(date(2026, 1, 15), {"summary": {"planned_pushes": 1}})
+    store.record_run(
+        datetime(2026, 1, 15, 7, 0, tzinfo=timezone.utc), {"summary": {"planned_pushes": 9}}
+    )
+    assert store.latest_run_log()["summary"]["planned_pushes"] == 9
+
+
+def test_prune_removes_expired_per_run_files(store):
+    from datetime import date, datetime, timezone
+
+    from chc_rental.models import Settings
+
+    old = datetime(2025, 12, 1, 12, 0, tzinfo=timezone.utc)
+    fresh = datetime(2026, 1, 15, 12, 0, tzinfo=timezone.utc)
+    store.record_run(old, {"summary": {}})
+    store.record_run(fresh, {"summary": {}})
+    store.prune(today=date(2026, 1, 15), settings=Settings())
+    remaining = [p.name for p in (store.state_dir / "runs").glob("*.json")]
+    assert remaining == ["2026-01-15T120000Z.json"]
+
+
+def test_prune_drops_only_expired_seen_records(store):
+    import json as jsonlib
+    from datetime import date
+
+    from chc_rental.models import Settings
+
+    store.mark_seen(111, "old-key", search_name="s", url="https://example.com/1")
+    store.mark_seen(111, "fresh-key", search_name="s", url="https://example.com/2")
+    lines = store.seen_path(111).read_text(encoding="utf-8").splitlines()
+    doctored = []
+    for line in lines:
+        record = jsonlib.loads(line)
+        if record["key"] == "old-key":
+            record["sent_at"] = "2025-01-01T00:00:00+00:00"
+        doctored.append(jsonlib.dumps(record))
+    store.seen_path(111).write_text("".join(f"{l}\n" for l in doctored), encoding="utf-8")
+
+    removed = store.prune(today=date(2026, 1, 15), settings=Settings(seen_retention_days=90))
+    assert removed["seen"] == 1
+    assert store.seen_keys(111) == {"fresh-key"}
+
+
+def test_seen_retention_zero_means_keep_forever(store):
+    from datetime import date
+
+    from chc_rental.models import Settings
+
+    store.mark_seen(111, "k", search_name="s", url="https://example.com/1")
+    removed = store.prune(today=date(2026, 1, 15), settings=Settings(seen_retention_days=0))
+    assert removed["seen"] == 0
+    assert store.seen_keys(111) == {"k"}
+
+
+def test_mark_notified_advances_last_sent_at_without_touching_listing_keys(store):
+    assert store.last_sent_at(111) is None
+    store.mark_notified(111)
+    assert store.last_sent_at(111) is not None
+    assert all(k.startswith("notice:") for k in store.seen_keys(111))

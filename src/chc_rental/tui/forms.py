@@ -15,6 +15,7 @@ from chc_rental.models import Search
 SEARCH_FIELDS = (
     "name",
     "city",
+    "state",
     "district",
     "price_min",
     "price_max",
@@ -33,6 +34,7 @@ SEARCH_FIELDS = (
 REQUIRED_FIELDS = (
     "name",
     "city",
+    "state",  # a US 2-letter code; source query planning cannot run without it
     "price_min",
     "price_max",
     "property_types",
@@ -93,6 +95,7 @@ def parse_search_form(data: dict) -> Search:
     payload: dict[str, Any] = {
         "name": str(data["name"]).strip(),
         "city": str(data["city"]).strip(),
+        "state": None if _is_blank(data.get("state")) else str(data["state"]).strip(),
         "district": None if _is_blank(data.get("district")) else str(data["district"]).strip(),
         "property_types": _parse_csv(data["property_types"]),
         "required_features": _parse_csv(data.get("required_features")),
@@ -118,6 +121,7 @@ def search_to_form(search: Search) -> dict[str, Any]:
     return {
         "name": search.name,
         "city": search.city,
+        "state": search.state or "",
         "district": search.district or "",
         "price_min": str(search.price_min),
         "price_max": str(search.price_max),

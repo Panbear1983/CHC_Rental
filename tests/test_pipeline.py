@@ -97,6 +97,26 @@ def test_two_searches_matching_one_listing_send_it_once(store):
     assert result.summary["planned_pushes"] == 1
 
 
+def test_two_sources_for_one_rental_send_one_direct_zillow_link(store):
+    store.save_allowlist(Allowlist(people=[make_person(111)]))
+    rentcast = make_listing(
+        source="rentcast",
+        url="https://www.google.com/maps/search/?api=1&query=100+Main+St",
+        address="100 Main Street",
+    )
+    zillow = make_listing(
+        source="zillow",
+        source_listing_id="123_zpid",
+        url="https://www.zillow.com/homedetails/100-main/123_zpid/",
+        address="100 Main St.",
+    )
+    result = plan_pushes(store, listings(rentcast, zillow), now_utc=DUE_NOW)
+    assert result.summary["listings_unique"] == 1
+    assert result.summary["planned_pushes"] == 1
+    assert result.planned[0].listing.source == "zillow"
+    assert "zillow.com" in result.planned[0].listing.url
+
+
 def test_one_malformed_record_does_not_discard_the_good_ones(store):
     """The old dry_run raised on the first bad record and kept none of them."""
     raws = [
@@ -123,6 +143,22 @@ def test_already_seen_listings_are_not_planned_again(store):
         111, dedup_key(Listing.model_validate(raw)), search_name="Downtown", url=raw["url"]
     )
     result = plan_pushes(store, listings(raw), now_utc=DUE_NOW)
+    assert result.planned == []
+
+
+def test_a_legacy_rentcast_seen_key_suppresses_the_same_zillow_rental(store):
+    store.save_allowlist(Allowlist(people=[make_person(111)]))
+    store.mark_seen(
+        111,
+        "v2:rentcast::austin::100%20main%20st:",
+        search_name="Downtown",
+        url="https://www.google.com/maps/search/?api=1&query=100+Main+St",
+    )
+    result = plan_pushes(
+        store,
+        listings(make_listing(source="zillow", url="https://www.zillow.com/123_zpid/")),
+        now_utc=DUE_NOW,
+    )
     assert result.planned == []
 
 
@@ -219,3 +255,63 @@ def test_no_results_notice_only_when_opted_in(store):
     store.save_allowlist(Allowlist(people=[quiet, loud]))
     result = plan_pushes(store, listings(make_listing()), now_utc=DUE_NOW)
     assert result.no_results_for == [222]
+
+
+def test_no_results_notice_is_suppressed_for_an_incomplete_source_pool(store):
+    person = make_person(
+        111,
+        profile=Profile(searches=[make_search(city="Nowhere")], notify_on_no_results=True),
+    )
+    store.save_allowlist(Allowlist(people=[person]))
+    result = plan_pushes(
+        store,
+        listings(make_listing()),
+        now_utc=DUE_NOW,
+        allow_no_results=False,
+    )
+    assert result.no_results_for == []
+    assert result.summary["no_results_suppressed"] is True
+
+
+def test_a_delivered_no_results_notice_does_not_repeat_within_the_day(store):
+    """Regression: notices never advanced the due-gate, so the hourly job
+    re-sent "no new rentals" every hour until local midnight."""
+    person = make_person(
+        111,
+        profile=Profile(searches=[make_search(city="Nowhere")], notify_on_no_results=True),
+    )
+    store.save_allowlist(Allowlist(people=[person]))
+    store.save_settings(Settings(live_push_enabled=True))
+    sender = RecordingSender()
+
+    first = plan_pushes(store, listings(make_listing()), now_utc=DUE_NOW)
+    deliver(store, first, sender=sender, live=True, now_utc=DUE_NOW)
+    assert len(sender.sent) == 1
+    assert first.summary["no_results_sent"] == 1
+
+    an_hour_later = DUE_NOW + timedelta(hours=1)
+    second = plan_pushes(store, listings(make_listing()), now_utc=an_hour_later)
+    deliver(store, second, sender=sender, live=True, now_utc=an_hour_later)
+    assert len(sender.sent) == 1, "the notice must not repeat within one local day"
+    assert second.no_results_for == []
+
+    next_day = DUE_NOW + timedelta(days=1)
+    third = plan_pushes(store, listings(make_listing()), now_utc=next_day)
+    assert third.no_results_for == [111], "but the next local day is due again"
+
+
+def test_a_failed_notice_does_not_advance_the_due_gate(store):
+    person = make_person(
+        111,
+        profile=Profile(searches=[make_search(city="Nowhere")], notify_on_no_results=True),
+    )
+    store.save_allowlist(Allowlist(people=[person]))
+    store.save_settings(Settings(live_push_enabled=True))
+
+    first = plan_pushes(store, listings(make_listing()), now_utc=DUE_NOW)
+    result = deliver(store, first, sender=RecordingSender(fail_for={111}), live=True, now_utc=DUE_NOW)
+    assert result.summary["no_results_failed"] == 1
+
+    an_hour_later = DUE_NOW + timedelta(hours=1)
+    second = plan_pushes(store, listings(make_listing()), now_utc=an_hour_later)
+    assert second.no_results_for == [111], "a failed notice must stay retryable"

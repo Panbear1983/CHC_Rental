@@ -2,7 +2,7 @@
 2026-08-10 audit found in the SQLite build.
 """
 
-from chc_rental.dedup import dedup_key
+from chc_rental.dedup import dedup_key, upgrade_seen_key
 from chc_rental.models import Listing
 
 from tests.conftest import make_listing
@@ -49,5 +49,29 @@ def test_unit_distinguishes_two_listings_at_one_address():
     assert key(unit="4B") != key(unit="5C")
 
 
-def test_different_sources_are_distinct_identities():
-    assert key(source="feed-a") != key(source="feed-b")
+def test_different_sources_are_one_property_identity():
+    assert key(source="rentcast") == key(source="zillow")
+
+
+def test_common_street_suffixes_collapse_across_sources():
+    assert key(source="rentcast", address="100 Main Street") == key(
+        source="zillow", address="100 Main St."
+    )
+
+
+def test_embedded_and_separate_units_have_one_identity():
+    assert key(address="100 Main St Apt 4B", unit=None) == key(
+        address="100 Main Street", unit="APT 4B"
+    )
+
+
+def test_v2_seen_key_projects_to_the_new_source_independent_identity():
+    old = "v2:rentcast:tx:austin::100%20main%20street:apt%204b"
+    assert upgrade_seen_key(old) == key(
+        source="zillow", state="TX", city="Austin", address="100 Main St", unit="4B"
+    )
+
+
+def test_same_address_and_city_in_different_states_does_not_collide():
+    """v2 regression: "100 Main St, Springfield" exists in a dozen states."""
+    assert key(state="IL") != key(state="MO")

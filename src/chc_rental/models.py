@@ -45,6 +45,54 @@ class PropertyType(str, Enum):
     ROOM = "room"
     SINGLE_FAMILY = "single_family"
     MULTI_FAMILY = "multi_family"
+    # Types RentCast can return that nobody is expected to search for. They
+    # exist so a valid source record validates instead of landing in
+    # state/rejected/ every single day.
+    MANUFACTURED = "manufactured"
+    LAND = "land"
+    OTHER = "other"
+
+
+_US_STATE_NAME_TO_CODE = {
+    "alabama": "AL", "alaska": "AK", "arizona": "AZ", "arkansas": "AR",
+    "california": "CA", "colorado": "CO", "connecticut": "CT", "delaware": "DE",
+    "district of columbia": "DC", "washington dc": "DC", "washington d.c.": "DC",
+    "florida": "FL", "georgia": "GA", "hawaii": "HI", "idaho": "ID",
+    "illinois": "IL", "indiana": "IN", "iowa": "IA", "kansas": "KS",
+    "kentucky": "KY", "louisiana": "LA", "maine": "ME", "maryland": "MD",
+    "massachusetts": "MA", "michigan": "MI", "minnesota": "MN", "mississippi": "MS",
+    "missouri": "MO", "montana": "MT", "nebraska": "NE", "nevada": "NV",
+    "new hampshire": "NH", "new jersey": "NJ", "new mexico": "NM", "new york": "NY",
+    "north carolina": "NC", "north dakota": "ND", "ohio": "OH", "oklahoma": "OK",
+    "oregon": "OR", "pennsylvania": "PA", "rhode island": "RI", "south carolina": "SC",
+    "south dakota": "SD", "tennessee": "TN", "texas": "TX", "utah": "UT",
+    "vermont": "VT", "virginia": "VA", "washington": "WA", "west virginia": "WV",
+    "wisconsin": "WI", "wyoming": "WY", "puerto rico": "PR", "guam": "GU",
+    "u.s. virgin islands": "VI", "virgin islands": "VI", "american samoa": "AS",
+    "northern mariana islands": "MP",
+}
+
+
+def _normalize_state(value: Optional[str]) -> Optional[str]:
+    """Blank -> None; accept a full US state name OR a 2-letter code.
+
+    Full names are mapped to their code so a user who types "New York" is not
+    refused when they mean NY. A 2-letter input is accepted as-is (upper-cased):
+    kept lenient on purpose so canonical source codes always validate. Any other
+    string is rejected with a message that names both accepted forms.
+    """
+    if value is None:
+        return None
+    cleaned = value.strip()
+    if not cleaned:
+        return None
+    upper = cleaned.upper()
+    if len(upper) == 2 and upper.isalpha():
+        return upper
+    code = _US_STATE_NAME_TO_CODE.get(cleaned.lower())
+    if code is not None:
+        return code
+    raise ValueError("state must be a US state name or 2-letter code, e.g. Texas or TX")
 
 
 def _normalize_feature_list(values: list[str]) -> list[str]:
@@ -66,6 +114,7 @@ class Search(BaseModel):
     name: str
     active: bool = True
     city: str
+    state: Optional[str] = None
     district: Optional[str] = None
     price_min: int
     price_max: int
@@ -95,12 +144,24 @@ class Search(BaseModel):
             return None
         return value.strip() or None
 
+    @field_validator("state")
+    @classmethod
+    def state_must_be_two_letters(cls, value: Optional[str]) -> Optional[str]:
+        return _normalize_state(value)
+
     @field_validator("property_types", mode="before")
     @classmethod
     def normalize_property_type_strings(cls, value: list) -> list:
+        # Keep byte-identical to Listing.normalize_property_type_string, or a
+        # search for "single family" can never match a listing of that type.
         if not isinstance(value, list):
             return value
-        return [item.strip().lower() if isinstance(item, str) else item for item in value]
+        return [
+            item.strip().lower().replace(" ", "_").replace("-", "_")
+            if isinstance(item, str)
+            else item
+            for item in value
+        ]
 
     @field_validator("property_types")
     @classmethod
@@ -252,7 +313,22 @@ class Settings(BaseModel):
     scrape_timezone: str = DEFAULT_TIMEZONE
     global_daily_request_budget: int = 100
     per_source_daily_request_budget: int = 50
+    # Optional per-source overrides. Sources absent from this mapping keep the
+    # legacy ``per_source_daily_request_budget`` value, so existing config files
+    # continue to mean exactly what they meant before multi-source fetching.
+    source_daily_request_budgets: dict[str, int] = {
+        "zillow": 5,
+    }
+    # Zillow is an owner-approved, terms-flagged managed source. It must never
+    # activate merely because a token happens to exist in the environment.
+    zillow_enabled: bool = False
+    zillow_actor: str = "maxcopell~zillow-scraper"
+    zillow_results_limit: int = 25
+    zillow_timeout_seconds: int = 300
+    zillow_max_charge_usd: float = 0.25
     live_push_enabled: bool = False
+    # Operator alert channel; None disables alerting entirely.
+    owner_telegram_id: Optional[int] = None
     seen_retention_days: int = 90
     cache_retention_days: int = 7
     rejected_retention_days: int = 30
@@ -275,6 +351,8 @@ class Settings(BaseModel):
         "cache_retention_days",
         "rejected_retention_days",
         "backup_retention_days",
+        "zillow_results_limit",
+        "zillow_timeout_seconds",
     )
     @classmethod
     def must_be_non_negative_int(cls, value: int) -> int:
@@ -282,6 +360,49 @@ class Settings(BaseModel):
             raise ValueError("value must be a whole number")
         if value < 0:
             raise ValueError("value must not be negative")
+        return value
+
+    @field_validator("source_daily_request_budgets")
+    @classmethod
+    def source_budgets_must_be_non_negative(
+        cls, value: dict[str, int]
+    ) -> dict[str, int]:
+        cleaned: dict[str, int] = {}
+        for raw_name, raw_limit in value.items():
+            name = raw_name.strip().lower()
+            if not name:
+                raise ValueError("source budget names must not be blank")
+            if not isinstance(raw_limit, int) or isinstance(raw_limit, bool) or raw_limit < 0:
+                raise ValueError(f"source budget for {name} must be a non-negative whole number")
+            cleaned[name] = raw_limit
+        return cleaned
+
+    @field_validator("zillow_actor")
+    @classmethod
+    def zillow_actor_must_not_be_blank(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("zillow_actor must not be blank")
+        return cleaned
+
+    @field_validator("zillow_max_charge_usd")
+    @classmethod
+    def zillow_charge_cap_must_be_non_negative(cls, value: float) -> float:
+        if value < 0:
+            raise ValueError("zillow_max_charge_usd must not be negative")
+        return value
+
+    def source_request_budget(self, source: str) -> int:
+        """Return a source-specific ceiling with legacy-config fallback."""
+        return self.source_daily_request_budgets.get(
+            source.strip().lower(), self.per_source_daily_request_budget
+        )
+
+    @field_validator("owner_telegram_id")
+    @classmethod
+    def owner_telegram_id_must_be_positive(cls, value: Optional[int]) -> Optional[int]:
+        if value is not None and value <= 0:
+            raise ValueError("owner_telegram_id must be a positive integer")
         return value
 
 
@@ -296,6 +417,8 @@ class Listing(BaseModel):
     address: str
     unit: Optional[str] = None
     city: str
+    state: Optional[str] = None
+    postal_code: Optional[str] = None
     district: Optional[str] = None
     price: int
     property_type: PropertyType
@@ -321,12 +444,17 @@ class Listing(BaseModel):
             raise ValueError("url must be an http(s) link")
         return cleaned
 
-    @field_validator("source_listing_id", "unit", "district")
+    @field_validator("source_listing_id", "unit", "postal_code", "district")
     @classmethod
     def normalize_optional_text(cls, value: Optional[str]) -> Optional[str]:
         if value is None:
             return None
         return value.strip() or None
+
+    @field_validator("state")
+    @classmethod
+    def state_must_be_two_letters(cls, value: Optional[str]) -> Optional[str]:
+        return _normalize_state(value)
 
     @field_validator("property_type", mode="before")
     @classmethod

@@ -11,6 +11,9 @@ from typing import Optional
 
 from chc_rental.models import AllowlistEntry, Profile, Search, Settings
 from chc_rental.pipeline import PipelineResult, plan_pushes
+from chc_rental.sources import KNOWN_SOURCES
+from chc_rental.sources.rentcast import load_rentcast_key
+from chc_rental.sources.zillow import load_apify_token
 from chc_rental.store import Store, StoreError
 from chc_rental.tui.forms import parse_search_form
 
@@ -135,13 +138,85 @@ class TuiController:
     def latest_run(self) -> Optional[dict]:
         return self.store.latest_run_log()
 
+    @staticmethod
+    def _today() -> date:
+        # The runner keys quota/rejected files by the UTC date, so the status
+        # screen must look up the same day — local date.today() diverges from
+        # it every evening west of Greenwich.
+        return datetime.now(timezone.utc).date()
+
     def quota_today(self) -> tuple[int, int]:
         settings = self.store.load_settings()
-        used = self.store.quota_total(date.today())
+        used = self.store.quota_total(self._today())
         return used, settings.global_daily_request_budget
 
+    def source_status_today(self) -> list[dict]:
+        """Return real per-source config, quota, cache, and last-run state."""
+        today = self._today()
+        settings = self.store.load_settings()
+        env_path = str(self.store.root / ".env")
+        credentials = {
+            "rentcast": load_rentcast_key(env_path) is not None,
+            "zillow": load_apify_token(env_path) is not None,
+        }
+        latest = self.store.latest_run_log() or {}
+        fetch = latest.get("fetch") if isinstance(latest, dict) else {}
+        source_runs = fetch.get("sources") if isinstance(fetch, dict) else None
+        if not isinstance(source_runs, list):
+            source_runs = [fetch] if isinstance(fetch, dict) and fetch.get("source") else []
+        by_source = {
+            str(item.get("source")): item
+            for item in source_runs
+            if isinstance(item, dict) and item.get("source")
+        }
+
+        rows: list[dict] = []
+        for source in KNOWN_SOURCES:
+            budget = settings.source_request_budget(source)
+            enabled = credentials[source] and budget > 0
+            readiness = "ready" if enabled else "disabled"
+            if source == "zillow":
+                enabled = settings.zillow_enabled and credentials[source] and budget > 0
+                if not settings.zillow_enabled:
+                    readiness = "disabled"
+                elif not credentials[source]:
+                    readiness = "needs token"
+                elif budget <= 0 or settings.zillow_results_limit <= 0:
+                    readiness = "budget 0"
+                else:
+                    readiness = "ready"
+            elif not credentials[source]:
+                readiness = "needs key"
+            elif budget <= 0:
+                readiness = "budget 0"
+
+            run = by_source.get(source) or {}
+            if run.get("errors"):
+                health = "error"
+            elif run.get("from_cache"):
+                health = "cached"
+            elif run.get("fetched"):
+                health = "ok"
+            elif run.get("warnings"):
+                health = "waiting"
+            else:
+                health = "not run"
+            rows.append(
+                {
+                    "source": source,
+                    "enabled": enabled,
+                    "readiness": readiness,
+                    "used": self.store.quota_used(today, source),
+                    "budget": budget,
+                    "cached": self.store.cache_path(today, source).is_file(),
+                    "records": run.get("records", 0),
+                    "health": health,
+                }
+            )
+        return rows
+
     def rejected_today(self) -> int:
-        return self.store.rejected_count(date.today())
+        return self.store.rejected_count(self._today())
 
     def preview(self, listings, *, now_utc: Optional[datetime] = None) -> PipelineResult:
         return plan_pushes(

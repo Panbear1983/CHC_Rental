@@ -19,6 +19,7 @@ Every mutation is:
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import os
 import shutil
@@ -84,6 +85,12 @@ class Store:
     def cache_dir(self, day: date) -> Path:
         return self.state_dir / "cache" / day.isoformat()
 
+    def cache_path(self, day: date, source: str) -> Path:
+        return self.cache_dir(day) / f"{source}.json"
+
+    def cache_metadata_path(self, day: date, source: str) -> Path:
+        return self.cache_dir(day) / f"{source}.meta.json"
+
     # ------------------------------------------------------------- primitives
     def initialize(self) -> None:
         """Create the directory skeleton and default config if absent."""
@@ -115,6 +122,30 @@ class Store:
             yield
         finally:
             fcntl.flock(handle, fcntl.LOCK_UN)
+            os.close(handle)
+
+    @contextmanager
+    def try_run_lock(self) -> Iterator[bool]:
+        """Try to own the whole fetch/delivery cycle without blocking.
+
+        Per-file locks protect individual writes, but a managed Zillow actor can
+        run for minutes. This process-wide gate prevents a manual invocation
+        from overlapping the scheduled cycle and paying for the same scrape.
+        """
+        self._lock_dir.mkdir(parents=True, exist_ok=True)
+        handle = os.open(self._lock_dir / "run.lock", os.O_RDWR | os.O_CREAT, 0o600)
+        acquired = False
+        try:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+            except BlockingIOError:
+                yield False
+                return
+            yield True
+        finally:
+            if acquired:
+                fcntl.flock(handle, fcntl.LOCK_UN)
             os.close(handle)
 
     def _atomic_write(self, path: Path, text: str) -> None:
@@ -230,13 +261,47 @@ class Store:
     def has_seen(self, telegram_id: int, key: str) -> bool:
         return key in self.seen_keys(telegram_id)
 
-    def mark_seen(self, telegram_id: int, key: str, *, search_name: str, url: str) -> None:
-        """Record a delivered listing. Only ever called AFTER a confirmed send."""
+    def mark_seen(
+        self,
+        telegram_id: int,
+        key: str,
+        *,
+        search_name: str,
+        url: str,
+        now_utc: Optional[datetime] = None,
+    ) -> None:
+        """Record a delivered listing. Only ever called AFTER a confirmed send.
+
+        ``now_utc`` keeps the ledger stamp coherent with the run's simulated
+        instant when the CLI is driven with ``--now``; the due-gate compares
+        this stamp's local date against the planning clock, so the two must
+        tell the same time.
+        """
+        stamp = now_utc.astimezone(timezone.utc) if now_utc else _utc_now()
         record = {
             "key": key,
             "search": search_name,
             "url": url,
-            "sent_at": _utc_now().isoformat(),
+            "sent_at": stamp.isoformat(),
+        }
+        with self._locked(f"seen-{telegram_id}"):
+            self._atomic_append(self.seen_path(telegram_id), json.dumps(record, ensure_ascii=False))
+
+    def mark_notified(self, telegram_id: int, *, now_utc: Optional[datetime] = None) -> None:
+        """Record a delivered no-results notice so the due-gate advances.
+
+        Written to the same per-person ledger `last_sent_at` reads. Without
+        this stamp a notice-only day never advances the gate and the hourly
+        runner repeats the notice every hour until midnight. The ``notice:``
+        key prefix cannot collide with listing keys (those start ``v3:``), so
+        `seen_keys` stays safe to use for listing dedup.
+        """
+        stamp = now_utc.astimezone(timezone.utc) if now_utc else _utc_now()
+        record = {
+            "key": f"notice:{stamp.date().isoformat()}",
+            "search": "",
+            "url": "",
+            "sent_at": stamp.isoformat(),
         }
         with self._locked(f"seen-{telegram_id}"):
             self._atomic_append(self.seen_path(telegram_id), json.dumps(record, ensure_ascii=False))
@@ -310,17 +375,54 @@ class Store:
         """Keep an unusable record for operator review instead of dropping it.
 
         One malformed record must never abort a batch, and must never vanish.
+        The hourly runner revalidates a day cache repeatedly, so the same
+        source record/reason is fingerprinted and retained once per UTC day
+        instead of being appended 24 times.
         """
+        fingerprint = self._rejected_fingerprint(source=source, reason=reason, raw=raw)
         record = {
             "at": _utc_now().isoformat(),
             "source": source,
             "reason": reason,
             "raw": raw,
+            "fingerprint": fingerprint,
         }
         with self._locked("rejected"):
+            path = self.rejected_path(day)
+            if path.exists():
+                for line in path.read_text(encoding="utf-8").splitlines():
+                    try:
+                        existing = json.loads(line)
+                    except (json.JSONDecodeError, TypeError):
+                        continue
+                    if not isinstance(existing, dict):
+                        continue
+                    existing_fingerprint = existing.get("fingerprint")
+                    if not existing_fingerprint:
+                        try:
+                            existing_fingerprint = self._rejected_fingerprint(
+                                source=existing["source"],
+                                reason=existing["reason"],
+                                raw=existing["raw"],
+                            )
+                        except (KeyError, TypeError):
+                            continue
+                    if existing_fingerprint == fingerprint:
+                        return
             self._atomic_append(
-                self.rejected_path(day), json.dumps(record, ensure_ascii=False, default=str)
+                path, json.dumps(record, ensure_ascii=False, default=str)
             )
+
+    @staticmethod
+    def _rejected_fingerprint(*, source: str, reason: str, raw: Any) -> str:
+        stable = json.dumps(
+            {"source": source, "reason": reason, "raw": raw},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+        return hashlib.sha256(stable.encode("utf-8")).hexdigest()
 
     def rejected_count(self, day: date) -> int:
         path = self.rejected_path(day)
@@ -333,6 +435,20 @@ class Store:
             self._atomic_write(
                 self.run_log_path(day), json.dumps(payload, indent=2, sort_keys=True, default=str)
             )
+
+    def record_run(self, now_utc: datetime, payload: dict[str, Any]) -> Path:
+        """Write one run log per RUN, not per day.
+
+        The hourly job used to overwrite the day file: the 19:00 run that
+        delivered was erased by the 20:00 run that did nothing. Per-run files
+        keep the history; `latest_run_log` still returns the newest because
+        ``<date>T<time>Z.json`` sorts after ``<date>.json``.
+        """
+        stamp = now_utc.astimezone(timezone.utc).strftime("%Y-%m-%dT%H%M%SZ")
+        path = self.state_dir / "runs" / f"{stamp}.json"
+        with self._locked("runs"):
+            self._atomic_write(path, json.dumps(payload, indent=2, sort_keys=True, default=str))
+        return path
 
     def read_run_log(self, day: date) -> Optional[dict[str, Any]]:
         path = self.run_log_path(day)
@@ -353,15 +469,55 @@ class Store:
         return None
 
     # -------------------------------------------------------------------- cache
-    def cache_raw(self, day: date, source: str, payload: Any) -> Path:
-        target = self.cache_dir(day) / f"{source}.json"
+    def cache_raw(
+        self,
+        day: date,
+        source: str,
+        payload: Any,
+        *,
+        metadata: Optional[dict[str, Any]] = None,
+    ) -> Path:
+        target = self.cache_path(day, source)
+        metadata_path = self.cache_metadata_path(day, source)
+        # Invalidate metadata before replacing data. If the process crashes
+        # between the two atomic writes, the unscoped payload is refetched
+        # instead of being trusted under stale scope/coverage metadata.
+        metadata_path.unlink(missing_ok=True)
         self._atomic_write(target, json.dumps(payload, indent=2, default=str))
+        if metadata is not None:
+            envelope = {"schema_version": 1, **metadata}
+            self._atomic_write(
+                metadata_path,
+                json.dumps(envelope, indent=2, sort_keys=True, default=str),
+            )
         return target
 
-    def load_cached(self, day: date, source: str) -> Optional[Any]:
-        path = self.cache_dir(day) / f"{source}.json"
+    def load_cache_metadata(self, day: date, source: str) -> Optional[dict[str, Any]]:
+        path = self.cache_metadata_path(day, source)
         if not path.exists():
             return None
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return None
+        if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+            return None
+        return payload
+
+    def load_cached(
+        self,
+        day: date,
+        source: str,
+        *,
+        expected_query_scope: Optional[list[dict[str, str]]] = None,
+    ) -> Optional[Any]:
+        path = self.cache_path(day, source)
+        if not path.exists():
+            return None
+        if expected_query_scope is not None:
+            metadata = self.load_cache_metadata(day, source)
+            if metadata is None or metadata.get("query_scope") != expected_query_scope:
+                return None
         try:
             return json.loads(path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, TypeError, ValueError):
@@ -370,7 +526,7 @@ class Store:
     # ---------------------------------------------------------------- retention
     def prune(self, *, today: date, settings: Settings) -> dict[str, int]:
         """Delete state older than the configured retention. Returns counts removed."""
-        removed = {"quota": 0, "runs": 0, "rejected": 0, "cache": 0, "backups": 0}
+        removed = {"quota": 0, "runs": 0, "rejected": 0, "cache": 0, "backups": 0, "seen": 0}
 
         def _dated_cleanup(directory: Path, days: int, bucket: str, suffix: str) -> None:
             if not directory.exists():
@@ -379,7 +535,8 @@ class Store:
             for path in directory.iterdir():
                 stem = path.name[: -len(suffix)] if suffix and path.name.endswith(suffix) else path.name
                 try:
-                    stamp = date.fromisoformat(stem)
+                    # stem[:10] so per-run logs (2026-08-11T072106Z) date-parse too.
+                    stamp = date.fromisoformat(stem[:10])
                 except ValueError:
                     continue
                 if stamp < cutoff:
@@ -404,7 +561,59 @@ class Store:
                 ) < cutoff_dt:
                     path.unlink(missing_ok=True)
                     removed["backups"] += 1
+
+        removed["seen"] = self._prune_seen(today, settings.seen_retention_days)
+        self._trim_daily_log()
         return removed
+
+    def _prune_seen(self, today: date, retention_days: int) -> int:
+        """Drop seen-ledger records older than the retention window.
+
+        This is what makes ``seen_retention_days`` real (Decision #5): after
+        the window, a still-listed rental may notify again — accepted. Each
+        person's file is rewritten atomically under their ledger lock, and a
+        retention of 0 is treated as "keep forever" so a bad config cannot
+        wipe every ledger in one prune.
+        """
+        if retention_days <= 0:
+            return 0
+        seen_dir = self.state_dir / "seen"
+        if not seen_dir.exists():
+            return 0
+        cutoff = datetime.combine(today - timedelta(days=retention_days), datetime.min.time(),
+                                  tzinfo=timezone.utc)
+        dropped = 0
+        for path in seen_dir.glob("*.jsonl"):
+            with self._locked(f"seen-{path.stem}"):
+                kept: list[str] = []
+                for line in path.read_text(encoding="utf-8").splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        stamp = datetime.fromisoformat(json.loads(line)["sent_at"])
+                    except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+                        kept.append(line)  # keep what cannot be judged
+                        continue
+                    if stamp.tzinfo is None:
+                        stamp = stamp.replace(tzinfo=timezone.utc)
+                    if stamp < cutoff:
+                        dropped += 1
+                    else:
+                        kept.append(line)
+                self._atomic_write(path, "".join(f"{line}\n" for line in kept))
+        return dropped
+
+    def _trim_daily_log(self, *, max_bytes: int = 512_000, keep_lines: int = 2000) -> None:
+        """Stop state/daily.log (launchd append target) growing without bound."""
+        log = self.state_dir / "daily.log"
+        try:
+            if not log.is_file() or log.stat().st_size <= max_bytes:
+                return
+            lines = log.read_text(encoding="utf-8", errors="replace").splitlines()[-keep_lines:]
+            self._atomic_write(log, "".join(f"{line}\n" for line in lines))
+        except OSError:
+            return
 
 
 def listing_from_raw(raw: Any) -> Listing:

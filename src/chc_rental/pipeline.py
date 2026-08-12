@@ -24,7 +24,7 @@ from typing import Any, Iterable, Optional, Protocol, Sequence
 
 from pydantic import ValidationError
 
-from chc_rental.dedup import dedup_key
+from chc_rental.dedup import dedup_key, upgrade_seen_key
 from chc_rental.matching import matches_search
 from chc_rental.models import AllowlistEntry, Listing
 from chc_rental.notification_schedule import is_profile_due
@@ -103,21 +103,29 @@ def validate_records(
             listings.append(Listing.model_validate(raw))
         except ValidationError as exc:
             rejected += 1
-            store.record_rejected(day, source=source, reason=str(exc), raw=raw)
+            record_source = raw.get("source") if isinstance(raw, dict) else None
+            store.record_rejected(
+                day, source=str(record_source or source), reason=str(exc), raw=raw
+            )
     return listings, rejected
 
 
+def _listing_preference(listing: Listing) -> tuple[int, int]:
+    """Prefer a direct Zillow link over an address-only Maps fallback."""
+    is_zillow = int(listing.source.strip().lower() == "zillow")
+    is_direct = int("google.com/maps/" not in listing.url.lower())
+    return is_zillow, is_direct
+
+
 def _unique(listings: Sequence[Listing]) -> list[Listing]:
-    """Collapse identical listings arriving from one or more sources."""
-    seen: set[str] = set()
-    unique: list[Listing] = []
+    """Collapse cross-source duplicates while retaining the best link."""
+    unique: dict[str, Listing] = {}
     for listing in listings:
         key = dedup_key(listing)
-        if key in seen:
-            continue
-        seen.add(key)
-        unique.append(listing)
-    return unique
+        current = unique.get(key)
+        if current is None or _listing_preference(listing) > _listing_preference(current):
+            unique[key] = listing
+    return list(unique.values())
 
 
 def plan_pushes(
@@ -125,6 +133,7 @@ def plan_pushes(
     listings: Sequence[Listing],
     *,
     now_utc: datetime,
+    allow_no_results: bool = True,
 ) -> PipelineResult:
     """Work out exactly what each allowlisted person should receive."""
     allowlist = store.load_allowlist()
@@ -141,7 +150,12 @@ def plan_pushes(
             continue
         due_count += 1
 
-        already_seen = store.seen_keys(person.telegram_id)
+        # Project legacy v2 keys into the source-independent v3 identity at
+        # read time. This avoids both a destructive ledger rewrite and a wave
+        # of repeat notifications when the second source is enabled.
+        already_seen = {
+            upgrade_seen_key(key) for key in store.seen_keys(person.telegram_id)
+        }
         planned_this_run: set[str] = set()
         person_items: list[PlannedPush] = []
 
@@ -169,7 +183,7 @@ def plan_pushes(
 
         if person_items:
             result.planned.extend(person_items)
-        elif person.profile.notify_on_no_results:
+        elif person.profile.notify_on_no_results and allow_no_results:
             result.no_results_for.append(person.telegram_id)
 
     result.summary = {
@@ -179,6 +193,7 @@ def plan_pushes(
         "listings_in": len(listings),
         "listings_unique": len(unique),
         "planned_pushes": len(result.planned),
+        "no_results_suppressed": bool(not allow_no_results),
         "no_results_notices": len(result.no_results_for),
     }
     return result
@@ -190,8 +205,13 @@ def deliver(
     *,
     sender: Optional[PushSender],
     live: bool = False,
+    now_utc: Optional[datetime] = None,
 ) -> PipelineResult:
-    """Send the planned pushes. Without ``live`` and a sender this is a no-op."""
+    """Send the planned pushes. Without ``live`` and a sender this is a no-op.
+
+    Pass the same ``now_utc`` that planning used so ledger stamps and the
+    due-gate share one clock; None falls back to the wall clock.
+    """
     settings = store.load_settings()
     if not live or not settings.live_push_enabled or sender is None:
         result.summary["delivery"] = "dry-run"
@@ -213,20 +233,33 @@ def deliver(
             item.key,
             search_name=item.search_name,
             url=item.listing.url,
+            now_utc=now_utc,
         )
         result.sent += 1
 
+    # Notices are tallied apart from listing pushes: ``sent``/``failed`` feed
+    # the status screen's push counts, and a failed courtesy notice must not
+    # masquerade as an undelivered listing.
+    notices_sent = 0
+    notices_failed = 0
     for telegram_id in result.no_results_for:
         if not allowlist.is_allowlisted(telegram_id):
             continue
         try:
             sender.send(telegram_id=telegram_id, text="No new rentals matched your searches today.")
         except Exception:
-            result.failed += 1
+            notices_failed += 1
+            continue
+        # Stamp the ledger so the due-gate advances: without this an hourly
+        # runner re-sends the notice every hour until local midnight.
+        store.mark_notified(telegram_id, now_utc=now_utc)
+        notices_sent += 1
 
     result.summary["delivery"] = "live"
     result.summary["sent"] = result.sent
     result.summary["failed"] = result.failed
+    result.summary["no_results_sent"] = notices_sent
+    result.summary["no_results_failed"] = notices_failed
     return result
 
 

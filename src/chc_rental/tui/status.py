@@ -35,6 +35,8 @@ class StatusScreen(Screen[None]):
         yield Label("", id="quota-summary")
         yield Label("", id="run-summary")
         yield Label("", id="push-summary")
+        yield Label("Listing sources")
+        yield DataTable(id="source-status-table")
         yield Label("Searches by person")
         yield DataTable(id="search-summary-table")
         with Horizontal(classes="action-row"):
@@ -43,6 +45,9 @@ class StatusScreen(Screen[None]):
         yield Footer()
 
     def on_mount(self) -> None:
+        sources = self.query_one("#source-status-table", DataTable)
+        sources.cursor_type = "row"
+        sources.add_columns("Source", "Config", "Requests", "Cache", "Records", "Last result")
         table = self.query_one("#search-summary-table", DataTable)
         table.cursor_type = "row"
         table.add_columns("Telegram ID", "Person", "Allowlisted", "Active searches", "Delivery")
@@ -64,14 +69,31 @@ class StatusScreen(Screen[None]):
             used, limit = self._controller.quota_today()
             rejected = self._controller.rejected_today()
             settings = self._controller.settings()
-            mode = "LIVE PUSH ENABLED" if settings.live_push_enabled else "dry-run only"
         except Exception as exc:
             self.query_one("#quota-summary", Label).update(f"Could not read settings: {exc}")
-            used = limit = rejected = 0
-            mode = "unknown"
-        self.query_one("#quota-summary", Label).update(
-            f"Requests today: {used}/{limit} · rejected records today: {rejected} · {mode}"
-        )
+        else:
+            mode = "LIVE PUSH ENABLED" if settings.live_push_enabled else "dry-run only"
+            self.query_one("#quota-summary", Label).update(
+                f"Requests today: {used}/{limit} · rejected records today: {rejected} · {mode}"
+            )
+
+        source_table = self.query_one("#source-status-table", DataTable)
+        source_table.clear()
+        try:
+            source_rows = self._controller.source_status_today()
+        except Exception as exc:
+            source_table.add_row("—", f"unavailable: {exc}", "—", "—", "—", "error")
+        else:
+            for row in source_rows:
+                source_table.add_row(
+                    row["source"],
+                    row["readiness"],
+                    f"{row['used']}/{row['budget']}",
+                    "today" if row["cached"] else "none",
+                    str(row["records"]),
+                    row["health"],
+                    key=row["source"],
+                )
 
         run = None
         try:

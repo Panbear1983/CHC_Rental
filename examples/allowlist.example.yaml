@@ -10,23 +10,25 @@ people:
       searches:
         - name: Downtown 2BR
           active: true
-          city: Taipei
-          district: Da'an
-          price_min: 20000
-          price_max: 35000
+          city: Austin
+          state: TX
+          district:
+          price_min: 1500
+          price_max: 3000
           property_types: [apartment, condo]
           bed_min: 2
           bed_max: 3
           bath_min: 1.0
           bath_max: 2.0
-          required_features: [elevator]
+          required_features: []
           excluded_features: []
           daily_cap: 5
         - name: Cheap studio
           active: true
-          city: Taipei
-          price_min: 8000
-          price_max: 20000
+          city: Austin
+          state: TX
+          price_min: 900
+          price_max: 1800
           property_types: [studio, room]
           bed_min: 0
           bed_max: 1

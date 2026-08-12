@@ -1,12 +1,15 @@
 """Command-line entry point for the daily run.
 
-Until Phase 3 supplies vetted source adapters, listings come from a local JSON
-fixture. The pipeline, dedup, capping and delivery gating are all real, so the
-only thing that changes when a source lands is where the records come from.
+Listings come from every enabled source adapter (RentCast plus optional Zillow)
+or from a local JSON fixture for offline runs and tests. Fetching is separately
+day-cached and budget-capped per source in `chc_rental.fetch`; everything
+downstream (validate, match, dedupe, cap, deliver) consumes the combined pool.
 
     chc-rental init
+    chc-rental run                        # all configured sources (cached per day)
     chc-rental run --fixture listings.json
-    chc-rental run --fixture listings.json --live
+    chc-rental run --live
+    chc-rental check
     chc-rental prune
 """
 
@@ -18,11 +21,31 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Optional, Sequence
 
+from chc_rental.fetch import fetch_many_daily
 from chc_rental.notify.telegram import build_sender
-from chc_rental.pipeline import deliver, plan_pushes, validate_records
+from chc_rental.pipeline import PipelineResult, deliver, plan_pushes, validate_records
+from chc_rental.sources import configured_adapters
 from chc_rental.store import Store, StoreError
 
 FIXTURE_SOURCE = "fixture"
+
+
+def _alert_owner(store: Store, env_file: str, text: str) -> None:
+    """Best-effort Telegram alert to the operator. Must never break the run.
+
+    Independent of `live_push_enabled`: that flag gates pushes to recipients,
+    while this is the operator channel that reports the system's own health.
+    """
+    try:
+        settings = store.load_settings()
+        if not settings.owner_telegram_id:
+            return
+        sender = build_sender(env_file)
+        if sender is None:
+            return
+        sender.send(telegram_id=settings.owner_telegram_id, text=f"[chc-rental] {text}")
+    except Exception:
+        pass
 
 
 def _parse_now(value: str) -> datetime:
@@ -60,28 +83,97 @@ def _cmd_run(args: argparse.Namespace) -> int:
     store = Store(args.root)
     store.initialize()
     now_utc = _parse_now(args.now) if args.now else datetime.now(timezone.utc)
+    with store.try_run_lock() as acquired:
+        if not acquired:
+            print("another CHC_Rental run is already in progress; nothing to do")
+            return 0
+        try:
+            return _run_once(store, args, now_utc)
+        except Exception as exc:
+            # The daily job is unattended; a crash nobody sees is a silent outage.
+            _alert_owner(
+                store, getattr(args, "env_file", ".env"),
+                f"daily run crashed: {type(exc).__name__}: {exc}",
+            )
+            raise
+
+
+def _run_once(store: Store, args: argparse.Namespace, now_utc: datetime) -> int:
     today = now_utc.date()
 
-    if not args.fixture:
-        # No source adapter exists yet, so an unattended run has nothing to
-        # fetch. Doing nothing is the only safe outcome — inventing listings
-        # would push fabricated data to real people.
-        print("no listing source configured; nothing to do (see Phase 0/3 in the plan)")
-        store.write_run_log(
-            today,
-            {
-                "finished_at": datetime.now(timezone.utc).isoformat(),
-                "summary": {"delivery": "skipped", "reason": "no listing source configured"},
-            },
-        )
-        return 0
+    def record(summary: dict[str, Any], *, rejected: int = 0, fetch: Optional[dict] = None) -> None:
+        payload: dict[str, Any] = {
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+            "summary": summary,
+            "rejected": rejected,
+        }
+        if fetch is not None:
+            payload["fetch"] = fetch
+        store.record_run(now_utc, payload)
 
-    raw = _load_fixture(Path(args.fixture))
-    listings, rejected = validate_records(store, raw, day=today, source=FIXTURE_SOURCE)
+    if args.fixture:
+        raw = _load_fixture(Path(args.fixture))
+        source = FIXTURE_SOURCE
+        fetch_summary: dict[str, Any] = {"source": source, "fixture": str(args.fixture)}
+        pool_complete = True
+    else:
+        settings = store.load_settings()
+        adapters, configuration_warnings = configured_adapters(
+            settings, env_path=args.env_file
+        )
+        if not adapters:
+            reason = "no listing source configured"
+            if configuration_warnings:
+                reason += ": " + "; ".join(configuration_warnings)
+            print(
+                f"{reason}; nothing to do "
+                f"(configure a source in {args.env_file} or use --fixture)"
+            )
+            record({"delivery": "skipped", "reason": reason})
+            return 1 if configuration_warnings else 0
+
+        pool = fetch_many_daily(
+            store,
+            adapters,
+            now_utc=now_utc,
+            configuration_warnings=configuration_warnings,
+        )
+        fetch_summary = pool.summary()
+        for note in pool.configuration_warnings:
+            print(f"source configuration: {note}")
+        for report in pool.sources:
+            for note in report.warnings:
+                print(f"note [{report.source}]: {note}")
+            for error in report.errors:
+                print(f"fetch error [{report.source}]: {error}")
+        if not pool.usable:
+            # Either every source failed, or it is before scrape time / there
+            # are no fetchable searches. Planning against an empty pool here
+            # would turn an outage into a false "nothing matched" notification.
+            notes = list(pool.configuration_warnings)
+            for report in pool.sources:
+                notes.extend(report.errors or report.warnings)
+            reason = "; ".join(notes) or "no listing pool"
+            print(f"no usable listing pool ({reason}); skipping plan/deliver")
+            if any(report.errors for report in pool.sources) and not _same_failure_as_last_run(
+                store, reason
+            ):
+                _alert_owner(store, args.env_file, f"fetch failed, no pushes today: {reason}")
+            record({"delivery": "skipped", "reason": reason}, fetch=fetch_summary)
+            return 1 if any(report.errors for report in pool.sources) else 0
+        raw = pool.records
+        source = "multi-source-pool"
+        pool_complete = pool.complete
+
+    listings, rejected = validate_records(store, raw, day=today, source=source)
     if rejected:
         print(f"note: {rejected} record(s) failed validation and were kept in state/rejected/")
 
-    result = plan_pushes(store, listings, now_utc=now_utc)
+    result = plan_pushes(
+        store, listings, now_utc=now_utc, allow_no_results=pool_complete
+    )
+    if not pool_complete:
+        print("note: source coverage was incomplete; no-results notices are suppressed")
 
     sender = build_sender(args.env_file) if args.live else None
     if args.live and sender is None:
@@ -89,25 +181,87 @@ def _cmd_run(args: argparse.Namespace) -> int:
             "note: --live ignored. No usable TELEGRAM_BOT_TOKEN in "
             f"{args.env_file} (it is still 'changeme' or absent)."
         )
-    result = deliver(store, result, sender=sender, live=args.live)
+    result = deliver(store, result, sender=sender, live=args.live, now_utc=now_utc)
 
     print(result.preview())
     print("SUMMARY " + json.dumps(result.summary, sort_keys=True))
 
-    store.write_run_log(
-        today,
-        {
-            "finished_at": datetime.now(timezone.utc).isoformat(),
-            "summary": result.summary,
-            "rejected": rejected,
-        },
-    )
+    _alert_on_problems(store, args.env_file, result, fetch_summary)
+    record(result.summary, rejected=rejected, fetch=fetch_summary)
     if args.live and result.summary.get("delivery") != "live":
         print(
             "note: --live had no effect. Set live_push_enabled: true in "
-            "config/settings.yaml and supply a sender (Phase 5)."
+            "config/settings.yaml and supply a sender."
         )
     return 0
+
+
+def _same_failure_as_last_run(store: Store, reason: str) -> bool:
+    """True when the most recent run already recorded this exact failure.
+
+    Alert on the first occurrence of a failure streak, then stay quiet until
+    something changes — an unattended hourly job must not page the operator
+    24 times about one broken subscription.
+    """
+    try:
+        last = store.latest_run_log() or {}
+        return (last.get("summary") or {}).get("reason") == reason
+    except Exception:
+        return False
+
+
+def _alert_on_problems(
+    store: Store, env_file: str, result: PipelineResult, fetch_summary: dict[str, Any]
+) -> None:
+    problems = _problem_messages(fetch_summary, result.summary)
+    if not problems:
+        return
+
+    # A truncated day cache is replayed hourly by design. Alert on the first
+    # occurrence of a problem streak and whenever the signature changes, not
+    # on every free cache replay. This runs before the current run is recorded,
+    # so latest_run_log is the previous cycle.
+    try:
+        previous = store.latest_run_log() or {}
+        previous_problems = _problem_messages(
+            previous.get("fetch") or {}, previous.get("summary") or {}
+        )
+    except Exception:
+        previous_problems = []
+    if problems == previous_problems:
+        return
+    _alert_owner(store, env_file, " · ".join(problems))
+
+
+def _problem_messages(
+    fetch_summary: dict[str, Any], result_summary: dict[str, Any]
+) -> list[str]:
+    """Stable operator-problem signature shared by live and cached runs."""
+    problems: list[str] = []
+    source_summaries = fetch_summary.get("sources")
+    if not isinstance(source_summaries, list):
+        source_summaries = [fetch_summary]
+    for source_summary in source_summaries:
+        if not isinstance(source_summary, dict):
+            continue
+        source = str(source_summary.get("source", "source"))
+        if source_summary.get("errors"):
+            problems.append(
+                f"{source} fetch errors: " + "; ".join(source_summary["errors"])
+            )
+        if source_summary.get("truncated"):
+            problems.append(f"{source} fetch was truncated")
+    if fetch_summary.get("configuration_warnings"):
+        problems.append(
+            "source configuration: " + "; ".join(fetch_summary["configuration_warnings"])
+        )
+    failed = result_summary.get("failed", 0)
+    notices_failed = result_summary.get("no_results_failed", 0)
+    if failed:
+        problems.append(f"{failed} push(es) failed to send")
+    if notices_failed:
+        problems.append(f"{notices_failed} no-results notice(s) failed to send")
+    return problems
 
 
 def _cmd_check(args: argparse.Namespace) -> int:
@@ -160,8 +314,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     run_parser = sub.add_parser("run", help="Plan (and optionally send) today's push")
     run_parser.add_argument(
         "--fixture",
-        help="JSON file holding listing objects. Omit once a source adapter exists; "
-        "with neither, the run does nothing rather than invent listings.",
+        help="JSON file holding listing objects; overrides all network sources. "
+        "Without it and without an enabled credentialed source, the run does "
+        "nothing rather than invent listings.",
     )
     run_parser.add_argument("--now", help="Override the current instant (ISO 8601 with offset)")
     run_parser.add_argument(

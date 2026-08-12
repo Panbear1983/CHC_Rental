@@ -29,6 +29,17 @@ def test_district_only_constrains_when_the_search_sets_one():
     assert matches_search(listing(district="Anywhere"), make_search(district=None)) is True
 
 
+def test_missing_district_can_use_an_exact_city_name_fallback():
+    assert matches_search(
+        listing(city="Brooklyn", state="TX", district=None),
+        make_search(city="Brooklyn", state="TX", district="Brooklyn"),
+    ) is True
+    assert matches_search(
+        listing(city="Austin", state="TX", district=None),
+        make_search(city="Austin", state="TX", district="Downtown"),
+    ) is False
+
+
 @pytest.mark.parametrize(
     "price,expected", [(999, False), (1000, True), (2000, True), (3000, True), (3001, False)]
 )
@@ -67,3 +78,33 @@ def test_required_and_excluded_features():
     assert not matches_search(
         listing(features=["basement"]), make_search(excluded_features=["basement"])
     )
+
+
+def test_state_only_constrains_when_the_search_sets_one():
+    search = make_search(state="TX")
+    assert matches_search(listing(state="TX"), search) is True
+    assert matches_search(listing(state="tx"), search) is True
+    assert matches_search(listing(state="CA"), search) is False
+    assert matches_search(listing(state=None), search) is False, (
+        "a stateless listing must not match across state lines"
+    )
+    assert matches_search(listing(state="CA"), make_search(state=None)) is True
+
+
+def test_state_accepts_full_name_or_code():
+    """Regression for the 2026-08-12 'cannot add search' report: typing the
+    full state name (New York) must not be refused when the user means NY."""
+    from chc_rental.models import _normalize_state
+    assert _normalize_state("New York") == "NY"
+    assert _normalize_state("new york") == "NY"
+    assert _normalize_state("NY") == "NY"
+    assert _normalize_state(" Texas ") == "TX"
+    assert _normalize_state("California") == "CA"
+    assert _normalize_state("") is None
+    for bad in ("Brooklyn", "New Yrok", "ZZZ"):
+        try:
+            _normalize_state(bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"{bad!r} should have been rejected")

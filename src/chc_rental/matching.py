@@ -18,8 +18,19 @@ def matches_search(listing: Listing, search: Search) -> bool:
     if _normalize_text(listing.city) != _normalize_text(search.city):
         return False
 
+    # A search that names a state only accepts listings that state theirs and
+    # agree — "Springfield" alone must not match across state lines.
+    if search.state is not None:
+        if _normalize_text(listing.state) != _normalize_text(search.state):
+            return False
+
     if search.district is not None:
-        if _normalize_text(listing.district) != _normalize_text(search.district):
+        # Providers commonly return borough-like places (for example,
+        # Brooklyn) as the city and omit a separate district. Allow that exact
+        # city fallback, but keep named neighborhoods strict: a missing
+        # district in Austin still cannot match a "Downtown" search.
+        listing_district = listing.district or listing.city
+        if _normalize_text(listing_district) != _normalize_text(search.district):
             return False
 
     if not (search.price_min <= listing.price <= search.price_max):
