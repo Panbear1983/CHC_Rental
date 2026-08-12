@@ -21,6 +21,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Optional, Sequence
 
+from chc_rental.event_store import AlertStoreError
 from chc_rental.fetch import fetch_many_daily
 from chc_rental.notify.telegram import build_sender
 from chc_rental.pipeline import PipelineResult, deliver, plan_pushes, validate_records
@@ -302,6 +303,45 @@ def _cmd_prune(args: argparse.Namespace) -> int:
     return 0
 
 
+def _alert_foundation_status(store: Store) -> dict[str, Any]:
+    return {
+        "config": store.config_v2_status(),
+        "ledger": store.alert_migration_status().as_dict(),
+    }
+
+
+def _cmd_alerts_migrate(args: argparse.Namespace) -> int:
+    """Inspect or apply the inert incremental-alert foundation."""
+    store = Store(args.root)
+    store.initialize()
+    if args.apply:
+        config = store.migrate_config_v2()
+        ledger = store.migrate_alert_ledger().as_dict()
+        payload = {"config": config, "ledger": ledger}
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return 0 if config["ready"] and ledger["ready"] else 1
+    print(json.dumps(_alert_foundation_status(store), indent=2, sort_keys=True))
+    return 0
+
+
+def _cmd_alerts_status(args: argparse.Namespace) -> int:
+    """Read-only foundation status; never creates the alert database."""
+    store = Store(args.root)
+    store.initialize()
+    payload = _alert_foundation_status(store)
+    if args.json:
+        print(json.dumps(payload, sort_keys=True))
+    else:
+        config = payload["config"]
+        ledger = payload["ledger"]
+        print(
+            "incremental foundation: "
+            f"config={'ready' if config['ready'] else 'migration needed'}, "
+            f"ledger={'ready' if ledger['ready'] else 'migration needed'}"
+        )
+    return 0
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(prog="chc-rental", description="CHC Rental daily runner.")
     parser.add_argument("--root", default=".", help="Data directory (default: %(default)s)")
@@ -335,10 +375,37 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         func=_cmd_prune
     )
 
+    alerts_parser = sub.add_parser(
+        "alerts", help="Incremental-alert migration and read-only status"
+    )
+    alerts_sub = alerts_parser.add_subparsers(dest="alerts_command", required=True)
+    migrate_parser = alerts_sub.add_parser(
+        "migrate", help="Inspect or apply config/ledger migrations"
+    )
+    migrate_mode = migrate_parser.add_mutually_exclusive_group()
+    migrate_mode.add_argument(
+        "--apply",
+        action="store_true",
+        help="Back up config and apply pending incremental-alert migrations",
+    )
+    migrate_mode.add_argument(
+        "--check",
+        action="store_false",
+        dest="apply",
+        help="Inspect pending migrations without changing config or state (default)",
+    )
+    migrate_parser.set_defaults(apply=False)
+    migrate_parser.set_defaults(func=_cmd_alerts_migrate)
+    alerts_status_parser = alerts_sub.add_parser(
+        "status", help="Show incremental foundation readiness without changing it"
+    )
+    alerts_status_parser.add_argument("--json", action="store_true")
+    alerts_status_parser.set_defaults(func=_cmd_alerts_status)
+
     args = parser.parse_args(argv)
     try:
         return args.func(args)
-    except (ValueError, StoreError) as exc:
+    except (ValueError, StoreError, AlertStoreError) as exc:
         parser.error(str(exc))
         return 2
 

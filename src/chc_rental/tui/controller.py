@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from datetime import date, datetime, timezone
 from typing import Optional
+from uuid import uuid4
 
 from chc_rental.models import AllowlistEntry, Profile, Search, Settings
 from chc_rental.pipeline import PipelineResult, plan_pushes
@@ -69,6 +70,7 @@ class TuiController:
 
     def add_search(self, telegram_id: int, form_data: dict) -> None:
         search = parse_search_form(form_data)
+        search.search_id = str(uuid4())
         with self.store.edit_allowlist() as allowlist:
             person = allowlist.get(telegram_id)
             if person is None:
@@ -93,6 +95,7 @@ class TuiController:
             }
             if search.name.lower() in clashes:
                 raise DuplicateError(f"this profile already has a search named {search.name!r}")
+            search.search_id = person.profile.searches[index].search_id
             person.profile.searches[index] = search
 
     def delete_search(self, telegram_id: int, index: int) -> None:

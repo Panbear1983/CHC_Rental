@@ -28,11 +28,18 @@ from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator, Optional
+from uuid import uuid4
 
 import yaml
 from pydantic import ValidationError
 
-from chc_rental.models import Allowlist, Listing, Settings
+from chc_rental.event_store import AlertMigrationStatus, EventStore
+from chc_rental.models import (
+    ALERT_CONFIG_SCHEMA_VERSION,
+    Allowlist,
+    Listing,
+    Settings,
+)
 
 CONFIG_DIR = "config"
 STATE_DIR = "state"
@@ -90,6 +97,14 @@ class Store:
 
     def cache_metadata_path(self, day: date, source: str) -> Path:
         return self.cache_dir(day) / f"{source}.meta.json"
+
+    @property
+    def alert_db_path(self) -> Path:
+        return self.state_dir / "alerts.sqlite3"
+
+    def event_store(self) -> EventStore:
+        """Return the lazy operational-ledger boundary without opening a DB."""
+        return EventStore(self.alert_db_path, backup_dir=self.backup_dir)
 
     # ------------------------------------------------------------- primitives
     def initialize(self) -> None:
@@ -240,6 +255,113 @@ class Store:
         with self._locked("settings"):
             self._backup(self.settings_path)
             self._write_yaml(self.settings_path, settings.model_dump(mode="json"))
+
+    # --------------------------------------------------- incremental migration
+    def config_v2_status(self) -> dict[str, Any]:
+        """Inspect config migration readiness without changing either file."""
+        allowlist_raw = self._read_yaml(self.allowlist_path)
+        settings_raw = self._read_yaml(self.settings_path)
+        missing_search_ids = 0
+        search_ids: list[str] = []
+        people = allowlist_raw.get("people")
+        if isinstance(people, list):
+            for person in people:
+                if not isinstance(person, dict):
+                    continue
+                profile = person.get("profile")
+                searches = profile.get("searches") if isinstance(profile, dict) else None
+                if not isinstance(searches, list):
+                    continue
+                for search in searches:
+                    if not isinstance(search, dict):
+                        continue
+                    search_id = str(search.get("search_id") or "").strip()
+                    if search_id:
+                        search_ids.append(search_id)
+                    else:
+                        missing_search_ids += 1
+        duplicates = sorted({item for item in search_ids if search_ids.count(item) > 1})
+        allowlist_version = int(allowlist_raw.get("schema_version", 1))
+        settings_version = int(settings_raw.get("schema_version", 1))
+        ready = (
+            allowlist_version >= ALERT_CONFIG_SCHEMA_VERSION
+            and settings_version >= ALERT_CONFIG_SCHEMA_VERSION
+            and missing_search_ids == 0
+            and not duplicates
+        )
+        return {
+            "target_version": ALERT_CONFIG_SCHEMA_VERSION,
+            "allowlist_version": allowlist_version,
+            "settings_version": settings_version,
+            "missing_search_ids": missing_search_ids,
+            "duplicate_search_ids": duplicates,
+            "ready": ready,
+        }
+
+    def migrate_config_v2(self) -> dict[str, Any]:
+        """Assign stable search IDs and persist schema-v2 defaults safely.
+
+        Both YAML documents are validated before either is replaced. Backups are
+        restored if a write fails, so the daily workflow never sees a half-
+        migrated configuration.
+        """
+        with self._locked("allowlist"), self._locked("settings"):
+            allowlist_raw = self._read_yaml(self.allowlist_path)
+            settings_raw = self._read_yaml(self.settings_path)
+
+            ids: set[str] = set()
+            people = allowlist_raw.get("people")
+            if isinstance(people, list):
+                for person in people:
+                    if not isinstance(person, dict):
+                        continue
+                    profile = person.get("profile")
+                    searches = profile.get("searches") if isinstance(profile, dict) else None
+                    if not isinstance(searches, list):
+                        continue
+                    for search in searches:
+                        if not isinstance(search, dict):
+                            continue
+                        raw_id = str(search.get("search_id") or "").strip()
+                        if raw_id:
+                            if raw_id in ids:
+                                raise StoreError(f"duplicate search_id prevents migration: {raw_id}")
+                            ids.add(raw_id)
+                            continue
+                        new_id = str(uuid4())
+                        while new_id in ids:
+                            new_id = str(uuid4())
+                        search["search_id"] = new_id
+                        ids.add(new_id)
+
+            allowlist_raw["schema_version"] = ALERT_CONFIG_SCHEMA_VERSION
+            settings_raw["schema_version"] = ALERT_CONFIG_SCHEMA_VERSION
+            try:
+                allowlist = Allowlist.model_validate(allowlist_raw)
+                settings = Settings.model_validate(settings_raw)
+            except ValidationError as exc:
+                raise StoreError(f"config schema-v2 migration failed validation:\n{exc}") from exc
+
+            allowlist_backup = self._backup(self.allowlist_path)
+            settings_backup = self._backup(self.settings_path)
+            try:
+                self._write_yaml(self.allowlist_path, allowlist.model_dump(mode="json"))
+                self._write_yaml(self.settings_path, settings.model_dump(mode="json"))
+            except BaseException:
+                if allowlist_backup is not None:
+                    shutil.copyfile(allowlist_backup, self.allowlist_path)
+                    os.chmod(self.allowlist_path, 0o600)
+                if settings_backup is not None:
+                    shutil.copyfile(settings_backup, self.settings_path)
+                    os.chmod(self.settings_path, 0o600)
+                raise
+        return self.config_v2_status()
+
+    def alert_migration_status(self) -> AlertMigrationStatus:
+        return self.event_store().migration_status()
+
+    def migrate_alert_ledger(self) -> AlertMigrationStatus:
+        return self.event_store().migrate()
 
     # -------------------------------------------------------------- seen ledger
     def seen_keys(self, telegram_id: int) -> set[str]:

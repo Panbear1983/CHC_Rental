@@ -11,6 +11,7 @@ import re
 from datetime import datetime
 from enum import Enum
 from typing import Optional
+from uuid import UUID
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, ConfigDict, field_validator, model_validator
@@ -20,6 +21,7 @@ _DELIVERY_TIME_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
 DEFAULT_DELIVERY_TIME = "09:00"
 DEFAULT_TIMEZONE = "America/New_York"
 SCHEMA_VERSION = 1
+ALERT_CONFIG_SCHEMA_VERSION = 2
 
 
 def _validate_delivery_time(value: str) -> str:
@@ -51,6 +53,13 @@ class PropertyType(str, Enum):
     MANUFACTURED = "manufactured"
     LAND = "land"
     OTHER = "other"
+
+
+class DeliveryMode(str, Enum):
+    """When a profile is eligible for outbound notification planning."""
+
+    DAILY = "daily"
+    IMMEDIATE = "immediate"
 
 
 _US_STATE_NAME_TO_CODE = {
@@ -111,6 +120,10 @@ def _normalize_feature_list(values: list[str]) -> list[str]:
 class Search(BaseModel):
     """One saved search. A profile owns several of these, matched independently."""
 
+    # Schema-v1 configs have no stable search identifier. It remains optional
+    # until the explicit schema-v2 migration assigns and persists one; legacy
+    # daily runs never depend on an ephemeral generated value.
+    search_id: Optional[str] = None
     name: str
     active: bool = True
     city: str
@@ -136,6 +149,19 @@ class Search(BaseModel):
         if not cleaned:
             raise ValueError("value must not be blank")
         return cleaned
+
+    @field_validator("search_id")
+    @classmethod
+    def search_id_must_be_a_uuid(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        cleaned = value.strip()
+        if not cleaned:
+            return None
+        try:
+            return str(UUID(cleaned))
+        except (ValueError, AttributeError) as exc:
+            raise ValueError("search_id must be a UUID") from exc
 
     @field_validator("district")
     @classmethod
@@ -230,6 +256,9 @@ class Profile(BaseModel):
 
     delivery_time: str = DEFAULT_DELIVERY_TIME
     timezone: str = DEFAULT_TIMEZONE
+    delivery_mode: DeliveryMode = DeliveryMode.DAILY
+    quiet_hours_start: Optional[str] = None
+    quiet_hours_end: Optional[str] = None
     notify_on_no_results: bool = False
     searches: list[Search] = []
 
@@ -243,12 +272,26 @@ class Profile(BaseModel):
     def timezone_must_be_valid_iana_zone(cls, value: str) -> str:
         return _validate_timezone(value)
 
+    @field_validator("quiet_hours_start", "quiet_hours_end")
+    @classmethod
+    def quiet_hours_must_be_strict_24h(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        return _validate_delivery_time(value)
+
     @model_validator(mode="after")
     def search_names_must_be_unique(self) -> "Profile":
         names = [search.name.lower() for search in self.searches]
         duplicates = sorted({name for name in names if names.count(name) > 1})
         if duplicates:
             raise ValueError(f"search names must be unique within a profile: {duplicates}")
+        if (self.quiet_hours_start is None) != (self.quiet_hours_end is None):
+            raise ValueError("quiet_hours_start and quiet_hours_end must be set together")
+        if (
+            self.quiet_hours_start is not None
+            and self.quiet_hours_start == self.quiet_hours_end
+        ):
+            raise ValueError("quiet hours must not cover the entire day")
         return self
 
     def active_searches(self) -> list[Search]:
@@ -291,6 +334,23 @@ class Allowlist(BaseModel):
         duplicates = sorted({i for i in ids if ids.count(i) > 1})
         if duplicates:
             raise ValueError(f"telegram_id must be unique: {duplicates}")
+        if self.schema_version >= ALERT_CONFIG_SCHEMA_VERSION:
+            search_ids = [
+                search.search_id
+                for person in self.people
+                for search in person.profile.searches
+            ]
+            if any(search_id is None for search_id in search_ids):
+                raise ValueError("schema-v2 searches must have a stable search_id")
+            duplicate_search_ids = sorted(
+                {
+                    search_id
+                    for search_id in search_ids
+                    if search_id is not None and search_ids.count(search_id) > 1
+                }
+            )
+            if duplicate_search_ids:
+                raise ValueError(f"search_id must be unique: {duplicate_search_ids}")
         return self
 
     def get(self, telegram_id: int) -> Optional[AllowlistEntry]:
@@ -327,6 +387,15 @@ class Settings(BaseModel):
     zillow_timeout_seconds: int = 300
     zillow_max_charge_usd: float = 0.25
     live_push_enabled: bool = False
+    # The incremental path is additive and inert until this independent global
+    # gate is enabled after shadow-mode verification.
+    incremental_alerts_enabled: bool = False
+    incremental_active_start: str = "08:00"
+    incremental_active_end: str = "23:00"
+    incremental_scheduler_tick_minutes: int = 15
+    incremental_event_retention_days: int = 180
+    incremental_canary_telegram_ids: list[int] = []
+    incremental_monthly_budget_usd: Optional[float] = None
     # Operator alert channel; None disables alerting entirely.
     owner_telegram_id: Optional[int] = None
     seen_retention_days: int = 90
@@ -344,6 +413,11 @@ class Settings(BaseModel):
     def scrape_timezone_must_be_valid(cls, value: str) -> str:
         return _validate_timezone(value)
 
+    @field_validator("incremental_active_start", "incremental_active_end")
+    @classmethod
+    def incremental_active_hours_must_be_strict_24h(cls, value: str) -> str:
+        return _validate_delivery_time(value)
+
     @field_validator(
         "global_daily_request_budget",
         "per_source_daily_request_budget",
@@ -351,6 +425,8 @@ class Settings(BaseModel):
         "cache_retention_days",
         "rejected_retention_days",
         "backup_retention_days",
+        "incremental_scheduler_tick_minutes",
+        "incremental_event_retention_days",
         "zillow_results_limit",
         "zillow_timeout_seconds",
     )
@@ -360,6 +436,34 @@ class Settings(BaseModel):
             raise ValueError("value must be a whole number")
         if value < 0:
             raise ValueError("value must not be negative")
+        return value
+
+    @model_validator(mode="after")
+    def incremental_policy_must_be_coherent(self) -> "Settings":
+        if self.incremental_scheduler_tick_minutes <= 0:
+            raise ValueError("incremental_scheduler_tick_minutes must be positive")
+        if self.incremental_event_retention_days <= 0:
+            raise ValueError("incremental_event_retention_days must be positive")
+        if self.incremental_active_start == self.incremental_active_end:
+            raise ValueError("incremental active window must not cover the entire day")
+        return self
+
+    @field_validator("incremental_canary_telegram_ids")
+    @classmethod
+    def canary_ids_must_be_positive_and_unique(cls, value: list[int]) -> list[int]:
+        if any(not isinstance(item, int) or isinstance(item, bool) or item <= 0 for item in value):
+            raise ValueError("incremental canary Telegram IDs must be positive integers")
+        if len(set(value)) != len(value):
+            raise ValueError("incremental canary Telegram IDs must be unique")
+        return value
+
+    @field_validator("incremental_monthly_budget_usd")
+    @classmethod
+    def incremental_monthly_budget_must_be_non_negative(
+        cls, value: Optional[float]
+    ) -> Optional[float]:
+        if value is not None and value < 0:
+            raise ValueError("incremental_monthly_budget_usd must not be negative")
         return value
 
     @field_validator("source_daily_request_budgets")

@@ -1,6 +1,7 @@
 """CLI operator-alert behavior that spans fetch and delivery summaries."""
 
 from datetime import datetime, timezone
+import json
 
 import chc_rental.cli as cli
 from chc_rental.pipeline import PipelineResult
@@ -47,3 +48,19 @@ def test_replayed_cached_problem_alerts_once_per_streak(store, monkeypatch):
     changed = {"sources": [{"source": "rentcast", "errors": ["HTTP 500"]}]}
     cli._alert_on_problems(store, ".env", result, changed)
     assert sent[-1] == "rentcast fetch errors: HTTP 500"
+
+
+def test_alert_status_is_read_only_and_reports_pending_migrations(tmp_path, capsys):
+    assert cli.main(["--root", str(tmp_path), "alerts", "status", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["config"]["ready"] is False
+    assert payload["ledger"]["pending_versions"] == [1]
+    assert (tmp_path / "state" / "alerts.sqlite3").exists() is False
+
+
+def test_alert_migration_apply_prepares_config_and_ledger(tmp_path, capsys):
+    assert cli.main(["--root", str(tmp_path), "alerts", "migrate", "--apply"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["config"]["ready"] is True
+    assert payload["ledger"]["ready"] is True
+    assert (tmp_path / "state" / "alerts.sqlite3").exists()
