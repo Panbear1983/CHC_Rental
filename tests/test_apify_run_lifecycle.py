@@ -230,3 +230,60 @@ def test_global_kill_switch_prevents_new_paid_start(store):
     report = collector(store, settings, client).cycle(now_utc=NOW)
     assert client.start_calls == 0 and report.started == 0
     assert any("kill switch" in warning for warning in report.warnings)
+
+
+# --- subscription ceiling ----------------------------------------------------
+#
+# On 2026-08-20 the free tier's $5 monthly cap was reached. Every actor run then
+# returned HTTP 403 platform-feature-disabled, no cache was written, and the
+# 07:00 push failed for every recipient. The platform gives no warning before
+# that point, so the number has to be checkable on demand.
+
+
+def test_account_limits_reports_spend_cap_and_cycle():
+    captured = {}
+
+    def opener(request, timeout, context):
+        captured["url"] = request.full_url
+        captured["method"] = request.method
+        return Response(
+            json.dumps(
+                {
+                    "data": {
+                        "monthlyUsageCycle": {
+                            "startAt": "2026-07-21T00:00:00.000Z",
+                            "endAt": "2026-08-20T23:59:59.999Z",
+                        },
+                        "limits": {"maxMonthlyUsageUsd": 5},
+                        "current": {"monthlyUsageUsd": 5.066801662483631},
+                    }
+                }
+            ).encode("utf-8")
+        )
+
+    limits = ApifyClient(token="t", opener=opener).account_limits()
+
+    assert captured["method"] == "GET", "reading usage must never mutate the account"
+    assert captured["url"].endswith("/users/me/limits")
+    assert limits["monthly_cap_usd"] == 5.0
+    assert round(limits["monthly_usage_usd"], 2) == 5.07
+    assert limits["cycle_end"] == "2026-08-20T23:59:59.999Z"
+
+
+def test_account_limits_survives_a_response_without_the_expected_shape():
+    from chc_rental.sources.base import SourceUnavailableError
+
+    def opener(request, timeout, context):
+        return Response(json.dumps({"unexpected": True}).encode("utf-8"))
+
+    with pytest.raises(SourceUnavailableError):
+        ApifyClient(token="t", opener=opener).account_limits()
+
+
+def test_account_limits_tolerates_missing_numbers_without_crashing():
+    def opener(request, timeout, context):
+        return Response(json.dumps({"data": {"limits": {}, "current": {}}}).encode("utf-8"))
+
+    limits = ApifyClient(token="t", opener=opener).account_limits()
+    assert limits["monthly_usage_usd"] is None
+    assert limits["monthly_cap_usd"] is None

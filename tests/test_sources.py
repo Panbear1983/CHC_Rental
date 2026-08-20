@@ -79,6 +79,72 @@ def test_two_people_watching_one_city_produce_one_query():
     assert warnings == []
 
 
+def test_query_count_never_exceeds_the_number_of_watched_cities():
+    """One planned query is one paid Apify actor run, so the query COUNT is the
+    monthly bill. On 2026-08-16 a planner split each city into 3 price bands x 2
+    bed groups; Zillow spend went 1 -> 5 runs/day and exhausted the Apify free
+    tier on 2026-08-20, taking the 07:00 push down for every recipient. Widening
+    or subdividing a city's filters is free; adding a query is not."""
+    wide = make_person(
+        111,
+        profile=Profile(
+            searches=[
+                make_search(name="Cheap studio", state="TX", price_min=500,
+                            price_max=1500, bed_min=0, bed_max=1),
+                make_search(name="Mid two-bed", state="TX", price_min=1500,
+                            price_max=4000, bed_min=2, bed_max=3),
+                make_search(name="Luxury house", state="TX", price_min=4000,
+                            price_max=12000, bed_min=4, bed_max=6),
+            ]
+        ),
+    )
+    other_city = make_person(
+        222,
+        profile=Profile(searches=[make_search(name="Dallas", city="Dallas", state="TX")]),
+    )
+    queries, warnings = plan_queries(Allowlist(people=[wide, other_city]))
+
+    cities = {(query.city.lower(), query.state) for query in queries}
+    assert len(queries) == len(cities) == 2, (
+        "each watched city must cost exactly one source request; "
+        f"got {len(queries)} queries for {len(cities)} cities"
+    )
+    assert warnings == []
+
+    austin = next(query for query in queries if query.city == "Austin")
+    assert (austin.price_min, austin.price_max) == (500, 12000)
+    assert (austin.beds_min, austin.beds_max) == (0, 6)
+
+
+def test_many_searches_in_one_city_still_spend_one_request(store):
+    """The end-to-end form of the cost invariant, measured at the budget ledger."""
+    store.save_allowlist(
+        Allowlist(
+            people=[
+                make_person(
+                    111,
+                    profile=Profile(
+                        searches=[
+                            make_search(name=f"Search {index}", state="TX",
+                                        price_min=1000 * index,
+                                        price_max=1000 * index + 5000)
+                            for index in range(1, 6)
+                        ]
+                    ),
+                )
+            ]
+        )
+    )
+    adapter = FakeAdapter({("Austin", 0): ([rec(1)], False)})
+    report = fetch_daily(store, adapter, now_utc=FETCH_NOW)
+
+    assert report.queries_planned == 1
+    assert report.requests_used == 1
+    assert len(adapter.calls) == 1
+    assert not report.truncated and report.errors == []
+    assert store.quota_used(FETCH_NOW.date(), "rentcast") == 1
+
+
 def test_query_carries_the_search_filter_envelope():
     """Regression for the 2026-08-13 report: the daily Zillow scrape ignored
     the dashboard filters, so scraped listings did not fit the search."""
@@ -266,6 +332,42 @@ def test_incremental_zillow_url_pushes_supported_filters_to_the_actor():
     assert filters["isApartment"] == {"value": True}
     assert filters["isCondo"] == {"value": True}
     assert filters["isSingleFamily"] == {"value": False}
+
+
+def test_bounds_are_geocoded_once_per_city_not_once_per_query(monkeypatch):
+    """A city's location does not depend on a price filter. Caching on the whole
+    SourceQuery made every extra query over one city pay for its own Nominatim
+    lookup, against an endpoint that asks for one request per second."""
+    calls = []
+
+    class FakeResponse(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    payload = json.dumps(
+        [{"boundingbox": ["40.5503390", "40.7394340", "-74.0566880", "-73.8329450"]}]
+    ).encode("utf-8")
+    import chc_rental.sources.zillow as mod
+
+    resolve_map_bounds.cache_clear()
+
+    def fake_urlopen(request, timeout, context):
+        calls.append(request.full_url)
+        return FakeResponse(payload)
+
+    monkeypatch.setattr(mod.urllib.request, "urlopen", fake_urlopen)
+
+    for price_min, price_max in ((5000, 6666), (6666, 8333), (8333, 10000)):
+        resolve_map_bounds(
+            SourceQuery("Brooklyn", "NY", price_min=price_min, price_max=price_max)
+        )
+    assert len(calls) == 1, f"one city must cost one geocode, got {len(calls)}"
+
+    resolve_map_bounds(SourceQuery("Queens", "NY"))
+    assert len(calls) == 2, "a different city is still a different lookup"
 
 
 def test_zillow_bounds_resolver_maps_nominatim_coordinate_order(monkeypatch):
@@ -600,11 +702,80 @@ def test_a_dead_source_yields_an_unusable_report(store):
     assert report.queries_completed == 0 and report.errors
 
 
-def test_auth_failure_aborts_the_whole_sweep(store):
+def test_auth_failure_aborts_the_sweep_and_reports_it_without_raising(store):
+    """The sweep still stops, but the report survives to carry the reason.
+
+    It used to propagate, and `fetch_many_daily` rebuilt a blank report — which
+    reported requests_used=0 for reservations that had already been spent."""
     _store_with_search(store)
     adapter = FakeAdapter({("Austin", 0): SourceAuthError("bad key")})
-    with pytest.raises(SourceAuthError):
-        fetch_daily(store, adapter, now_utc=FETCH_NOW)
+    report = fetch_daily(store, adapter, now_utc=FETCH_NOW)
+    assert report.fetched and not report.usable
+    assert report.queries_completed == 0
+    assert report.errors == ["bad key"]
+
+
+def test_a_rejected_credential_does_not_consume_the_daily_budget(store):
+    """Regression for 2026-08-20: five 403s ate the whole Zillow budget in fifty
+    minutes, after which every tick blamed the budget instead of the token."""
+    _store_with_search(store)
+    adapter = FakeAdapter({("Austin", 0): SourceAuthError("HTTP 403: cap exceeded")})
+
+    report = fetch_daily(store, adapter, now_utc=FETCH_NOW)
+
+    assert report.requests_used == 0
+    assert store.quota_used(FETCH_NOW.date(), "rentcast") == 0, (
+        "a request the source refused outright costs nothing and must not be banked"
+    )
+
+
+def test_a_rejected_credential_is_not_retried_for_the_rest_of_the_day(store):
+    _store_with_search(store)
+    adapter = FakeAdapter({("Austin", 0): SourceAuthError("HTTP 403: cap exceeded")})
+    fetch_daily(store, adapter, now_utc=FETCH_NOW)
+    assert len(adapter.calls) == 1
+
+    later = fetch_daily(store, adapter, now_utc=FETCH_NOW.replace(hour=14))
+    assert len(adapter.calls) == 1, "the day breaker must stop the retry loop"
+    assert not later.usable
+    # The error stays byte-identical to the failure that tripped the breaker, so
+    # the run summary keeps one signature and the operator alert pages once per
+    # streak. The suppression itself is reported as a warning.
+    assert later.errors == ["HTTP 403: cap exceeded"]
+    assert any("not retried" in note for note in later.warnings)
+
+    # The block is scoped to the scrape day, so tomorrow tries again by itself.
+    tomorrow = FETCH_NOW.replace(day=FETCH_NOW.day + 1)
+    adapter.pages[("Austin", 0)] = ([rec(1)], False)
+    recovered = fetch_daily(store, adapter, now_utc=tomorrow)
+    assert recovered.usable and recovered.records == [rec(1)]
+
+
+def test_a_partial_sweep_interrupted_by_auth_keeps_what_it_paid_for(store):
+    person = make_person(
+        111,
+        profile=Profile(
+            searches=[
+                make_search(name="Austin", city="Austin", state="TX"),
+                make_search(name="Dallas", city="Dallas", state="TX"),
+            ]
+        ),
+    )
+    store.save_allowlist(Allowlist(people=[person]))
+    adapter = FakeAdapter(
+        {
+            ("Austin", 0): ([rec(1)], False),
+            ("Dallas", 0): SourceAuthError("token revoked mid-sweep"),
+        }
+    )
+
+    report = fetch_daily(store, adapter, now_utc=FETCH_NOW)
+
+    assert report.records == [rec(1)]
+    assert report.queries_completed == 1
+    assert report.requests_used == 1, "the Austin page was really paid for"
+    assert store.quota_used(FETCH_NOW.date(), "rentcast") == 1
+    assert report.errors == ["token revoked mid-sweep"]
 
 
 def test_multi_source_pool_keeps_one_source_when_another_auth_fails(store):

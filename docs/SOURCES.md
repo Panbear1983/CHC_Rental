@@ -23,7 +23,8 @@ removed from `.env` at will.
 | Actor/API docs | https://apify.com/maxcopell/zillow-scraper and https://apify.com/maxcopell/zillow-scraper/api |
 | Bounds lookup | OpenStreetMap Nominatim search API; city/state to map rectangle only; no listing data or credentials |
 | Zillow terms checked | 2026-08-11; https://www.zillow.com/corporate/terms-of-use/ prohibits automated queries and encouraging third parties to perform them |
-| Local ceilings | Disabled by default; 5 actor runs/day; 25 results/city; USD 0.25 maximum charge/run; 100 requests/day global |
+| Local ceilings | Disabled by default; one actor run per watched city per day (budget 5/day); 25 results/run; USD 0.25 maximum charge/run; 100 requests/day global |
+| Subscription ceiling | The Apify plan's own monthly cap sits ABOVE all of these and is not enforced locally. Reaching it returns HTTP 403 `platform-feature-disabled` on every run and stops the product outright. Check it with `./dashboard.sh usage`. |
 | Kill switch | `zillow_enabled: false`, missing token, zero results, or zero request budget |
 
 Implementation boundaries:

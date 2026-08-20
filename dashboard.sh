@@ -7,6 +7,8 @@
 #   ./dashboard.sh deliver [--live]        use today's cache; never scrape
 #   ./dashboard.sh run [--live]            plan or send today's push
 #   ./dashboard.sh check                   verify Telegram reachability
+#   ./dashboard.sh test                    run the test suite (gates job start)
+#   ./dashboard.sh usage                   Apify monthly spend vs its ceiling
 #   ./dashboard.sh prune                   prune expired state
 #   ./dashboard.sh logs [-f]               show or follow the daily log
 #   ./dashboard.sh alerts ...              incremental alert operations
@@ -28,7 +30,7 @@ DOMAIN="gui/$(id -u)"
 
 die() { echo "dashboard: $*" >&2; exit 1; }
 
-usage() { sed -n '2,14p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,16p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 [[ -x "$PY" ]] || die "venv not found at $REPO/.venv — create it, then: $PY -m pip install -e ."
 
@@ -39,8 +41,19 @@ fi
 cmd="$1"
 shift
 
+run_tests() {
+  # The scheduled job runs this working tree directly, so a red suite is a live
+  # defect, not a chore. On 2026-08-20 a planner change that 5x'd Apify spend
+  # shipped past 17 failing tests and took the 07:00 push down for everyone.
+  "$PY" -m pytest -q "$@"
+}
+
 case "$cmd" in
-  run|scrape|deliver|check)
+  test)
+    run_tests "$@"
+    exit $?
+    ;;
+  run|scrape|deliver|check|usage)
     exec "$PY" -m chc_rental.cli --root "$REPO" "$cmd" --env-file "$REPO/.env" "$@"
     ;;
   prune|init)
@@ -72,6 +85,14 @@ case "$cmd" in
         ;;
       start)
         [[ -f "$LAUNCHD_PLIST" ]] || die "plist not installed at $LAUNCHD_PLIST (copy scripts/${LAUNCHD_LABEL}.plist there)"
+        if [[ "${1:-}" == "--skip-tests" ]]; then
+          shift
+          echo "dashboard: WARNING — installing the job without running the suite"
+        else
+          echo "dashboard: running the test suite before installing the job..."
+          run_tests >/dev/null 2>&1 || die "test suite is red; fix it or re-run with: job start --skip-tests (see ./dashboard.sh test)"
+          echo "dashboard: suite green."
+        fi
         launchctl bootstrap "$DOMAIN" "$LAUNCHD_PLIST" && echo "job started (loaded)"
         ;;
       stop)

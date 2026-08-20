@@ -93,6 +93,9 @@ class Store:
     def quota_path(self, day: date) -> Path:
         return self.state_dir / "quota" / f"{day.isoformat()}.json"
 
+    def source_breaker_path(self, day: date) -> Path:
+        return self.state_dir / "breaker" / f"{day.isoformat()}.json"
+
     def run_log_path(self, day: date) -> Path:
         return self.state_dir / "runs" / f"{day.isoformat()}.json"
 
@@ -135,6 +138,7 @@ class Store:
             self._lock_dir,
             self.state_dir / "seen",
             self.state_dir / "quota",
+            self.state_dir / "breaker",
             self.state_dir / "runs",
             self.state_dir / "rejected",
             self.state_dir / "test-pushes",
@@ -1250,6 +1254,69 @@ class Store:
             self._atomic_write(path, json.dumps(payload, indent=2, sort_keys=True))
             return True
 
+    def refund_request(self, day: date, source: str) -> bool:
+        """Return one unspent reservation to the day's ledger.
+
+        The ceiling must be claimed BEFORE a request is issued, or two workers
+        race for the last unit. But a request the provider refused outright —
+        a rejected token — costs no money and consumes no provider quota, so
+        holding its reservation is pure loss. On 2026-08-20 five such 403s ate
+        the entire daily Zillow budget in fifty minutes and every later tick
+        then blamed the budget instead of the token.
+        """
+        with self._locked("quota"):
+            path = self.quota_path(day)
+            if not path.exists():
+                return False
+            try:
+                loaded = json.loads(path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, TypeError, ValueError):
+                return False
+            if not isinstance(loaded, dict):
+                return False
+            payload = {k: int(v) for k, v in loaded.items() if isinstance(v, int)}
+            used = payload.get(source, 0)
+            if used <= 0:
+                return False
+            payload[source] = used - 1
+            self._atomic_write(path, json.dumps(payload, indent=2, sort_keys=True))
+            return True
+
+    def block_source_for_day(self, day: date, source: str, *, reason: str) -> None:
+        """Stop attempting one source for the rest of a scrape day.
+
+        Retrying a rejected credential every ten minutes cannot succeed. Scoping
+        the block to the scrape day means it clears itself when the day rolls
+        over, with no operator action and no persistent kill switch to forget.
+        """
+        with self._locked("breaker"):
+            path = self.source_breaker_path(day)
+            payload: dict[str, Any] = {}
+            if path.exists():
+                try:
+                    loaded = json.loads(path.read_text(encoding="utf-8"))
+                    if isinstance(loaded, dict):
+                        payload = loaded
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    payload = {}
+            payload[source] = {"reason": str(reason), "at": _utc_now().isoformat()}
+            self._atomic_write(path, json.dumps(payload, indent=2, sort_keys=True))
+
+    def source_blocked_reason(self, day: date, source: str) -> Optional[str]:
+        """Why ``source`` is blocked for ``day``, or None when it may be tried."""
+        path = self.source_breaker_path(day)
+        if not path.exists():
+            return None
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return None
+        entry = payload.get(source) if isinstance(payload, dict) else None
+        if not isinstance(entry, dict):
+            return None
+        reason = entry.get("reason")
+        return str(reason) if reason else None
+
     # ------------------------------------------------------- rejects and runs
     def record_rejected(self, day: date, *, source: str, reason: str, raw: Any) -> None:
         """Keep an unusable record for operator review instead of dropping it.
@@ -1456,6 +1523,7 @@ class Store:
         """Delete state older than the configured retention. Returns counts removed."""
         removed = {
             "quota": 0,
+            "breaker": 0,
             "runs": 0,
             "rejected": 0,
             "test_pushes": 0,
@@ -1484,6 +1552,9 @@ class Store:
                     removed[bucket] += 1
 
         _dated_cleanup(self.state_dir / "quota", settings.cache_retention_days, "quota", ".json")
+        _dated_cleanup(
+            self.state_dir / "breaker", settings.cache_retention_days, "breaker", ".json"
+        )
         _dated_cleanup(self.state_dir / "runs", settings.rejected_retention_days, "runs", ".json")
         _dated_cleanup(
             self.state_dir / "rejected", settings.rejected_retention_days, "rejected", ".jsonl"

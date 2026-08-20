@@ -101,6 +101,8 @@ jobs:
 ./dashboard.sh deliver --live  # saved cache only; never Apify
 ./dashboard.sh run --live      # run today's push now
 ./dashboard.sh check           # bot reachability per person
+./dashboard.sh test            # run the suite; `job start` refuses while it is red
+./dashboard.sh usage           # Apify monthly spend vs its subscription ceiling
 ./dashboard.sh job status      # is the 10-minute job loaded?
 ./dashboard.sh job stop|start  # unload / load it
 ./dashboard.sh logs -f         # follow the daily job log
@@ -169,6 +171,19 @@ actor runs per configured scrape-timezone day; `zillow_max_charge_usd` is sent
 as the actor-run charge
 ceiling. Set `zillow_enabled: false` or its request budget to `0` for an
 immediate kill switch.
+
+**The query count is the bill.** The planner emits exactly one query — one paid
+actor run — per watched (city, state), no matter how many people watch it or how
+wide their filters are. Widening or subdividing a city's price/bed span is free;
+adding a query is not. A planner change on 2026-08-16 split one city into six
+sub-queries, took Zillow spend from 1 to 5 runs/day, and exhausted the Apify
+monthly subscription on 2026-08-20 — which stopped every recipient's push.
+`tests/test_sources.py::test_query_count_never_exceeds_the_number_of_watched_cities`
+guards this.
+
+Local budgets cannot see the Apify subscription's own monthly ceiling; reaching
+it fails every run with HTTP 403 `platform-feature-disabled`. `./dashboard.sh usage`
+reports spend against that ceiling and exits non-zero within 15% of it.
 
 Before each paid city run, the adapter resolves that US city/state to the map
 bounds required by the pinned actor through OpenStreetMap Nominatim. Actor

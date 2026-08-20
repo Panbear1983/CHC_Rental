@@ -155,6 +155,34 @@ class ApifyClient:
         encoded = urllib.parse.quote(run_id, safe="")
         return self._run_state(self._request("GET", f"{APIFY_API}/actor-runs/{encoded}"))
 
+    def account_limits(self) -> dict[str, Any]:
+        """Monthly subscription usage against its ceiling.
+
+        The daily job discovers the ceiling the expensive way — every actor run
+        starts returning HTTP 403 ``platform-feature-disabled`` and the whole
+        product stops, as it did on 2026-08-20. This is the cheap way to see it
+        coming: a free read of what has been spent and when the cycle resets.
+        """
+        payload = self._request("GET", f"{APIFY_API}/users/me/limits")
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(data, dict):
+            raise SourceUnavailableError("Apify limits response had no data object")
+        limits = data.get("limits") if isinstance(data.get("limits"), dict) else {}
+        current = data.get("current") if isinstance(data.get("current"), dict) else {}
+        cycle = (
+            data.get("monthlyUsageCycle")
+            if isinstance(data.get("monthlyUsageCycle"), dict)
+            else {}
+        )
+        used = current.get("monthlyUsageUsd")
+        cap = limits.get("maxMonthlyUsageUsd")
+        return {
+            "monthly_usage_usd": float(used) if isinstance(used, (int, float)) else None,
+            "monthly_cap_usd": float(cap) if isinstance(cap, (int, float)) else None,
+            "cycle_start": cycle.get("startAt"),
+            "cycle_end": cycle.get("endAt"),
+        }
+
     def get_dataset(self, dataset_id: str) -> list[Any]:
         encoded = urllib.parse.quote(dataset_id, safe="")
         payload = self._request(

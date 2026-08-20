@@ -130,20 +130,15 @@ def rental_search_url(
 
 
 @lru_cache(maxsize=128)
-def resolve_map_bounds(query: SourceQuery, timeout: float = 20.0) -> dict[str, float]:
-    """Resolve a US city to the map rectangle required by the Zillow actor.
-
-    OpenStreetMap's Nominatim endpoint is used only for geographic bounds, not
-    listing collection. Results are cached in-process, while CHC's daily Zillow
-    response cache prevents repeated lookups during frequent scheduler checks.
-    """
+def _city_map_bounds(city: str, state: str, timeout: float) -> dict[str, float]:
+    """Cached geocode for one (city, state). See ``resolve_map_bounds``."""
     params = urllib.parse.urlencode(
         {
             "format": "jsonv2",
             "limit": 1,
             "countrycodes": "us",
-            "city": query.city,
-            "state": query.state,
+            "city": city,
+            "state": state,
         }
     )
     request = urllib.request.Request(
@@ -180,13 +175,32 @@ def resolve_map_bounds(query: SourceQuery, timeout: float = 20.0) -> dict[str, f
         south, north, west, east = map(float, body[0]["boundingbox"])
     except (IndexError, KeyError, TypeError, ValueError):
         raise SourceUnavailableError(
-            f"no US map bounds found for {query.city}, {query.state}"
+            f"no US map bounds found for {city}, {state}"
         ) from None
     if not (south < north and west < east):
-        raise SourceUnavailableError(
-            f"invalid map bounds for {query.city}, {query.state}"
-        )
+        raise SourceUnavailableError(f"invalid map bounds for {city}, {state}")
     return {"west": west, "east": east, "south": south, "north": north}
+
+
+def resolve_map_bounds(query: SourceQuery, timeout: float = 20.0) -> dict[str, float]:
+    """Resolve a US city to the map rectangle required by the Zillow actor.
+
+    OpenStreetMap's Nominatim endpoint is used only for geographic bounds, not
+    listing collection.
+
+    Keyed on (city, state) ONLY. A SourceQuery also carries price and bed
+    filters, which have no bearing on where a city is; caching on the whole
+    query meant several queries over one city each paid for their own geocode.
+    Nominatim asks for at most one request per second, and a 429 here surfaces
+    as a rate-limit error in the middle of the paid fetch loop.
+    """
+    return _city_map_bounds(query.city, query.state, min(float(timeout), 20.0))
+
+
+# Callers (and tests) treat the resolver as the cache boundary; keep that true
+# even though the memoized function underneath is now narrower than the query.
+resolve_map_bounds.cache_clear = _city_map_bounds.cache_clear
+resolve_map_bounds.cache_info = _city_map_bounds.cache_info
 
 
 @dataclass

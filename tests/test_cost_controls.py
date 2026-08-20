@@ -288,3 +288,66 @@ def test_retention_prunes_completed_history_but_keeps_active_query_scope(store):
         assert connection.execute("SELECT count(*) FROM listing_versions").fetchone()[0] == 0
         assert connection.execute("SELECT count(*) FROM listing_identities").fetchone()[0] == 0
         assert connection.execute("SELECT count(*) FROM query_scopes").fetchone()[0] == 1
+
+
+# --- the refund must never credit more than was reserved ----------------------
+#
+# Refunding an auth-rejected reservation is what stops a bad token eating the
+# day's budget. But an over-credit is far worse than the bug it fixes: it would
+# hand back budget that was really spent, and the ceiling is the only thing
+# standing between this project and an unbounded Apify bill.
+
+
+def test_refund_never_credits_more_than_was_reserved(store):
+    from datetime import date
+
+    day = date(2026, 1, 15)
+    assert store.reserve_request(day, "zillow", per_source_limit=5, global_limit=100)
+    assert store.quota_used(day, "zillow") == 1
+
+    assert store.refund_request(day, "zillow") is True
+    assert store.quota_used(day, "zillow") == 0
+
+    # Every further refund is a no-op: there is nothing left to give back.
+    for _ in range(5):
+        assert store.refund_request(day, "zillow") is False
+    assert store.quota_used(day, "zillow") == 0
+
+    # An unknown source cannot manufacture credit either.
+    assert store.refund_request(day, "never-reserved") is False
+    assert store.quota_used(day, "never-reserved") == 0
+
+
+def test_repeated_auth_failures_leave_the_ledger_where_they_found_it(store):
+    """The 2026-08-20 shape: a ten-minute job against a rejected credential."""
+    from datetime import datetime, timezone
+
+    from chc_rental.fetch import fetch_daily
+    from chc_rental.models import Allowlist, Profile
+    from chc_rental.sources.base import SourceAuthError
+
+    from tests.conftest import make_person, make_search
+
+    store.save_allowlist(
+        Allowlist(
+            people=[make_person(111, profile=Profile(searches=[make_search(state="TX")]))]
+        )
+    )
+
+    class Rejecting:
+        name = "zillow"
+        calls = 0
+
+        def fetch_page(self, query, *, offset):
+            type(self).calls += 1
+            raise SourceAuthError("HTTP 403: Monthly usage hard limit exceeded")
+
+    now = datetime(2026, 1, 15, 13, 5, tzinfo=timezone.utc)
+    adapter = Rejecting()
+    for minute in range(0, 60, 10):
+        fetch_daily(store, adapter, now_utc=now.replace(minute=minute))
+
+    assert store.quota_used(now.date(), "zillow") == 0, (
+        "an hour of rejected requests must leave the day's budget intact"
+    )
+    assert Rejecting.calls == 1, "and must only actually ask the source once"

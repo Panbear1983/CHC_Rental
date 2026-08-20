@@ -35,10 +35,18 @@ from chc_rental.operations import (
     incremental_cost_status,
     incremental_rollout_readiness,
 )
-from chc_rental.pipeline import PipelineResult, deliver, plan_pushes, validate_records
+from chc_rental.pipeline import (
+    PipelineResult,
+    deliver,
+    deliver_source_outage_notices,
+    plan_pushes,
+    validate_records,
+)
 from chc_rental.scheduler import IncrementalScheduler
 from chc_rental.sources import configured_adapters, enabled_cache_sources
 from chc_rental.sources.apify import ApifyClient, ApifyRunState
+from chc_rental.sources.base import SourceError
+from chc_rental.sources.planner import plan_queries
 from chc_rental.sources.zillow import ZillowRentalAdapter, load_apify_token
 from chc_rental.store import Store, StoreError
 
@@ -122,11 +130,15 @@ def _record_daily_run(
     now_utc: datetime,
     summary: dict[str, Any],
     *,
+    kind: str,
     rejected: int = 0,
     fetch: Optional[dict[str, Any]] = None,
 ) -> None:
+    """Write one run record. ``kind`` is what lets alert dedup compare like with
+    like: the split job emits a scrape record and a delivery record per tick."""
     payload: dict[str, Any] = {
         "finished_at": datetime.now(timezone.utc).isoformat(),
+        "kind": kind,
         "summary": summary,
         "rejected": rejected,
     }
@@ -175,6 +187,7 @@ def _cmd_scrape(args: argparse.Namespace) -> int:
                 store,
                 now_utc,
                 {"scrape": "skipped", "reason": reason},
+                kind="scrape",
             )
             return 1 if configuration_warnings else 0
 
@@ -199,7 +212,8 @@ def _cmd_scrape(args: argparse.Namespace) -> int:
             if any(r.requests_used for r in pool.sources):
                 store.prune(today=scrape_day(settings, now_utc), settings=settings)
             print("SCRAPE " + json.dumps(summary, sort_keys=True))
-            _record_daily_run(store, now_utc, summary, fetch=fetch_summary)
+            _alert_on_scrape_problems(store, args.env_file, fetch_summary, summary)
+            _record_daily_run(store, now_utc, summary, kind="scrape", fetch=fetch_summary)
             return 1 if any(r.errors for r in pool.sources) else 0
 
         reason = _pool_reason(pool)
@@ -209,7 +223,10 @@ def _cmd_scrape(args: argparse.Namespace) -> int:
             "reason": reason,
         }
         print("SCRAPE " + json.dumps(summary, sort_keys=True))
-        _record_daily_run(store, now_utc, summary, fetch=fetch_summary)
+        # The unattended job runs `scrape` and `deliver`, never `run`, so this is
+        # the ONLY place a total fetch failure can be reported to the operator.
+        _alert_on_scrape_problems(store, args.env_file, fetch_summary, summary)
+        _record_daily_run(store, now_utc, summary, kind="scrape", fetch=fetch_summary)
         return 1 if any(r.errors for r in pool.sources) else 0
 
 
@@ -229,7 +246,7 @@ def _cmd_deliver(args: argparse.Namespace) -> int:
             reason = "no enabled saved-cache source"
             print(f"{reason}; delivery skipped")
             _record_daily_run(
-                store, now_utc, {"delivery": "skipped", "reason": reason}
+                store, now_utc, {"delivery": "skipped", "reason": reason}, kind="delivery"
             )
             return 0
 
@@ -239,10 +256,25 @@ def _cmd_deliver(args: argparse.Namespace) -> int:
         if not pool.usable:
             reason = _pool_reason(pool, "no compatible current scrape-day cache")
             print(f"no usable saved listing pool ({reason}); delivery skipped")
+            _alert_on_unusable_pool(store, args.env_file, reason)
+            summary: dict[str, Any] = {"delivery": "skipped", "reason": reason}
+            # Silence reads as "nothing matched today" to anyone who asked to
+            # hear about empty days. When the scrape actually failed, say so.
+            if _last_scrape_failed(store):
+                outage = deliver_source_outage_notices(
+                    store,
+                    sender=build_sender(args.env_file) if args.live else None,
+                    live=args.live,
+                    now_utc=now_utc,
+                )
+                if outage["sent"]:
+                    print(f"sent {outage['sent']} source-outage notice(s)")
+                summary["source_outage_notices"] = outage
             _record_daily_run(
                 store,
                 now_utc,
-                {"delivery": "skipped", "reason": reason},
+                summary,
+                kind="delivery",
                 fetch=fetch_summary,
             )
             return 0
@@ -273,11 +305,12 @@ def _cmd_deliver(args: argparse.Namespace) -> int:
         )
         print(result.preview())
         print("SUMMARY " + json.dumps(result.summary, sort_keys=True))
-        _alert_on_problems(store, args.env_file, result, fetch_summary)
+        _alert_on_problems(store, args.env_file, result, fetch_summary, kind="delivery")
         _record_daily_run(
             store,
             now_utc,
             result.summary,
+            kind="delivery",
             rejected=rejected,
             fetch=fetch_summary,
         )
@@ -295,6 +328,7 @@ def _run_once(store: Store, args: argparse.Namespace, now_utc: datetime) -> int:
     def record(summary: dict[str, Any], *, rejected: int = 0, fetch: Optional[dict] = None) -> None:
         payload: dict[str, Any] = {
             "finished_at": datetime.now(timezone.utc).isoformat(),
+            "kind": "run",
             "summary": summary,
             "rejected": rejected,
         }
@@ -391,22 +425,81 @@ def _run_once(store: Store, args: argparse.Namespace, now_utc: datetime) -> int:
     return 0
 
 
-def _same_failure_as_last_run(store: Store, reason: str) -> bool:
-    """True when the most recent run already recorded this exact failure.
+def _same_failure_as_last_run(store: Store, reason: str, *, kind: str = "run") -> bool:
+    """True when the previous run OF THIS KIND already recorded this failure.
 
     Alert on the first occurrence of a failure streak, then stay quiet until
     something changes — frequent unattended checks must not repeatedly page
-    the operator about one broken subscription.
+    the operator about one broken subscription. The kind filter is load-bearing:
+    the scheduled job writes a scrape record and a delivery record every tick,
+    so comparing against whichever landed last would flip the signature each
+    time and defeat the dedup entirely.
     """
     try:
-        last = store.latest_run_log() or {}
+        last = store.latest_run_log(kind=kind) or {}
         return (last.get("summary") or {}).get("reason") == reason
     except Exception:
         return False
 
 
+def _last_scrape_failed(store: Store) -> bool:
+    """True when the most recent scrape reported an outright failure.
+
+    The delivery command reads only saved caches, so on its own it cannot tell
+    "the source was down" from "it is not scrape time yet" — both look like a
+    missing cache. The scrape record is where that distinction lives.
+    """
+    summary = (store.latest_run_log(kind="scrape") or {}).get("summary") or {}
+    return summary.get("scrape") == "failed"
+
+
+def _alert_on_unusable_pool(store: Store, env_file: str, reason: str) -> None:
+    """Page when delivery has no pool on a day whose scrape did not already page.
+
+    Deliberately narrow. A failed scrape is reported by `_alert_on_scrape_problems`
+    and must not page twice for one root cause; "waiting" is the normal state
+    before scrape time; "skipped" is the operator's own kill switch. What is left
+    — the scrape reported success yet delivery cannot use the result — is the
+    genuinely new signal, and it is currently invisible.
+    """
+    last_scrape = (store.latest_run_log(kind="scrape") or {}).get("summary") or {}
+    if last_scrape.get("scrape") in {"failed", "waiting", "skipped"}:
+        return
+    if _same_failure_as_last_run(store, reason, kind="delivery"):
+        return
+    _alert_operator(store, env_file, f"delivery had no usable listing pool: {reason}")
+
+
+def _alert_on_scrape_problems(
+    store: Store,
+    env_file: str,
+    fetch_summary: dict[str, Any],
+    summary: dict[str, Any],
+) -> None:
+    """Page the operator when the paid scrape itself failed.
+
+    `_alert_on_problems` needs a PipelineResult and only runs once delivery has
+    something to deliver, so it can never see a day where the fetch produced no
+    pool at all. That is precisely the outage worth paging about — on 2026-08-20
+    an exhausted Apify subscription went unreported for a full day — so this
+    path reports it directly and dedups against the previous SCRAPE record only.
+    """
+    problems = _problem_messages(fetch_summary, {})
+    if not problems:
+        return
+    reason = str(summary.get("reason") or "; ".join(problems))
+    if _same_failure_as_last_run(store, reason, kind="scrape"):
+        return
+    _alert_operator(store, env_file, "scrape failed: " + "; ".join(problems))
+
+
 def _alert_on_problems(
-    store: Store, env_file: str, result: PipelineResult, fetch_summary: dict[str, Any]
+    store: Store,
+    env_file: str,
+    result: PipelineResult,
+    fetch_summary: dict[str, Any],
+    *,
+    kind: str = "run",
 ) -> None:
     problems = _problem_messages(fetch_summary, result.summary)
     if not problems:
@@ -417,7 +510,7 @@ def _alert_on_problems(
     # on every free cache replay. This runs before the current run is recorded,
     # so latest_run_log is the previous cycle.
     try:
-        previous = store.latest_run_log() or {}
+        previous = store.latest_run_log(kind=kind) or {}
         previous_problems = _problem_messages(
             previous.get("fetch") or {}, previous.get("summary") or {}
         )
@@ -495,6 +588,57 @@ def _cmd_check(args: argparse.Namespace) -> int:
             f"{searches} active search(es), {reach}"
         )
     return 1 if problems else 0
+
+
+def _cmd_usage(args: argparse.Namespace) -> int:
+    """Report Apify monthly spend against the ceiling. Reads only; costs nothing.
+
+    Hitting the ceiling stops the product dead — no scrape, no cache, no push —
+    and the only warning the platform gives is the failure itself. This makes
+    the number checkable before that happens. Exit 1 once spend is within 15%
+    of the cap so it can be used as a scripted check, not just read by eye.
+    """
+    store = Store(args.root)
+    store.initialize()
+    token = load_apify_token(args.env_file)
+    if token is None:
+        print(f"no usable APIFY_TOKEN in {args.env_file}")
+        return 1
+    settings = store.load_settings()
+    try:
+        limits = ApifyClient(
+            token=token, timeout=float(settings.zillow_timeout_seconds)
+        ).account_limits()
+    except SourceError as exc:
+        print(f"could not read Apify usage: {exc}")
+        return 1
+
+    used = limits["monthly_usage_usd"]
+    cap = limits["monthly_cap_usd"]
+    print(f"apify cycle: {limits['cycle_start']} -> {limits['cycle_end']}")
+    if used is None or cap is None or cap <= 0:
+        print("apify usage: unavailable")
+        return 1
+    share = used / cap
+    print(f"apify usage: ${used:.2f} / ${cap:.2f} ({share:.0%})")
+
+    day = scrape_day(settings, datetime.now(timezone.utc))
+    budget = settings.source_request_budget("zillow")
+    queries, _ = plan_queries(store.load_allowlist())
+    print(
+        f"planned queries/day: {len(queries)} (zillow budget {budget}/day) — "
+        f"one query is one paid actor run"
+    )
+    if len(queries) > budget:
+        print(
+            f"WARNING: {len(queries)} planned queries cannot fit a budget of "
+            f"{budget}; the last {len(queries) - budget} are never fetched"
+        )
+        return 1
+    if share >= 0.85:
+        print("WARNING: within 15% of the Apify ceiling; scrapes will start failing")
+        return 1
+    return 0
 
 
 def _cmd_prune(args: argparse.Namespace) -> int:
@@ -958,6 +1102,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     check_parser = sub.add_parser("check", help="Verify the bot can reach every allowlisted person")
     check_parser.add_argument("--env-file", default=".env")
     check_parser.set_defaults(func=_cmd_check)
+
+    usage_parser = sub.add_parser(
+        "usage", help="Show Apify monthly spend against its subscription ceiling"
+    )
+    usage_parser.add_argument("--env-file", default=".env")
+    usage_parser.set_defaults(func=_cmd_usage)
 
     sub.add_parser("prune", help="Delete state past its retention window").set_defaults(
         func=_cmd_prune

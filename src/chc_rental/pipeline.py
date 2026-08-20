@@ -388,104 +388,27 @@ def deliver(
             ):
                 suppressed_after_plan += 1
                 continue
-            message = "No new rentals matched your searches today."
-            local_day = delivery_now.astimezone(
-                ZoneInfo(person.profile.timezone)
-            ).date()
-            try:
-                attempt = store.prepare_routine_delivery(
-                    telegram_id,
-                    display_name=person.display_name,
-                    timezone_name=person.profile.timezone,
-                    local_day=local_day,
-                    kind="notice",
-                    message_text=message,
-                    items=[],
-                    now_utc=delivery_now,
-                )
-            except Exception:
-                notices_failed += 1
-                continue
-            if attempt.status == "accepted":
+            outcome = send_routine_notice(
+                store,
+                person,
+                NO_RESULTS_NOTICE,
+                sender=sender,
+                now_utc=delivery_now,
+            )
+            if outcome == "sent":
+                # Stamp the ledger so the due-gate advances: without this a
+                # frequent delivery checker re-sends the notice until midnight.
+                try:
+                    store.mark_notified(telegram_id, now_utc=delivery_now)
+                except Exception:
+                    bank_repairs_needed += 1
+                notices_sent += 1
+            elif outcome == "already_sent":
                 suppressed_after_plan += 1
-                continue
-            if attempt.status == "uncertain":
+            elif outcome == "uncertain":
                 result.uncertain += 1
-                continue
-            try:
-                store.transition_routine_delivery(
-                    telegram_id,
-                    local_day,
-                    attempt.attempt_id,
-                    state="sending",
-                    now_utc=delivery_now,
-                )
-            except Exception:
+            else:
                 notices_failed += 1
-                continue
-            try:
-                receipt = sender.send(telegram_id=telegram_id, text=message)
-            except TelegramSendError as exc:
-                state = "uncertain" if exc.ambiguous else "failed"
-                store.transition_routine_delivery(
-                    telegram_id,
-                    local_day,
-                    attempt.attempt_id,
-                    state=state,
-                    now_utc=delivery_now,
-                    error=str(exc),
-                )
-                if state == "uncertain":
-                    result.uncertain += 1
-                else:
-                    notices_failed += 1
-                continue
-            except Exception as exc:
-                store.transition_routine_delivery(
-                    telegram_id,
-                    local_day,
-                    attempt.attempt_id,
-                    state="uncertain",
-                    now_utc=delivery_now,
-                    error=f"{type(exc).__name__}: {exc}",
-                )
-                result.uncertain += 1
-                continue
-            message_id, chat_id = _receipt_values(receipt)
-            if message_id is None or chat_id != str(telegram_id):
-                store.transition_routine_delivery(
-                    telegram_id,
-                    local_day,
-                    attempt.attempt_id,
-                    state="uncertain",
-                    now_utc=delivery_now,
-                    error=(
-                        "Telegram accepted the request without a verifiable "
-                        "recipient receipt"
-                    ),
-                )
-                result.uncertain += 1
-                continue
-            try:
-                store.transition_routine_delivery(
-                    telegram_id,
-                    local_day,
-                    attempt.attempt_id,
-                    state="accepted",
-                    now_utc=delivery_now,
-                    telegram_message_id=message_id,
-                    chat_id=chat_id,
-                )
-            except Exception:
-                result.uncertain += 1
-                continue
-            # Stamp the ledger so the due-gate advances: without this a frequent
-            # delivery checker re-sends the notice until local midnight.
-            try:
-                store.mark_notified(telegram_id, now_utc=delivery_now)
-            except Exception:
-                bank_repairs_needed += 1
-            notices_sent += 1
 
     result.summary["delivery"] = "live"
     result.summary["sent"] = result.sent
@@ -496,6 +419,164 @@ def deliver(
     result.summary["suppressed_after_plan"] = suppressed_after_plan
     result.summary["bank_repairs_needed"] = bank_repairs_needed
     return result
+
+
+NO_RESULTS_NOTICE = "No new rentals matched your searches today."
+
+SOURCE_OUTAGE_NOTICE = (
+    "CHC Rental could not check listings today — the rental source was "
+    "unavailable. Your saved searches are unchanged; you will get the next "
+    "update as soon as the source is back."
+)
+
+
+def send_routine_notice(
+    store: Store,
+    person: AllowlistEntry,
+    message: str,
+    *,
+    sender: PushSender,
+    now_utc: datetime,
+    discriminator: str | None = None,
+) -> str:
+    """Deliver one journalled courtesy notice. Returns its outcome.
+
+    ``"sent"`` | ``"already_sent"`` | ``"uncertain"`` | ``"failed"``.
+
+    The caller holds the recipient delivery lock and owns the tallies, because
+    a no-results notice and a source-outage notice mean different things to the
+    operator even though the transport is identical. The journal attempt key
+    covers (recipient, local day, kind, message, discriminator), so re-entering
+    an already accepted notice is a no-op rather than a duplicate Telegram send.
+    """
+    telegram_id = person.telegram_id
+    local_day = now_utc.astimezone(ZoneInfo(person.profile.timezone)).date()
+    try:
+        attempt = store.prepare_routine_delivery(
+            telegram_id,
+            display_name=person.display_name,
+            timezone_name=person.profile.timezone,
+            local_day=local_day,
+            kind="notice",
+            message_text=message,
+            items=[],
+            now_utc=now_utc,
+            discriminator=discriminator,
+        )
+    except Exception:
+        return "failed"
+    if attempt.status == "accepted":
+        return "already_sent"
+    if attempt.status == "uncertain":
+        return "uncertain"
+    try:
+        store.transition_routine_delivery(
+            telegram_id,
+            local_day,
+            attempt.attempt_id,
+            state="sending",
+            now_utc=now_utc,
+        )
+    except Exception:
+        return "failed"
+    try:
+        receipt = sender.send(telegram_id=telegram_id, text=message)
+    except TelegramSendError as exc:
+        state = "uncertain" if exc.ambiguous else "failed"
+        store.transition_routine_delivery(
+            telegram_id,
+            local_day,
+            attempt.attempt_id,
+            state=state,
+            now_utc=now_utc,
+            error=str(exc),
+        )
+        return state
+    except Exception as exc:
+        store.transition_routine_delivery(
+            telegram_id,
+            local_day,
+            attempt.attempt_id,
+            state="uncertain",
+            now_utc=now_utc,
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        return "uncertain"
+    message_id, chat_id = _receipt_values(receipt)
+    if message_id is None or chat_id != str(telegram_id):
+        store.transition_routine_delivery(
+            telegram_id,
+            local_day,
+            attempt.attempt_id,
+            state="uncertain",
+            now_utc=now_utc,
+            error=(
+                "Telegram accepted the request without a verifiable "
+                "recipient receipt"
+            ),
+        )
+        return "uncertain"
+    try:
+        store.transition_routine_delivery(
+            telegram_id,
+            local_day,
+            attempt.attempt_id,
+            state="accepted",
+            now_utc=now_utc,
+            telegram_message_id=message_id,
+            chat_id=chat_id,
+        )
+    except Exception:
+        return "uncertain"
+    return "sent"
+
+
+def deliver_source_outage_notices(
+    store: Store,
+    *,
+    sender: Optional[PushSender],
+    live: bool,
+    now_utc: datetime,
+) -> dict[str, int]:
+    """Tell opted-in recipients that today could not be checked at all.
+
+    Without this, a source outage is indistinguishable from a quiet market: the
+    delivery path returns before planning, so nobody hears anything. Only people
+    who asked for no-results notices get one, only once per local day, and only
+    once they are due — a 07:00 recipient is not woken at 06:10 to be told the
+    scrape failed.
+
+    Deliberately does NOT stamp ``mark_notified``: if the source recovers later
+    the same day, the real listings must still be able to go out.
+    """
+    tally = {"sent": 0, "failed": 0, "uncertain": 0, "already_sent": 0}
+    settings = store.load_settings()
+    if not live or not settings.live_push_enabled or sender is None:
+        return tally
+    allowlist = store.load_allowlist()
+    stamp = now_utc.astimezone(timezone.utc)
+    for person in allowlist.people:
+        if not allowlist.is_allowlisted(person.telegram_id):
+            continue
+        if not person.profile.notify_on_no_results:
+            continue
+        with store.recipient_delivery_lock(person.telegram_id):
+            if not is_profile_due(
+                person.profile,
+                stamp,
+                last_sent_at_utc=store.last_sent_at(person.telegram_id),
+            ):
+                continue
+            outcome = send_routine_notice(
+                store,
+                person,
+                SOURCE_OUTAGE_NOTICE,
+                sender=sender,
+                now_utc=stamp,
+                discriminator="source-outage",
+            )
+        tally[outcome] = tally.get(outcome, 0) + 1
+    return tally
 
 
 def _routine_item(item: PlannedPush) -> RoutineDeliveryItem:

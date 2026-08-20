@@ -307,17 +307,40 @@ def fetch_daily(
         )
         return report
 
-    records: list[Any] = []
-    for query in queries:
-        usable, stop_sweep = _sweep_query(
-            store, adapter, settings, day, query, records, report, sleeper
+    blocked = store.source_blocked_reason(day, adapter.name)
+    if blocked is not None:
+        # A credential the source already rejected today cannot start working
+        # before the day rolls over, and every retry costs a request slot.
+        # The ERROR stays byte-identical to the failure that tripped the breaker
+        # so the run summary keeps one stable signature and the operator alert
+        # pages once per streak rather than once per tick; the note below is
+        # what tells the log this tick was suppressed rather than re-attempted.
+        report.errors.append(blocked)
+        report.warnings.append(
+            f"{adapter.name} already failed authentication today; not retried until {day} rolls over"
         )
-        if usable:
-            report.queries_completed += 1
-        # Only a spent request budget stops the whole sweep. One city hitting
-        # its page cap, or one query failing, must not skip the other cities.
-        if stop_sweep:
-            break
+        return report
+
+    records: list[Any] = []
+    try:
+        for query in queries:
+            usable, stop_sweep = _sweep_query(
+                store, adapter, settings, day, query, records, report, sleeper
+            )
+            if usable:
+                report.queries_completed += 1
+            # Only a spent request budget stops the whole sweep. One city hitting
+            # its page cap, or one query failing, must not skip the other cities.
+            if stop_sweep:
+                break
+    except SourceAuthError as exc:
+        # Rejected credentials end the sweep, but the report must still carry
+        # what was already fetched and the requests it really cost. Rebuilding a
+        # blank report here used to claim requests_used=0 for reservations that
+        # had already been spent, so the run log understated real spend.
+        report.truncated = True
+        report.errors.append(str(exc))
+        store.block_source_for_day(day, adapter.name, reason=str(exc))
 
     report.fetched = True
     report.records = records
@@ -426,7 +449,12 @@ def _sweep_query(
                 adapter, query, offset, report, store, settings, day, sleeper
             )
         except SourceAuthError:
-            raise  # the caller alerts the operator and aborts the run
+            # Rejected credentials cost no money and no provider quota. Give the
+            # reservation back before re-raising, then let fetch_daily trip the
+            # day breaker so this is attempted once, not every ten minutes.
+            store.refund_request(day, adapter.name)
+            report.requests_used -= 1
+            raise
         except SourceUnavailableError as exc:
             report.errors.append(f"{query.city}, {query.state}: {exc}")
             return collected > 0, False
