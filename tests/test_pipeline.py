@@ -8,6 +8,7 @@ import pytest
 
 from chc_rental.dedup import dedup_key
 from chc_rental.models import Allowlist, Listing, Profile, Settings
+from chc_rental.notify.telegram import TelegramReceipt, TelegramSendError
 from chc_rental.pipeline import deliver, plan_pushes, validate_records
 
 from tests.conftest import DUE_NOW, make_listing, make_person, make_search
@@ -20,10 +21,14 @@ class RecordingSender:
         self.sent: list[tuple[int, str]] = []
         self.fail_for = fail_for or set()
 
-    def send(self, *, telegram_id: int, text: str) -> None:
+    def send(self, *, telegram_id: int, text: str) -> TelegramReceipt:
         if telegram_id in self.fail_for:
-            raise RuntimeError("transport exploded")
+            raise TelegramSendError("transport exploded", terminal=True)
         self.sent.append((telegram_id, text))
+        return TelegramReceipt(
+            message_id=str(1000 + len(self.sent)),
+            chat_id=str(telegram_id),
+        )
 
 
 def listings(*raws) -> list[Listing]:
@@ -66,6 +71,30 @@ def test_daily_cap_limits_one_search(store):
     )
     result = plan_pushes(store, many, now_utc=DUE_NOW)
     assert result.summary["planned_pushes"] == 2
+
+
+def test_daily_push_keeps_more_than_five_newest_source_ordered_links(store):
+    person = make_person(111, profile=Profile(searches=[make_search(daily_cap=25)]))
+    store.save_allowlist(Allowlist(people=[person]))
+    many = listings(
+        *[
+            make_listing(
+                source="zillow",
+                source_listing_id=f"Z{i}",
+                address=f"{i} Newest St",
+                url=f"https://www.zillow.com/homedetails/new-{i}/{i}_zpid/",
+            )
+            for i in range(1, 7)
+        ]
+    )
+
+    result = plan_pushes(store, many, now_utc=DUE_NOW)
+
+    assert result.summary["planned_pushes"] == 6
+    assert [item.listing.address for item in result.planned] == [
+        f"{i} Newest St" for i in range(1, 7)
+    ]
+    assert all("zillow.com/homedetails/" in item.render() for item in result.planned)
 
 
 # --- regressions for the 2026-08-10 audit -----------------------------------
@@ -210,6 +239,112 @@ def test_live_send_marks_seen_only_after_success(store):
     assert len(sender.sent) == 1
     assert result.sent == 1
     assert len(store.seen_keys(111)) == 1
+    days = store.routine_delivery_days(111, now_utc=DUE_NOW)
+    entry = days[0].entries[0]
+    assert entry.status == "accepted"
+    assert entry.message_text == result.planned[0].render()
+    assert entry.primary_item.url == "https://example.com/listing/1"
+    assert entry.telegram_message_id == "1001"
+
+
+def test_unverifiable_routine_receipt_is_uncertain_and_never_marked_seen(store):
+    class WrongReceiptSender:
+        calls = 0
+
+        def send(self, *, telegram_id: int, text: str) -> TelegramReceipt:
+            self.calls += 1
+            return TelegramReceipt(message_id="900", chat_id="999")
+
+    store.save_allowlist(Allowlist(people=[make_person(111)]))
+    store.save_settings(Settings(live_push_enabled=True))
+    result = plan_pushes(store, listings(make_listing()), now_utc=DUE_NOW)
+    sender = WrongReceiptSender()
+
+    delivered = deliver(
+        store,
+        result,
+        sender=sender,
+        live=True,
+        now_utc=DUE_NOW,
+    )
+
+    assert delivered.uncertain == 1 and delivered.sent == 0
+    assert sender.calls == 1
+    assert store.seen_keys(111) == set()
+    days = store.routine_delivery_days(111, now_utc=DUE_NOW)
+    assert days[0].uncertain_count == 1
+
+
+def test_interrupted_routine_attempt_is_not_automatically_resent(store):
+    from zoneinfo import ZoneInfo
+
+    from chc_rental.pipeline import _routine_item
+
+    store.save_allowlist(Allowlist(people=[make_person(111)]))
+    store.save_settings(Settings(live_push_enabled=True))
+    result = plan_pushes(store, listings(make_listing()), now_utc=DUE_NOW)
+    planned = result.planned[0]
+    person = store.load_allowlist().get(111)
+    local_day = DUE_NOW.astimezone(ZoneInfo(person.profile.timezone)).date()
+    staged = store.prepare_routine_delivery(
+        111,
+        display_name=person.display_name,
+        timezone_name=person.profile.timezone,
+        local_day=local_day,
+        kind="listing",
+        message_text=planned.render(),
+        items=[_routine_item(planned)],
+        now_utc=DUE_NOW,
+    )
+    store.transition_routine_delivery(
+        111,
+        local_day,
+        staged.attempt_id,
+        state="sending",
+        now_utc=DUE_NOW,
+    )
+    sender = RecordingSender()
+
+    delivered = deliver(
+        store,
+        result,
+        sender=sender,
+        live=True,
+        now_utc=DUE_NOW + timedelta(minutes=1),
+    )
+
+    assert sender.sent == []
+    assert delivered.uncertain == 1
+    assert store.routine_delivery_days(111, now_utc=DUE_NOW)[0].uncertain_count == 1
+
+
+def test_delivery_rechecks_bank_after_planning_and_skips_a_test_push_duplicate(store):
+    store.save_allowlist(Allowlist(people=[make_person(111)]))
+    store.save_settings(Settings(live_push_enabled=True))
+    result = plan_pushes(store, listings(make_listing()), now_utc=DUE_NOW)
+    item = result.planned[0]
+    store.mark_seen(
+        111,
+        item.key,
+        search_name=item.search_name,
+        url=item.listing.url,
+        now_utc=DUE_NOW,
+        channel="test",
+    )
+    sender = RecordingSender()
+
+    delivered = deliver(
+        store,
+        result,
+        sender=sender,
+        live=True,
+        now_utc=DUE_NOW,
+    )
+
+    assert sender.sent == []
+    assert delivered.sent == 0
+    assert delivered.summary["suppressed_after_plan"] == 1
+    assert store.last_sent_at(111) is None
 
 
 def test_a_failed_send_is_not_marked_seen(store):
@@ -288,6 +423,11 @@ def test_a_delivered_no_results_notice_does_not_repeat_within_the_day(store):
     deliver(store, first, sender=sender, live=True, now_utc=DUE_NOW)
     assert len(sender.sent) == 1
     assert first.summary["no_results_sent"] == 1
+    diary = store.routine_delivery_days(111, now_utc=DUE_NOW)
+    assert diary[0].notice_count == 1
+    assert diary[0].entries[0].message_text == (
+        "No new rentals matched your searches today."
+    )
 
     an_hour_later = DUE_NOW + timedelta(hours=1)
     second = plan_pushes(store, listings(make_listing()), now_utc=an_hour_later)

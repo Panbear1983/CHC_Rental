@@ -1,7 +1,7 @@
 # Incremental Zillow alerts — operator runbook
 
 The incremental path is implemented but ships paused. It is additive: the
-existing `com.chcrental.daily` job and `chc-rental run` command remain the
+existing `com.chcrental.daily` job and `./dashboard.sh run` command remain the
 rollback path. The separate `com.chcrental.alerts` LaunchAgent is not installed
 or loaded by the build.
 
@@ -15,9 +15,10 @@ A Zillow result can reach Telegram only when every gate is true:
 4. the recipient is active, is listed in `incremental_canary_telegram_ids`, and
    uses `delivery_mode: immediate`.
 
-The worker rechecks the allowlist, current search filters, legacy seen ledger,
-and quiet hours immediately before transport. The first usable result for each
-source-query fingerprint is always a silent baseline.
+The worker rechecks the allowlist, current search filters, unified per-recipient
+delivery bank, and quiet hours immediately before transport. Daily, Test Push,
+and incremental sends share the same per-recipient transport lock. The first
+usable result for each source-query fingerprint is always a silent baseline.
 
 Telegram has no caller-supplied idempotency key. A timeout or restart after the
 local row enters `sending` therefore becomes `uncertain`; it is displayed for
@@ -28,11 +29,11 @@ rows.
 ## Prepare and inspect
 
 ```bash
-./chc.sh alerts migrate --check
-./chc.sh alerts migrate --apply
-./chc.sh alerts status --json
-./chc.sh alerts readiness --json
-./chc.sh alerts deliver                 # read-only outbox counts
+./dashboard.sh alerts migrate --check
+./dashboard.sh alerts migrate --apply
+./dashboard.sh alerts status --json
+./dashboard.sh alerts readiness --json
+./dashboard.sh alerts deliver                 # read-only outbox counts
 ```
 
 The dashboard's Alerts screen shows query baselines, last success/staleness,
@@ -47,14 +48,14 @@ does not meter a request and cannot send. Use a JSON list of actor items, and do
 not run it against a ledger whose real baseline you intend to preserve:
 
 ```bash
-./chc.sh alerts tick --fixture <APIFY_ITEMS_LIST.json>
+./dashboard.sh alerts tick --fixture <APIFY_ITEMS_LIST.json>
 ```
 
 A live source-only cycle may consume one bounded Apify start but never calls
 Telegram:
 
 ```bash
-./chc.sh alerts cycle --shadow
+./dashboard.sh alerts cycle --shadow
 ```
 
 Before any canary message, establish a baseline, replay it to confirm zero
@@ -73,7 +74,7 @@ Facts that software cannot honestly infer require an owner attestation. Record
 one only after doing the named review, with short non-secret evidence:
 
 ```bash
-./chc.sh alerts attest \
+./dashboard.sh alerts attest \
   --gate source_terms_reviewed \
   --evidence "Reviewed source record and links on YYYY-MM-DD" \
   --confirm-gate source_terms_reviewed
@@ -93,7 +94,7 @@ delivery mode to Immediate, and keep every other profile in Daily mode. Select
 the exact shadow row in the dashboard, or use the explicit CLI boundary:
 
 ```bash
-./chc.sh alerts deliver --live \
+./dashboard.sh alerts deliver --live \
   --confirm-telegram-id <PETER_TELEGRAM_ID> \
   --outbox-id <SHADOW_OUTBOX_ID> \
   --max-messages 1
@@ -131,9 +132,9 @@ day. The restore drill copies a backup into a disposable database, verifies its
 schema and `PRAGMA integrity_check`, and never replaces live state.
 
 ```bash
-./chc.sh alerts backup
-./chc.sh alerts backup --verify backups/alerts-daily-YYYY-MM-DD.sqlite3
-./chc.sh alerts backup --drill backups/alerts-daily-YYYY-MM-DD.sqlite3
+./dashboard.sh alerts backup
+./dashboard.sh alerts backup --verify backups/alerts-daily-YYYY-MM-DD.sqlite3
+./dashboard.sh alerts backup --drill backups/alerts-daily-YYYY-MM-DD.sqlite3
 ```
 
 On restart, the next tick resumes persisted Apify run IDs, re-reads successful
@@ -154,19 +155,19 @@ that activation is a separate explicit operator action:
 
 ```bash
 cp scripts/com.chcrental.alerts.plist ~/Library/LaunchAgents/
-./chc.sh alerts-job start
-./chc.sh alerts-job status
-./chc.sh alerts-logs -f
+./dashboard.sh alerts-job start
+./dashboard.sh alerts-job status
+./dashboard.sh alerts-logs -f
 ```
 
 Immediate rollback does not touch the daily workflow:
 
 ```bash
-./chc.sh alerts-job stop
+./dashboard.sh alerts-job stop
 # Then turn incremental_alerts_enabled off in the dashboard.
 ```
 
-Do not install the alerts plist merely to test it. `./chc.sh alerts tick
+Do not install the alerts plist merely to test it. `./dashboard.sh alerts tick
 --fixture ...` and the dashboard shadow action cover the pre-activation path.
 Each live tick writes a compact success/degraded evidence row. Readiness refuses
 recipient expansion when the retained 48-hour window has unexplained gaps,

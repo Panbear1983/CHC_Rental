@@ -39,13 +39,14 @@ working venv runs 3.11). The plan's "Python 3.12+" stack note is superseded.
 ## 4. Listing sources + budget — DECIDED 2026-08-11
 
 - Scope: **US rentals only** (Peter, 2026-08-11). Taiwan portals out of scope.
-- Primary source: **RentCast** official API (`docs/SOURCES.md`), key already
-  provisioned in `.env`.
-- Additional source: owner-approved, terms-flagged Zillow rental collection
-  through the pinned Apify actor. It is opt-in (`zillow_enabled: false` by
-  default) and isolated so its failure cannot erase RentCast matches.
-- Daily API-call ceiling: 50/day legacy/default for RentCast, 5/day for Zillow,
-  100/day global
+- **Sole source (updated 2026-08-13): Zillow rental collection through the
+  pinned Apify actor.** RentCast was removed — its address-only records had no
+  listing link and gave recipients nothing actionable. Zillow provides real
+  `zillow.com/homedetails/...` listing links.
+- Zillow is owner-approved and terms-flagged; it stays gated behind
+  `zillow_enabled` and an explicit `APIFY_TOKEN` (a token alone never activates
+  it). It is not represented as Zillow-authorized.
+- Daily API-call ceiling: 5/day for Zillow, 100/day global
   (`config/settings.yaml`, enforced by `store.reserve_request`).
 - Zillow per-query result limit: 25; per-actor-run charge ceiling: USD 0.25.
 - Zillow search URLs must contain geographic map bounds. Resolve US city/state
@@ -67,7 +68,7 @@ working venv runs 3.11). The plan's "Python 3.12+" stack note is superseded.
 - Notification/dedup (seen) ledger: 90 days (`seen_retention_days`) — after
   this, an old listing may notify again; accepted.
 - Fetched listing cache: 7 days. Rejected/validation records: 30 days;
-  identical source/reason/raw failures are retained once per UTC day.
+  identical source/reason/raw failures are retained once per run day.
 - Profile audit history: gitignored config + timestamped `backups/`, 30 days.
 - All values live in `config/settings.yaml` and are revisable without
   migration.
@@ -84,7 +85,7 @@ Telegram delivery only after full validation. A failed listing push is not
 marked seen, so it retries on the next run — bounded to one attempt per run
 by design (the old ledger's `max_attempts = 3` is superseded by the daily
 cadence). No-results notices stamp the seen ledger so the due-gate advances
-and the hourly runner cannot repeat them within a day.
+and the ten-minute delivery checker cannot repeat them within a day.
 
 ## 8. Circuit-breaker limits — DECIDED 2026-08-11
 
@@ -162,3 +163,43 @@ quarterly terms/source review cadence and own it.
 - No Facebook Marketplace or Craigslist code is authorized. Every future source
   must pass `docs/SOURCE_ONBOARDING.md` and receive its own terms decision,
   schema fixtures, identity tests, budgets, breaker, baseline and canary.
+
+## 13. Unified per-recipient delivery bank — DECIDED 2026-08-14
+
+- Scheduled, incremental, and manual Test Push deliveries share one isolated
+  bank per Telegram ID, keyed by normalized state/city/address/unit identity.
+- Only listings with a confirmed Telegram receipt enter the bank. Multipart
+  Test Pushes bank each accepted part immediately; previews, cancellations,
+  definite failures, and unaccepted parts do not.
+- All delivery paths take the same per-recipient transport lock and re-check
+  the bank immediately before sending. A stale Test Push preview aborts and
+  must be reviewed again.
+- Normal Test Push previews contain unseen matches only, filtering the whole
+  compatible cache before applying each preference cap. No extra paid scrape
+  is started to fill the batch.
+- When every compatible match is already banked, Test Push may resend only
+  through the distinct repeat warning and confirmation. The repeat is audited
+  but cannot restart the original suppression window.
+- The existing `seen_retention_days` setting remains authoritative (90 days by
+  default). Test Push bank events suppress scheduled delivery but are excluded
+  from the scheduled due-time calculation.
+
+## 14. Per-recipient routine delivery diary — DECIDED 2026-08-14
+
+- `Edit` opens a member-details page with Profile and Routine diary tabs. The
+  diary is intentionally routine-only: Test Push and immediate alerts remain
+  in their existing audit systems and do not clutter this view. A narrowly
+  recovered historical Test Push may be added at the owner's request, but must
+  be labeled `TEST PUSH · LEGACY` and excluded from scheduled suppression.
+- Routine payloads are staged in a file-backed append-only journal before
+  transport. A verified recipient receipt marks them accepted; interrupted or
+  ambiguous sends become uncertain and are not automatically retried.
+- The diary retains exact outbound text, listing snapshots, links and receipts
+  for 365 days (`delivery_history_retention_days`). This is independent of the
+  90-day duplicate-suppression window.
+- Accepted no-results messages appear as notices. Definite failures remain an
+  internal retryable state; accepted and uncertain entries are operator-visible.
+- Existing scheduled seen rows are imported idempotently on a best-effort
+  basis. Missing historical facts stay unknown and are visibly labeled legacy.
+- A Telegram ID change starts the new ID with an empty visible diary. The old
+  ID's immutable journal remains on disk until normal retention expiry.

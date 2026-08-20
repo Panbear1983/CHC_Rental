@@ -3,31 +3,14 @@
 Required by the buildout plan: no adapter may be activated for a source without
 an explicit status here. Scope decision (Peter, 2026-08-11): **US rentals only.**
 
-## RentCast — ALLOWED-WITH-LIMITS
+## RentCast — REMOVED 2026-08-13
 
-| | |
-|---|---|
-| Status | **ALLOWED-WITH-LIMITS** (official commercial API; per-plan request limits) |
-| Checked | 2026-08-11 |
-| Access | REST API, `X-Api-Key` header; key already provisioned in `.env` (`RENTCAST_API_KEY`) |
-| API docs | https://developers.rentcast.io/reference/introduction |
-| Terms | https://www.rentcast.io/terms-of-use (API access is the product being sold; programmatic use with a key is the licensed path) |
-| robots.txt | Not applicable — this is the vendor's API, not a crawl of their site |
-| Endpoint used | `GET /v1/listings/rental/long-term` (active long-term rental listings by city/state) |
-| Local ceilings | `config/settings.yaml`: 50 requests/day for this source, 100/day global; hard stop + operator alert at the ceiling |
-
-Known data-shape limits that constrain product behavior:
-
-- Responses carry **no consumer-facing listing URL**. Pushes link to a Google
-  Maps search for the listing address instead.
-- **No feature/amenity list** on this endpoint. A search with
-  `required_features` set will never match a RentCast listing — leave features
-  empty for RentCast-backed searches.
-- **No district/neighborhood field.** Leave `district` blank for a true
-  neighborhood filter. The matcher permits only one safe fallback: when the
-  requested district exactly equals the listing city (for example,
-  Brooklyn/Brooklyn).
-- `state` (2-letter) is required on every search for query planning.
+Status: **REMOVED.** RentCast was the primary source through 2026-08-12 but was
+removed on 2026-08-13 (Peter): its records carried **no consumer listing link**
+— only a Google-Maps-of-the-address fallback — which delivered no value to
+recipients. The adapter (`sources/rentcast.py`) and its wiring were deleted;
+Zillow via Apify is now the sole source. The unused `RENTCAST_API_KEY` may be
+removed from `.env` at will.
 
 ## Zillow rentals through Apify — OWNER-APPROVED-FLAGGED
 
@@ -50,14 +33,14 @@ Implementation boundaries:
   search URL and returns a bounded dataset.
 - The actor requires a map-backed search URL. CHC resolves US city/state bounds
   through Nominatim with an identifying user agent and caches the resulting
-  Zillow pool for the UTC day, so the hourly job does not repeat the lookup.
+  Zillow pool for the configured scrape timezone's calendar day. Ten-minute
+  checks reuse it and do not repeat the lookup.
 - Only explicit rental results are admitted. Explicit sale/sold results are
   discarded. Actor control records and building-summary cards without exact
   unit-level bath/price data are skipped rather than fabricated; other
   malformed records go through the normal rejected-record path.
-- Zillow failure is isolated from RentCast. Positive matches from a usable
-  source may still deliver, but no-results notices are suppressed until every
-  enabled source produced a usable pool.
+- A partial Zillow pool may still produce positive matches, but no-results
+  notices are suppressed unless the enabled source produced complete coverage.
 - Search-card results have no trusted amenity list or neighborhood. Features
   stay empty; a missing district can match only when the requested district is
   exactly the listing city.

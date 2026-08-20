@@ -11,6 +11,7 @@ import chc_rental.cli as cli
 from chc_rental.delivery_worker import DeliveryWorker
 from chc_rental.models import Allowlist, DeliveryMode, Profile
 from chc_rental.notify.telegram import TelegramReceipt, TelegramSendError
+from chc_rental.tui.controller import TuiController
 
 from tests.conftest import make_person, make_search
 from tests.test_listing_events import NOW, cycle, prepare, raw_listing
@@ -70,6 +71,9 @@ def test_success_records_receipt_marks_daily_seen_and_never_replays(store):
     assert "Newly observed rental (first seen by CHC)" in sender.sent[0][1]
     sent = store.event_store().outbox_records()[0]
     assert sent.status == "sent" and sent.identity_key in store.seen_keys(111)
+    bank_event = json.loads(store.seen_path(111).read_text(encoding="utf-8").strip())
+    assert bank_event["channel"] == "incremental"
+    assert bank_event["telegram_message_id"] == "9001"
     with store.event_store().connection() as connection:
         receipt = connection.execute(
             "SELECT telegram_message_id FROM delivery_receipts WHERE outbox_id=?",
@@ -163,6 +167,72 @@ def test_removal_after_promotion_is_rechecked_and_cancelled(store):
     )
     assert report.cancelled == 1 and report.sent == 0
     assert store.event_store().outbox_records()[0].status == "cancelled"
+
+
+def test_test_push_delivery_bank_wins_race_before_incremental_transport(store):
+    _, row = shadow_for_peter(store)
+    sender = RecordingSender()
+    worker = DeliveryWorker(store, sender=sender)
+    worker.promote(now_utc=NOW + timedelta(hours=3), telegram_ids={111})
+    listing = json.loads(store.event_store().outbox_listing_json(row.outbox_id))
+    store.mark_seen(
+        111,
+        row.identity_key,
+        search_name=row.primary_search_name,
+        url=listing["url"],
+        now_utc=NOW + timedelta(hours=3),
+        channel="test",
+    )
+
+    report = worker.deliver_due(
+        now_utc=NOW + timedelta(hours=3),
+        telegram_ids={111},
+    )
+
+    assert report.cancelled == 1
+    assert report.sent == 0
+    assert sender.sent == []
+
+
+def test_recipient_id_edit_cancels_actionable_outbox_and_resets_seen(store):
+    _, row = shadow_for_peter(store)
+    store.mark_seen(111, "v3:old", search_name="Old", url="https://old")
+    store.mark_seen(222, "v3:stale", search_name="Stale", url="https://stale")
+    before_profile = TuiController(store).get_person(111).profile.model_dump()
+    with store.edit_settings() as settings:
+        settings.operator_alert_telegram_id = 111
+
+    outcome = TuiController(store).update_person(111, 222, "Corrected")
+
+    assert outcome.outbox_rows_cancelled == 1
+    assert store.event_store().outbox_records()[0].status == "cancelled"
+    person = TuiController(store).get_person(222)
+    assert person.display_name == "Corrected"
+    assert person.profile.model_dump() == before_profile
+    assert store.load_settings().incremental_canary_telegram_ids == [222]
+    assert store.load_settings().operator_alert_telegram_id == 111
+    assert not store.seen_path(111).exists() and not store.seen_path(222).exists()
+    with store.event_store().connection() as connection:
+        audit = connection.execute(
+            "SELECT action, target_id FROM operator_audit ORDER BY audit_id DESC LIMIT 1"
+        ).fetchone()
+    assert tuple(audit) == ("cancel_recipient_outbox", "111,222")
+
+
+def test_recipient_removal_retains_uncertain_outbox_history(store):
+    _, row = shadow_for_peter(store)
+    with store.event_store().connection() as connection:
+        connection.execute(
+            "UPDATE outbox SET status='uncertain' WHERE outbox_id=?", (row.outbox_id,)
+        )
+        connection.commit()
+
+    outcome = TuiController(store).remove_person(111)
+
+    assert outcome.outbox_rows_cancelled == 0
+    retained = store.event_store().outbox_records()[0]
+    assert retained.telegram_id == 111 and retained.status == "uncertain"
+    assert TuiController(store).list_people() == []
 
 
 def test_changed_search_is_rechecked_before_transport(store):

@@ -7,7 +7,7 @@ state — the same inputs always produce the same result.
 
 from __future__ import annotations
 
-from chc_rental.models import Listing, Search
+from chc_rental.models import Listing, Search, property_type_group
 
 
 def _normalize_text(value: str | None) -> str:
@@ -36,7 +36,10 @@ def matches_search(listing: Listing, search: Search) -> bool:
     if not (search.price_min <= listing.price <= search.price_max):
         return False
 
-    if listing.property_type not in search.property_types:
+    # Compare by canonical group, not raw enum: sources emit single_family /
+    # apartment, so a "house" or "studio" search would otherwise match nothing.
+    search_groups = {property_type_group(t) for t in search.property_types}
+    if property_type_group(listing.property_type) not in search_groups:
         return False
 
     if not (search.bed_min <= listing.beds <= search.bed_max):

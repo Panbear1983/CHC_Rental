@@ -39,6 +39,29 @@ def local_day_window_utc(profile, now_utc: datetime) -> tuple[datetime, datetime
     return start.astimezone(timezone.utc), end.astimezone(timezone.utc)
 
 
+def push_precedes_scrape(profile, settings, *, ref_date) -> bool:
+    """True when a person's daily push time is at or before the scrape gate.
+
+    Compares ``profile.delivery_time`` (in the profile's zone) against
+    ``settings.scrape_time`` (in the scrape zone), both projected to UTC on
+    ``ref_date``. When true, the person is "due" before the day's fetch has run,
+    so their first push of the day can be empty. This is a same-calendar-date
+    approximation used ONLY to surface a non-blocking operator warning; it never
+    blocks a save and small DST/date-wrap imprecision is acceptable.
+    """
+    scrape_zone = ZoneInfo(settings.scrape_timezone)
+    push_zone = ZoneInfo(profile.timezone)
+    scrape_h, scrape_m = _clock(settings.scrape_time)
+    push_h, push_m = _clock(profile.delivery_time)
+    scrape_utc = datetime.combine(
+        ref_date, time(scrape_h, scrape_m), tzinfo=scrape_zone
+    ).astimezone(timezone.utc)
+    push_utc = datetime.combine(
+        ref_date, time(push_h, push_m), tzinfo=push_zone
+    ).astimezone(timezone.utc)
+    return push_utc <= scrape_utc
+
+
 def notification_not_before(profile, now_utc: datetime) -> datetime:
     """Earliest send time respecting delivery mode and local quiet hours."""
     now = _aware_utc(now_utc, "now_utc")

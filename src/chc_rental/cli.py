@@ -5,12 +5,14 @@ or from a local JSON fixture for offline runs and tests. Fetching is separately
 day-cached and budget-capped per source in `chc_rental.fetch`; everything
 downstream (validate, match, dedupe, cap, deliver) consumes the combined pool.
 
-    chc-rental init
-    chc-rental run                        # all configured sources (cached per day)
-    chc-rental run --fixture listings.json
-    chc-rental run --live
-    chc-rental check
-    chc-rental prune
+    ./dashboard.sh init
+    ./dashboard.sh scrape                 # network/cache only; never Telegram
+    ./dashboard.sh deliver --live         # saved cache only; never scrapes
+    ./dashboard.sh run                    # all configured sources (cached per day)
+    ./dashboard.sh run --fixture listings.json
+    ./dashboard.sh run --live
+    ./dashboard.sh check
+    ./dashboard.sh prune
 """
 
 from __future__ import annotations
@@ -24,9 +26,9 @@ from uuid import uuid4
 
 from chc_rental.event_store import AlertStoreError
 from chc_rental.delivery_worker import DeliveryWorker
-from chc_rental.fetch import fetch_many_daily
+from chc_rental.fetch import fetch_many_daily, load_many_daily_cached, scrape_day
 from chc_rental.incremental import IncrementalCollector
-from chc_rental.notify.telegram import build_sender
+from chc_rental.notify.telegram import TelegramSendError, build_sender
 from chc_rental.outbox import process_incremental_report
 from chc_rental.operations import (
     ROLLOUT_ATTESTATIONS,
@@ -35,7 +37,7 @@ from chc_rental.operations import (
 )
 from chc_rental.pipeline import PipelineResult, deliver, plan_pushes, validate_records
 from chc_rental.scheduler import IncrementalScheduler
-from chc_rental.sources import configured_adapters
+from chc_rental.sources import configured_adapters, enabled_cache_sources
 from chc_rental.sources.apify import ApifyClient, ApifyRunState
 from chc_rental.sources.zillow import ZillowRentalAdapter, load_apify_token
 from chc_rental.store import Store, StoreError
@@ -43,7 +45,7 @@ from chc_rental.store import Store, StoreError
 FIXTURE_SOURCE = "fixture"
 
 
-def _alert_owner(store: Store, env_file: str, text: str) -> bool:
+def _alert_operator(store: Store, env_file: str, text: str) -> bool:
     """Best-effort Telegram alert to the operator. Must never break the run.
 
     Independent of `live_push_enabled`: that flag gates pushes to recipients,
@@ -51,12 +53,15 @@ def _alert_owner(store: Store, env_file: str, text: str) -> bool:
     """
     try:
         settings = store.load_settings()
-        if not settings.owner_telegram_id:
+        if not settings.operator_alert_telegram_id:
             return False
         sender = build_sender(env_file)
         if sender is None:
             return False
-        sender.send(telegram_id=settings.owner_telegram_id, text=f"[chc-rental] {text}")
+        sender.send(
+            telegram_id=settings.operator_alert_telegram_id,
+            text=f"[chc-rental] {text}",
+        )
         return True
     except Exception:
         return False
@@ -105,15 +110,187 @@ def _cmd_run(args: argparse.Namespace) -> int:
             return _run_once(store, args, now_utc)
         except Exception as exc:
             # The daily job is unattended; a crash nobody sees is a silent outage.
-            _alert_owner(
+            _alert_operator(
                 store, getattr(args, "env_file", ".env"),
                 f"daily run crashed: {type(exc).__name__}: {exc}",
             )
             raise
 
 
+def _record_daily_run(
+    store: Store,
+    now_utc: datetime,
+    summary: dict[str, Any],
+    *,
+    rejected: int = 0,
+    fetch: Optional[dict[str, Any]] = None,
+) -> None:
+    payload: dict[str, Any] = {
+        "finished_at": datetime.now(timezone.utc).isoformat(),
+        "summary": summary,
+        "rejected": rejected,
+    }
+    if fetch is not None:
+        payload["fetch"] = fetch
+    store.record_run(now_utc, payload)
+
+
+def _print_fetch_notes(pool) -> None:
+    for note in pool.configuration_warnings:
+        print(f"source configuration: {note}")
+    for report in pool.sources:
+        for note in report.warnings:
+            print(f"note [{report.source}]: {note}")
+        for error in report.errors:
+            print(f"fetch error [{report.source}]: {error}")
+
+
+def _pool_reason(pool, fallback: str = "no listing pool") -> str:
+    notes = list(pool.configuration_warnings)
+    for report in pool.sources:
+        notes.extend(report.errors or report.warnings)
+    return "; ".join(notes) or fallback
+
+
+def _cmd_scrape(args: argparse.Namespace) -> int:
+    """Update the daily source snapshot; never construct a Telegram sender."""
+    store = Store(args.root)
+    store.initialize()
+    now_utc = _parse_now(args.now) if args.now else datetime.now(timezone.utc)
+    with store.try_run_lock() as acquired:
+        if not acquired:
+            print("another CHC_Rental run is already in progress; scrape skipped")
+            return 0
+
+        settings = store.load_settings()
+        adapters, configuration_warnings = configured_adapters(
+            settings, env_path=args.env_file
+        )
+        if not adapters:
+            reason = "no listing source configured"
+            if configuration_warnings:
+                reason += ": " + "; ".join(configuration_warnings)
+            print(f"{reason}; scrape skipped")
+            _record_daily_run(
+                store,
+                now_utc,
+                {"scrape": "skipped", "reason": reason},
+            )
+            return 1 if configuration_warnings else 0
+
+        pool = fetch_many_daily(
+            store,
+            adapters,
+            now_utc=now_utc,
+            configuration_warnings=configuration_warnings,
+        )
+        _print_fetch_notes(pool)
+        fetch_summary = pool.summary()
+        if pool.usable:
+            status = "fetched" if any(r.fetched for r in pool.sources) else "cached"
+            summary = {
+                "scrape": status,
+                "scrape_day": scrape_day(settings, now_utc).isoformat(),
+                "records": len(pool.records),
+                "requests_used": sum(r.requests_used for r in pool.sources),
+            }
+            # Retention work now happens once, alongside the one paid scrape,
+            # instead of on every ten-minute delivery check.
+            if any(r.requests_used for r in pool.sources):
+                store.prune(today=scrape_day(settings, now_utc), settings=settings)
+            print("SCRAPE " + json.dumps(summary, sort_keys=True))
+            _record_daily_run(store, now_utc, summary, fetch=fetch_summary)
+            return 1 if any(r.errors for r in pool.sources) else 0
+
+        reason = _pool_reason(pool)
+        summary = {
+            "scrape": "waiting" if not any(r.errors for r in pool.sources) else "failed",
+            "scrape_day": scrape_day(settings, now_utc).isoformat(),
+            "reason": reason,
+        }
+        print("SCRAPE " + json.dumps(summary, sort_keys=True))
+        _record_daily_run(store, now_utc, summary, fetch=fetch_summary)
+        return 1 if any(r.errors for r in pool.sources) else 0
+
+
+def _cmd_deliver(args: argparse.Namespace) -> int:
+    """Plan/send only from today's saved pool; this path cannot call Apify."""
+    store = Store(args.root)
+    store.initialize()
+    now_utc = _parse_now(args.now) if args.now else datetime.now(timezone.utc)
+    with store.try_run_lock() as acquired:
+        if not acquired:
+            print("another CHC_Rental run is already in progress; delivery check skipped")
+            return 0
+
+        settings = store.load_settings()
+        sources = enabled_cache_sources(settings)
+        if not sources:
+            reason = "no enabled saved-cache source"
+            print(f"{reason}; delivery skipped")
+            _record_daily_run(
+                store, now_utc, {"delivery": "skipped", "reason": reason}
+            )
+            return 0
+
+        pool = load_many_daily_cached(store, sources, now_utc=now_utc)
+        _print_fetch_notes(pool)
+        fetch_summary = pool.summary()
+        if not pool.usable:
+            reason = _pool_reason(pool, "no compatible current scrape-day cache")
+            print(f"no usable saved listing pool ({reason}); delivery skipped")
+            _record_daily_run(
+                store,
+                now_utc,
+                {"delivery": "skipped", "reason": reason},
+                fetch=fetch_summary,
+            )
+            return 0
+
+        day = scrape_day(settings, now_utc)
+        listings, rejected = validate_records(
+            store, pool.records, day=day, source="saved-daily-pool"
+        )
+        if rejected:
+            print(
+                f"note: {rejected} record(s) failed validation and were kept "
+                "in state/rejected/"
+            )
+        result = plan_pushes(
+            store, listings, now_utc=now_utc, allow_no_results=pool.complete
+        )
+        if not pool.complete:
+            print("note: source coverage was incomplete; no-results notices are suppressed")
+
+        sender = build_sender(args.env_file) if args.live else None
+        if args.live and sender is None:
+            print(
+                "note: --live ignored. No usable TELEGRAM_BOT_TOKEN in "
+                f"{args.env_file} (it is still 'changeme' or absent)."
+            )
+        result = deliver(
+            store, result, sender=sender, live=args.live, now_utc=now_utc
+        )
+        print(result.preview())
+        print("SUMMARY " + json.dumps(result.summary, sort_keys=True))
+        _alert_on_problems(store, args.env_file, result, fetch_summary)
+        _record_daily_run(
+            store,
+            now_utc,
+            result.summary,
+            rejected=rejected,
+            fetch=fetch_summary,
+        )
+        if args.live and result.summary.get("delivery") != "live":
+            print(
+                "note: --live had no effect. Set live_push_enabled: true in "
+                "config/settings.yaml and supply a sender."
+            )
+        return 0
+
+
 def _run_once(store: Store, args: argparse.Namespace, now_utc: datetime) -> int:
-    today = now_utc.date()
+    today = scrape_day(store.load_settings(), now_utc)
 
     def record(summary: dict[str, Any], *, rejected: int = 0, fetch: Optional[dict] = None) -> None:
         payload: dict[str, Any] = {
@@ -172,7 +349,11 @@ def _run_once(store: Store, args: argparse.Namespace, now_utc: datetime) -> int:
             if any(report.errors for report in pool.sources) and not _same_failure_as_last_run(
                 store, reason
             ):
-                _alert_owner(store, args.env_file, f"fetch failed, no pushes today: {reason}")
+                _alert_operator(
+                    store,
+                    args.env_file,
+                    f"fetch failed, no pushes today: {reason}",
+                )
             record({"delivery": "skipped", "reason": reason}, fetch=fetch_summary)
             return 1 if any(report.errors for report in pool.sources) else 0
         raw = pool.records
@@ -214,8 +395,8 @@ def _same_failure_as_last_run(store: Store, reason: str) -> bool:
     """True when the most recent run already recorded this exact failure.
 
     Alert on the first occurrence of a failure streak, then stay quiet until
-    something changes — an unattended hourly job must not page the operator
-    24 times about one broken subscription.
+    something changes — frequent unattended checks must not repeatedly page
+    the operator about one broken subscription.
     """
     try:
         last = store.latest_run_log() or {}
@@ -231,7 +412,7 @@ def _alert_on_problems(
     if not problems:
         return
 
-    # A truncated day cache is replayed hourly by design. Alert on the first
+    # A truncated day cache is replayed by frequent checks. Alert on the first
     # occurrence of a problem streak and whenever the signature changes, not
     # on every free cache replay. This runs before the current run is recorded,
     # so latest_run_log is the previous cycle.
@@ -244,7 +425,7 @@ def _alert_on_problems(
         previous_problems = []
     if problems == previous_problems:
         return
-    _alert_owner(store, env_file, " · ".join(problems))
+    _alert_operator(store, env_file, " · ".join(problems))
 
 
 def _problem_messages(
@@ -290,7 +471,15 @@ def _cmd_check(args: argparse.Namespace) -> int:
     if sender is None:
         print(f"no usable TELEGRAM_BOT_TOKEN in {args.env_file}")
         return 1
-    me = sender.whoami()
+    try:
+        me = sender.whoami()
+    except TelegramSendError as exc:
+        print(f"Telegram bot authentication failed: {exc}")
+        print(
+            f"Replace TELEGRAM_BOT_TOKEN in {args.env_file} with the current "
+            "token from @BotFather, then retry."
+        )
+        return 1
     print(f"bot: @{me.get('username')} (id {me.get('id')}, name {me.get('first_name')})")
     problems = 0
     for person in store.load_allowlist().people:
@@ -311,7 +500,10 @@ def _cmd_check(args: argparse.Namespace) -> int:
 def _cmd_prune(args: argparse.Namespace) -> int:
     store = Store(args.root)
     store.initialize()
-    removed = store.prune(today=date.today(), settings=store.load_settings())
+    settings = store.load_settings()
+    removed = store.prune(
+        today=scrape_day(settings, datetime.now(timezone.utc)), settings=settings
+    )
     print("pruned " + json.dumps(removed, sort_keys=True))
     return 0
 
@@ -326,7 +518,9 @@ def _alert_foundation_status(store: Store) -> dict[str, Any]:
 def _alert_operational_status(store: Store, *, env_file: str) -> dict[str, Any]:
     payload = _alert_foundation_status(store)
     settings = store.load_settings()
-    used = store.quota_used(datetime.now(timezone.utc).date(), "zillow")
+    used = store.quota_used(
+        scrape_day(settings, datetime.now(timezone.utc)), "zillow"
+    )
     budget = settings.source_request_budget("zillow")
     token_ready = load_apify_token(env_file) is not None
     payload["incremental"] = {
@@ -605,10 +799,10 @@ def _cmd_alerts_tick(args: argparse.Namespace) -> int:
         collector=collector,
         sender=sender,
         source_unavailable_reason=source_reason,
-        owner_alert=(
+        operator_alert=(
             None
             if args.fixture
-            else lambda text: _alert_owner(store, env_file, text)
+            else lambda text: _alert_operator(store, env_file, text)
         ),
         runtime_mode="fixture" if args.fixture else "live",
     ).tick(now_utc=now_utc, max_delivery_messages=args.max_messages)
@@ -695,19 +889,19 @@ def _cmd_alerts_deliver(args: argparse.Namespace) -> int:
         )
     # Never follow an ambiguous recipient send with another automatic Telegram
     # call: the first message may already have been accepted. Definite failures
-    # may alert a distinct operator; if Peter is both recipient and owner, the
+    # may alert a distinct operator; if Peter is both recipient and operator, the
     # dashboard remains the safe review channel for his own failed canary.
     terminal = [
         row
         for row in store.event_store().terminal_failures_needing_alert()
         if row.status == "failed"
     ]
-    owner_id = store.load_settings().owner_telegram_id
-    if terminal and owner_id != args.confirm_telegram_id:
+    operator_id = store.load_settings().operator_alert_telegram_id
+    if terminal and operator_id != args.confirm_telegram_id:
         text = "incremental delivery needs review: " + ", ".join(
             f"outbox {row.outbox_id}={row.status}" for row in terminal[:10]
         )
-        if _alert_owner(store, args.env_file, text):
+        if _alert_operator(store, args.env_file, text):
             store.event_store().mark_terminal_failure_alerted(
                 [row.outbox_id for row in terminal], now_utc=now_utc
             )
@@ -716,7 +910,9 @@ def _cmd_alerts_deliver(args: argparse.Namespace) -> int:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    parser = argparse.ArgumentParser(prog="chc-rental", description="CHC Rental daily runner.")
+    parser = argparse.ArgumentParser(
+        prog="dashboard.sh", description="CHC Rental daily runner."
+    )
     parser.add_argument("--root", default=".", help="Data directory (default: %(default)s)")
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -739,6 +935,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "--env-file", default=".env", help="Dotenv holding TELEGRAM_BOT_TOKEN (default: %(default)s)"
     )
     run_parser.set_defaults(func=_cmd_run)
+
+    scrape_parser = sub.add_parser(
+        "scrape", help="Update today's source cache without any Telegram delivery"
+    )
+    scrape_parser.add_argument(
+        "--now", help="Override the current instant (ISO 8601 with offset)"
+    )
+    scrape_parser.add_argument("--env-file", default=".env")
+    scrape_parser.set_defaults(func=_cmd_scrape)
+
+    deliver_daily_parser = sub.add_parser(
+        "deliver", help="Plan/send from today's saved cache without any source fetch"
+    )
+    deliver_daily_parser.add_argument(
+        "--now", help="Override the current instant (ISO 8601 with offset)"
+    )
+    deliver_daily_parser.add_argument("--live", action="store_true")
+    deliver_daily_parser.add_argument("--env-file", default=".env")
+    deliver_daily_parser.set_defaults(func=_cmd_deliver)
 
     check_parser = sub.add_parser("check", help="Verify the bot can reach every allowlisted person")
     check_parser.add_argument("--env-file", default=".env")

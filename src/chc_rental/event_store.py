@@ -1038,6 +1038,68 @@ class EventStore:
             connection.commit()
         return cursor.rowcount == 1
 
+    def cancel_recipient_outbox(
+        self,
+        telegram_ids: set[int],
+        *,
+        now_utc: datetime,
+        reason: str,
+    ) -> int:
+        """Cancel every still-actionable row for explicit recipients.
+
+        Completed receipts and uncertain outcomes remain immutable history.
+        A missing ledger means incremental alerts were never initialized and is
+        therefore a successful no-op rather than a reason to create SQLite.
+        """
+        if not telegram_ids or not self.path.exists():
+            return 0
+        if any(
+            not isinstance(item, int) or isinstance(item, bool) or item <= 0
+            for item in telegram_ids
+        ):
+            raise ValueError("Telegram IDs must be positive integers")
+        ids = sorted(telegram_ids)
+        placeholders = ",".join("?" for _ in ids)
+        now = self._iso(now_utc)
+        with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = connection.execute(
+                    f"""UPDATE outbox SET status='cancelled', claimed_at=NULL,
+                               last_error_class='ineligible', last_error=?
+                           WHERE telegram_id IN ({placeholders})
+                           AND status IN (
+                               'shadow', 'pending', 'sending', 'retry_wait', 'failed'
+                           )""",
+                    (reason[:500], *ids),
+                )
+                cancelled = cursor.rowcount
+                has_operator_audit = connection.execute(
+                    "SELECT 1 FROM sqlite_master "
+                    "WHERE type='table' AND name='operator_audit'"
+                ).fetchone()
+                if cancelled and has_operator_audit:
+                    connection.execute(
+                        """INSERT INTO operator_audit(
+                               action, target_type, target_id, details_json, created_at
+                           ) VALUES (
+                               'cancel_recipient_outbox', 'telegram_recipient', ?, ?, ?
+                           )""",
+                        (
+                            ",".join(map(str, ids)),
+                            json.dumps(
+                                {"cancelled": cancelled, "reason": reason[:500]},
+                                sort_keys=True,
+                            ),
+                            now,
+                        ),
+                    )
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+        return cancelled
+
     def release_due_retries(
         self, *, now_utc: datetime, telegram_ids: set[int]
     ) -> int:

@@ -43,14 +43,14 @@ class IncrementalScheduler:
         *,
         collector: IncrementalCollector | None,
         sender: IncrementalSender | None,
-        owner_alert: Callable[[str], bool] | None = None,
+        operator_alert: Callable[[str], bool] | None = None,
         source_unavailable_reason: str | None = None,
         runtime_mode: str = "test",
     ) -> None:
         self.store = store
         self.collector = collector
         self.sender = sender
-        self.owner_alert = owner_alert
+        self.operator_alert = operator_alert
         self.source_unavailable_reason = source_unavailable_reason
         if runtime_mode not in {"live", "fixture", "test"}:
             raise ValueError("scheduler runtime mode must be live, fixture, or test")
@@ -117,23 +117,23 @@ class IncrementalScheduler:
                     f"{breaker.source} source breaker {breaker.pending_alert}: "
                     f"{breaker.last_error_class or 'unknown'}"
                 )
-            if self.owner_alert is not None and self.owner_alert(text):
+            if self.operator_alert is not None and self.operator_alert(text):
                 events.acknowledge_source_alert(breaker.source, now_utc=now)
 
         terminal = events.terminal_failures_needing_alert()
-        owner_id = self.store.load_settings().owner_telegram_id
-        alertable = [row for row in terminal if row.telegram_id != owner_id]
+        operator_id = self.store.load_settings().operator_alert_telegram_id
+        alertable = [row for row in terminal if row.telegram_id != operator_id]
         if alertable:
             text = "incremental delivery needs review: " + ", ".join(
                 f"outbox {row.outbox_id}={row.status}" for row in alertable[:10]
             )
-            if self.owner_alert is not None and self.owner_alert(text):
+            if self.operator_alert is not None and self.operator_alert(text):
                 events.mark_terminal_failure_alerted(
                     [row.outbox_id for row in alertable], now_utc=now
                 )
         if terminal and not alertable:
             report.warnings.append(
-                "owner-recipient delivery failures require dashboard review"
+                "operator-recipient delivery failures require dashboard review"
             )
 
     def tick(self, *, now_utc: datetime, max_delivery_messages: int = 10) -> SchedulerReport:

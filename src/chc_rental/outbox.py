@@ -98,7 +98,11 @@ def plan_shadow_notifications(
                 continue
             matched_any = True
             already_seen = {
-                upgrade_seen_key(key) for key in store.seen_keys(person.telegram_id)
+                upgrade_seen_key(key)
+                for key in store.active_seen_keys(
+                    person.telegram_id,
+                    now_utc=now_utc,
+                )
             }
             if event.identity_key in already_seen:
                 report.legacy_seen_suppressed += 1

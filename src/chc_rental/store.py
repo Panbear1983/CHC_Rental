@@ -28,12 +28,22 @@ from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator, Optional
+from urllib.parse import unquote
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 import yaml
 from pydantic import ValidationError
 
 from chc_rental.event_store import AlertMigrationStatus, EventStore
+from chc_rental.delivery_history import (
+    DELIVERY_CHANNELS,
+    RoutineDeliveryDay,
+    RoutineDeliveryEntry,
+    RoutineDeliveryItem,
+    fold_routine_events,
+    group_routine_days,
+)
 from chc_rental.models import (
     ALERT_CONFIG_SCHEMA_VERSION,
     Allowlist,
@@ -89,6 +99,15 @@ class Store:
     def rejected_path(self, day: date) -> Path:
         return self.state_dir / "rejected" / f"{day.isoformat()}.jsonl"
 
+    def test_push_path(self, day: date) -> Path:
+        return self.state_dir / "test-pushes" / f"{day.isoformat()}.jsonl"
+
+    def routine_journal_dir(self, telegram_id: int) -> Path:
+        return self.state_dir / "delivery-journal" / str(telegram_id)
+
+    def routine_journal_path(self, telegram_id: int, local_day: date) -> Path:
+        return self.routine_journal_dir(telegram_id) / f"{local_day.isoformat()}.jsonl"
+
     def cache_dir(self, day: date) -> Path:
         return self.state_dir / "cache" / day.isoformat()
 
@@ -118,6 +137,8 @@ class Store:
             self.state_dir / "quota",
             self.state_dir / "runs",
             self.state_dir / "rejected",
+            self.state_dir / "test-pushes",
+            self.state_dir / "delivery-journal",
             self.state_dir / "cache",
         ):
             path.mkdir(parents=True, exist_ok=True)
@@ -138,6 +159,25 @@ class Store:
         finally:
             fcntl.flock(handle, fcntl.LOCK_UN)
             os.close(handle)
+
+    @contextmanager
+    def recipient_delivery_lock(self, telegram_id: int) -> Iterator[None]:
+        """Serialize every outbound delivery path for one recipient.
+
+        Planning and previewing are intentionally lock-free.  The daily,
+        incremental, and manual Test Push paths take this lock immediately
+        before transport, re-check the recipient's bank, and hold it until the
+        accepted Telegram receipt has been recorded.  Different recipients do
+        not block one another.
+        """
+        if (
+            not isinstance(telegram_id, int)
+            or isinstance(telegram_id, bool)
+            or telegram_id <= 0
+        ):
+            raise ValueError("Telegram ID must be a positive integer")
+        with self._locked(f"delivery-{telegram_id}"):
+            yield
 
     @contextmanager
     def try_run_lock(self) -> Iterator[bool]:
@@ -376,9 +416,578 @@ class Store:
     def migrate_alert_ledger(self) -> AlertMigrationStatus:
         return self.event_store().migrate()
 
-    # -------------------------------------------------------------- seen ledger
-    def seen_keys(self, telegram_id: int) -> set[str]:
+    # ---------------------------------------------------- routine delivery journal
+    @staticmethod
+    def _aware_utc(value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("routine delivery timestamps must be timezone-aware")
+        return value.astimezone(timezone.utc)
+
+    def _routine_events(self, telegram_id: int, local_day: date) -> list[dict[str, Any]]:
+        path = self.routine_journal_path(telegram_id, local_day)
+        if not path.exists():
+            return []
+        events: list[dict[str, Any]] = []
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if isinstance(event, dict):
+                events.append(event)
+        return events
+
+    def _routine_entry(
+        self,
+        telegram_id: int,
+        local_day: date,
+        attempt_id: str,
+    ) -> RoutineDeliveryEntry | None:
+        return next(
+            (
+                entry
+                for entry in fold_routine_events(
+                    self._routine_events(telegram_id, local_day)
+                )
+                if entry.attempt_id == attempt_id
+            ),
+            None,
+        )
+
+    @staticmethod
+    def _routine_attempt_identity(
+        telegram_id: int,
+        local_day: date,
+        kind: str,
+        message_text: str,
+        items: list[RoutineDeliveryItem],
+        discriminator: str | None,
+    ) -> tuple[str, str]:
+        stable = json.dumps(
+            {
+                "telegram_id": telegram_id,
+                "local_date": local_day.isoformat(),
+                "kind": kind,
+                "message_sha256": hashlib.sha256(
+                    message_text.encode("utf-8")
+                ).hexdigest(),
+                "keys": [item.key for item in items],
+                "discriminator": discriminator or "",
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        attempt_key = hashlib.sha256(stable.encode("utf-8")).hexdigest()
+        return f"routine-{attempt_key[:24]}", attempt_key
+
+    def prepare_routine_delivery(
+        self,
+        telegram_id: int,
+        *,
+        display_name: str,
+        timezone_name: str,
+        local_day: date,
+        kind: str,
+        message_text: str,
+        items: list[RoutineDeliveryItem],
+        now_utc: datetime,
+        legacy: bool = False,
+        channel: str = "scheduled",
+        discriminator: str | None = None,
+    ) -> RoutineDeliveryEntry:
+        """Durably stage one exact routine Telegram payload before transport.
+
+        Re-entering a definitely failed attempt makes it prepared and retryable.
+        Re-entering a stale ``sending`` attempt quarantines it as uncertain;
+        Telegram offers no history lookup that can prove whether it arrived.
+        """
+        if kind not in {"listing", "notice"}:
+            raise ValueError(f"unsupported routine delivery kind: {kind}")
+        if channel not in DELIVERY_CHANNELS:
+            raise ValueError(f"unsupported delivery channel: {channel}")
+        stamp = self._aware_utc(now_utc)
+        attempt_id, attempt_key = self._routine_attempt_identity(
+            telegram_id,
+            local_day,
+            kind,
+            message_text,
+            items,
+            discriminator,
+        )
+        lock_name = f"routine-journal-{telegram_id}"
+        with self._locked(lock_name):
+            current = self._routine_entry(telegram_id, local_day, attempt_id)
+            if current is not None and current.status in {"accepted", "uncertain"}:
+                return current
+            if current is not None and current.status == "sending":
+                self._atomic_append(
+                    self.routine_journal_path(telegram_id, local_day),
+                    json.dumps(
+                        {
+                            "schema_version": 1,
+                            "attempt_id": attempt_id,
+                            "state": "uncertain",
+                            "event_at": stamp.isoformat(),
+                            "error": (
+                                "recovered an interrupted Telegram send; delivery "
+                                "cannot be confirmed and was not retried"
+                            ),
+                        },
+                        ensure_ascii=False,
+                    ),
+                )
+                recovered = self._routine_entry(telegram_id, local_day, attempt_id)
+                if recovered is None:  # pragma: no cover - durable append invariant
+                    raise StoreError("routine delivery recovery could not be read back")
+                return recovered
+            if current is None or current.status == "failed":
+                payload = {
+                    "display_name": display_name,
+                    "timezone": timezone_name,
+                    "local_date": local_day.isoformat(),
+                    "kind": kind,
+                    "message_text": message_text,
+                    "items": [item.as_dict() for item in items],
+                    "legacy": bool(legacy),
+                    "channel": channel,
+                }
+                self._atomic_append(
+                    self.routine_journal_path(telegram_id, local_day),
+                    json.dumps(
+                        {
+                            "schema_version": 1,
+                            "attempt_id": attempt_id,
+                            "attempt_key": attempt_key,
+                            "telegram_id": telegram_id,
+                            "state": "prepared",
+                            "event_at": stamp.isoformat(),
+                            "payload": payload,
+                        },
+                        ensure_ascii=False,
+                    ),
+                )
+            prepared = self._routine_entry(telegram_id, local_day, attempt_id)
+            if prepared is None:  # pragma: no cover - durable append invariant
+                raise StoreError("prepared routine delivery could not be read back")
+            return prepared
+
+    def transition_routine_delivery(
+        self,
+        telegram_id: int,
+        local_day: date,
+        attempt_id: str,
+        *,
+        state: str,
+        now_utc: datetime,
+        telegram_message_id: str | None = None,
+        chat_id: str | None = None,
+        error: str | None = None,
+    ) -> RoutineDeliveryEntry:
+        """Append one legal lifecycle transition and read its folded result."""
+        stamp = self._aware_utc(now_utc)
+        allowed_from = {
+            "sending": {"prepared"},
+            "accepted": {"sending"},
+            "failed": {"sending"},
+            "uncertain": {"sending"},
+        }
+        if state not in allowed_from:
+            raise ValueError(f"unsupported routine delivery transition: {state}")
+        with self._locked(f"routine-journal-{telegram_id}"):
+            current = self._routine_entry(telegram_id, local_day, attempt_id)
+            if current is None:
+                raise StoreError(f"unknown routine delivery attempt: {attempt_id}")
+            if current.status == state:
+                return current
+            if current.status not in allowed_from[state]:
+                raise StoreError(
+                    f"routine delivery {attempt_id} cannot change "
+                    f"from {current.status} to {state}"
+                )
+            event: dict[str, Any] = {
+                "schema_version": 1,
+                "attempt_id": attempt_id,
+                "state": state,
+                "event_at": stamp.isoformat(),
+            }
+            if telegram_message_id is not None:
+                event["telegram_message_id"] = str(telegram_message_id)
+            if chat_id is not None:
+                event["chat_id"] = str(chat_id)
+            if error is not None:
+                event["error"] = str(error)
+            self._atomic_append(
+                self.routine_journal_path(telegram_id, local_day),
+                json.dumps(event, ensure_ascii=False),
+            )
+            updated = self._routine_entry(telegram_id, local_day, attempt_id)
+            if updated is None:  # pragma: no cover - durable append invariant
+                raise StoreError("routine delivery transition could not be read back")
+            return updated
+
+    def annotate_routine_delivery(
+        self,
+        telegram_id: int,
+        local_day: date,
+        attempt_id: str,
+        *,
+        now_utc: datetime,
+        message_text: str | None = None,
+        items: list[RoutineDeliveryItem] | None = None,
+        channel: str | None = None,
+        error: str | None = None,
+    ) -> RoutineDeliveryEntry:
+        """Append recovered historical detail without rewriting journal evidence."""
+        if channel is not None and channel not in DELIVERY_CHANNELS:
+            raise ValueError(f"unsupported delivery channel: {channel}")
+        payload_patch: dict[str, Any] = {}
+        if message_text is not None:
+            payload_patch["message_text"] = message_text
+        if items is not None:
+            payload_patch["items"] = [item.as_dict() for item in items]
+        if channel is not None:
+            payload_patch["channel"] = channel
+        if error is not None:
+            payload_patch["error"] = error
+        with self._locked(f"routine-journal-{telegram_id}"):
+            current = self._routine_entry(telegram_id, local_day, attempt_id)
+            if current is None:
+                raise StoreError(f"unknown routine delivery attempt: {attempt_id}")
+            if not payload_patch:
+                return current
+            if current.status not in {"accepted", "uncertain"}:
+                raise StoreError(
+                    f"routine delivery {attempt_id} cannot be annotated from "
+                    f"{current.status}"
+                )
+            self._atomic_append(
+                self.routine_journal_path(telegram_id, local_day),
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "attempt_id": attempt_id,
+                        "state": "annotated",
+                        "event_at": self._aware_utc(now_utc).isoformat(),
+                        "payload_patch": payload_patch,
+                    },
+                    ensure_ascii=False,
+                ),
+            )
+            updated = self._routine_entry(telegram_id, local_day, attempt_id)
+            if updated is None:  # pragma: no cover - durable append invariant
+                raise StoreError("routine delivery annotation could not be read back")
+            return updated
+
+    def _routine_entries_since(
+        self,
+        telegram_id: int,
+        *,
+        cutoff_utc: datetime | None = None,
+    ) -> list[RoutineDeliveryEntry]:
+        directory = self.routine_journal_dir(telegram_id)
+        if not directory.exists():
+            return []
+        entries: list[RoutineDeliveryEntry] = []
+        for path in sorted(directory.glob("*.jsonl")):
+            try:
+                local_day = date.fromisoformat(path.stem)
+            except ValueError:
+                continue
+            entries.extend(
+                fold_routine_events(self._routine_events(telegram_id, local_day))
+            )
+        if cutoff_utc is not None:
+            entries = [
+                entry
+                for entry in entries
+                if entry.updated_at.astimezone(timezone.utc) >= cutoff_utc
+            ]
+        return entries
+
+    def routine_accepted_keys(
+        self,
+        telegram_id: int,
+        *,
+        now_utc: datetime | None = None,
+        retention_days: int | None = None,
+    ) -> set[str]:
+        days = (
+            self.load_settings().seen_retention_days
+            if retention_days is None
+            else retention_days
+        )
+        cutoff = None
+        if days > 0:
+            now = self._aware_utc(now_utc or _utc_now())
+            cutoff = now - timedelta(days=days)
+        return {
+            item.key
+            for entry in self._routine_entries_since(
+                telegram_id,
+                cutoff_utc=cutoff,
+            )
+            if (
+                entry.status == "accepted"
+                and entry.kind == "listing"
+                and entry.channel == "scheduled"
+            )
+            for item in entry.items
+        }
+
+    def routine_delivery_days(
+        self,
+        telegram_id: int,
+        *,
+        now_utc: datetime | None = None,
+    ) -> list[RoutineDeliveryDay]:
+        """Return the visible one-year routine diary for one current ID."""
+        self.import_legacy_routine_history(telegram_id)
+        settings = self.load_settings()
+        now = self._aware_utc(now_utc or _utc_now())
+        cutoff = now - timedelta(days=settings.delivery_history_retention_days)
+        return group_routine_days(
+            self._routine_entries_since(telegram_id, cutoff_utc=cutoff)
+        )
+
+    def reconcile_routine_seen(
+        self,
+        telegram_id: int,
+        *,
+        now_utc: datetime | None = None,
+    ) -> int:
+        """Repair the compact seen projection from accepted routine receipts."""
+        now = self._aware_utc(now_utc or _utc_now())
+        repaired = 0
+        retention_days = self.load_settings().seen_retention_days
+        cutoff = (
+            now - timedelta(days=retention_days)
+            if retention_days > 0
+            else None
+        )
+        for entry in self._routine_entries_since(
+            telegram_id,
+            cutoff_utc=cutoff,
+        ):
+            if (
+                entry.status != "accepted"
+                or entry.kind != "listing"
+                or entry.channel != "scheduled"
+            ):
+                continue
+            for item in entry.items:
+                repaired += int(
+                    self.mark_seen(
+                        telegram_id,
+                        item.key,
+                        search_name=item.search_name,
+                        url=item.url,
+                        now_utc=entry.updated_at,
+                        channel="scheduled",
+                        telegram_message_id=entry.telegram_message_id,
+                        chat_id=entry.chat_id,
+                    )
+                )
+        return repaired
+
+    def import_legacy_routine_history(self, telegram_id: int) -> int:
+        """Best-effort, idempotent import of accepted legacy scheduled rows."""
+        from chc_rental.dedup import upgrade_seen_key
+
         path = self.seen_path(telegram_id)
+        if not path.exists():
+            return 0
+        person = self.load_allowlist().get(telegram_id)
+        if person is None:
+            return 0
+        try:
+            local_zone = ZoneInfo(person.profile.timezone)
+        except Exception:
+            local_zone = timezone.utc
+        cached = self._cached_listings_by_key()
+        existing = self._routine_entries_since(telegram_id)
+        imported = 0
+        for line in path.read_text(encoding="utf-8").splitlines():
+            try:
+                raw = json.loads(line)
+                if not isinstance(raw, dict):
+                    continue
+                if raw.get("channel", "scheduled") != "scheduled":
+                    continue
+                stamp = datetime.fromisoformat(str(raw["sent_at"]))
+                if stamp.tzinfo is None:
+                    stamp = stamp.replace(tzinfo=timezone.utc)
+                stamp = stamp.astimezone(timezone.utc)
+                key = str(raw["key"])
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+                continue
+            local_day = stamp.astimezone(local_zone).date()
+            kind = "notice" if key.startswith("notice:") else "listing"
+            if any(
+                entry.status == "accepted"
+                and entry.kind == kind
+                and entry.updated_at.astimezone(timezone.utc) == stamp
+                and (
+                    kind == "notice"
+                    or any(item.key == key for item in entry.items)
+                )
+                for entry in existing
+            ):
+                continue
+            items: list[RoutineDeliveryItem] = []
+            message_text = "No new rentals matched your searches today." if kind == "notice" else ""
+            if kind == "listing":
+                listing = cached.get(upgrade_seen_key(key))
+                items.append(
+                    self._legacy_routine_item(
+                        key,
+                        search_name=str(raw.get("search") or ""),
+                        url=str(raw.get("url") or ""),
+                        listing=listing,
+                    )
+                )
+            before = self._routine_attempt_identity(
+                telegram_id,
+                local_day,
+                kind,
+                message_text,
+                items,
+                stamp.isoformat(),
+            )[0]
+            if self._routine_entry(telegram_id, local_day, before) is not None:
+                continue
+            entry = self.prepare_routine_delivery(
+                telegram_id,
+                display_name=person.display_name,
+                timezone_name=person.profile.timezone,
+                local_day=local_day,
+                kind=kind,
+                message_text=message_text,
+                items=items,
+                now_utc=stamp,
+                legacy=True,
+                discriminator=stamp.isoformat(),
+            )
+            entry = self.transition_routine_delivery(
+                telegram_id,
+                local_day,
+                entry.attempt_id,
+                state="sending",
+                now_utc=stamp,
+            )
+            imported_entry = self.transition_routine_delivery(
+                telegram_id,
+                local_day,
+                entry.attempt_id,
+                state="accepted",
+                now_utc=stamp,
+                telegram_message_id=(
+                    str(raw["telegram_message_id"])
+                    if raw.get("telegram_message_id") is not None
+                    else None
+                ),
+                chat_id=(
+                    str(raw["chat_id"])
+                    if raw.get("chat_id") is not None
+                    else str(telegram_id)
+                ),
+            )
+            existing.append(imported_entry)
+            imported += 1
+        return imported
+
+    def _cached_listings_by_key(self) -> dict[str, Listing]:
+        from chc_rental.dedup import dedup_key, upgrade_seen_key
+
+        found: dict[str, Listing] = {}
+        for path in sorted(self.state_dir.glob("cache/*/*.json"), reverse=True):
+            try:
+                raw_records = json.loads(path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError, TypeError):
+                continue
+            if not isinstance(raw_records, list):
+                continue
+            for raw in raw_records:
+                try:
+                    listing = Listing.model_validate(raw)
+                except Exception:
+                    continue
+                found.setdefault(upgrade_seen_key(dedup_key(listing)), listing)
+        return found
+
+    @staticmethod
+    def _legacy_routine_item(
+        key: str,
+        *,
+        search_name: str,
+        url: str,
+        listing: Listing | None,
+    ) -> RoutineDeliveryItem:
+        if listing is not None:
+            return RoutineDeliveryItem(
+                key=key,
+                search_name=search_name,
+                url=url or listing.url,
+                address=listing.address,
+                unit=listing.unit,
+                city=listing.city,
+                district=listing.district,
+                price=listing.price,
+                beds=listing.beds,
+                baths=listing.baths,
+                sqft=listing.sqft,
+                source=listing.source,
+            )
+        address = None
+        unit = None
+        city = None
+        district = None
+        parts = key.split(":")
+        if len(parts) == 6 and parts[0] == "v3":
+            city = unquote(parts[2]) or None
+            district = unquote(parts[3]) or None
+            address = unquote(parts[4]) or None
+            unit = unquote(parts[5]) or None
+        return RoutineDeliveryItem(
+            key=key,
+            search_name=search_name,
+            url=url,
+            address=address,
+            unit=unit,
+            city=city,
+            district=district,
+        )
+
+    # -------------------------------------------------------------- seen ledger
+    @staticmethod
+    def _delivery_record_is_active(
+        record: dict[str, Any],
+        *,
+        cutoff: datetime | None,
+    ) -> bool:
+        """Return whether a non-repeat delivery still suppresses a listing."""
+        if record.get("repeat_override") is True:
+            return False
+        if cutoff is None:
+            return True
+        try:
+            stamp = datetime.fromisoformat(str(record["sent_at"]))
+        except (KeyError, TypeError, ValueError):
+            # Preserve the old fail-safe: an unparseable delivery remains seen
+            # until an operator repairs or removes the row.
+            return True
+        if stamp.tzinfo is None:
+            stamp = stamp.replace(tzinfo=timezone.utc)
+        return stamp.astimezone(timezone.utc) >= cutoff
+
+    def _seen_keys_from_path(
+        self,
+        path: Path,
+        *,
+        cutoff: datetime | None = None,
+    ) -> set[str]:
         if not path.exists():
             return set()
         keys: set[str] = set()
@@ -387,11 +996,45 @@ class Store:
             if not line:
                 continue
             try:
-                keys.add(json.loads(line)["key"])
+                record = json.loads(line)
+                key = record["key"]
             except (json.JSONDecodeError, KeyError, TypeError):
                 # A torn or hand-edited line must not hide everything after it.
                 continue
+            if not isinstance(record, dict) or not isinstance(key, str):
+                continue
+            if self._delivery_record_is_active(record, cutoff=cutoff):
+                keys.add(key)
         return keys
+
+    def seen_keys(self, telegram_id: int) -> set[str]:
+        """Return suppressing listing keys, excluding audited repeat sends."""
+        return self._seen_keys_from_path(self.seen_path(telegram_id))
+
+    def active_seen_keys(
+        self,
+        telegram_id: int,
+        *,
+        now_utc: Optional[datetime] = None,
+    ) -> set[str]:
+        """Return keys inside the configured per-recipient retention window."""
+        settings = self.load_settings()
+        cutoff: datetime | None = None
+        if settings.seen_retention_days > 0:
+            now = (now_utc or _utc_now()).astimezone(timezone.utc)
+            cutoff = datetime.combine(
+                now.date() - timedelta(days=settings.seen_retention_days),
+                datetime.min.time(),
+                tzinfo=timezone.utc,
+            )
+        return self._seen_keys_from_path(
+            self.seen_path(telegram_id),
+            cutoff=cutoff,
+        ) | self.routine_accepted_keys(
+            telegram_id,
+            now_utc=now_utc,
+            retention_days=settings.seen_retention_days,
+        )
 
     def has_seen(self, telegram_id: int, key: str) -> bool:
         return key in self.seen_keys(telegram_id)
@@ -404,7 +1047,11 @@ class Store:
         search_name: str,
         url: str,
         now_utc: Optional[datetime] = None,
-    ) -> None:
+        channel: str = "scheduled",
+        telegram_message_id: str | None = None,
+        chat_id: str | None = None,
+        repeat_override: bool = False,
+    ) -> bool:
         """Record a delivered listing. Only ever called AFTER a confirmed send.
 
         ``now_utc`` keeps the ledger stamp coherent with the run's simulated
@@ -412,30 +1059,80 @@ class Store:
         this stamp's local date against the planning clock, so the two must
         tell the same time.
         """
+        return self.record_delivery(
+            telegram_id,
+            key,
+            search_name=search_name,
+            url=url,
+            now_utc=now_utc,
+            channel=channel,
+            telegram_message_id=telegram_message_id,
+            chat_id=chat_id,
+            repeat_override=repeat_override,
+        )
+
+    def record_delivery(
+        self,
+        telegram_id: int,
+        key: str,
+        *,
+        search_name: str,
+        url: str,
+        now_utc: Optional[datetime] = None,
+        channel: str,
+        telegram_message_id: str | None = None,
+        chat_id: str | None = None,
+        repeat_override: bool = False,
+    ) -> bool:
+        """Append one confirmed Telegram delivery to the recipient's bank.
+
+        Normal deliveries suppress the same normalized property for the
+        configured retention window.  An explicit repeat is retained as an
+        audit event but is deliberately excluded from suppression, so it does
+        not restart the original 90-day clock.
+        """
+        if channel not in {"scheduled", "test", "incremental"}:
+            raise ValueError(f"unsupported delivery channel: {channel}")
         stamp = now_utc.astimezone(timezone.utc) if now_utc else _utc_now()
         record = {
             "key": key,
             "search": search_name,
             "url": url,
             "sent_at": stamp.isoformat(),
+            "channel": channel,
+            "repeat_override": bool(repeat_override),
         }
+        if telegram_message_id is not None:
+            record["telegram_message_id"] = str(telegram_message_id)
+        if chat_id is not None:
+            record["chat_id"] = str(chat_id)
+        settings = self.load_settings()
+        cutoff: datetime | None = None
+        if settings.seen_retention_days > 0:
+            cutoff = datetime.combine(
+                stamp.date() - timedelta(days=settings.seen_retention_days),
+                datetime.min.time(),
+                tzinfo=timezone.utc,
+            )
         with self._locked(f"seen-{telegram_id}"):
             path = self.seen_path(telegram_id)
-            if path.exists():
-                for line in path.read_text(encoding="utf-8").splitlines():
-                    try:
-                        if json.loads(line).get("key") == key:
-                            return
-                    except (AttributeError, json.JSONDecodeError, TypeError):
-                        continue
-            self._atomic_append(self.seen_path(telegram_id), json.dumps(record, ensure_ascii=False))
+            if (
+                not repeat_override
+                and key in self._seen_keys_from_path(path, cutoff=cutoff)
+            ):
+                return False
+            self._atomic_append(
+                self.seen_path(telegram_id),
+                json.dumps(record, ensure_ascii=False),
+            )
+        return True
 
     def mark_notified(self, telegram_id: int, *, now_utc: Optional[datetime] = None) -> None:
         """Record a delivered no-results notice so the due-gate advances.
 
         Written to the same per-person ledger `last_sent_at` reads. Without
-        this stamp a notice-only day never advances the gate and the hourly
-        runner repeats the notice every hour until midnight. The ``notice:``
+        this stamp a notice-only day never advances the gate and the frequent
+        delivery checker repeats the notice until midnight. The ``notice:``
         key prefix cannot collide with listing keys (those start ``v3:``), so
         `seen_keys` stays safe to use for listing dedup.
         """
@@ -445,6 +1142,8 @@ class Store:
             "search": "",
             "url": "",
             "sent_at": stamp.isoformat(),
+            "channel": "scheduled",
+            "repeat_override": False,
         }
         with self._locked(f"seen-{telegram_id}"):
             self._atomic_append(self.seen_path(telegram_id), json.dumps(record, ensure_ascii=False))
@@ -459,14 +1158,52 @@ class Store:
             if not line:
                 continue
             try:
-                stamp = datetime.fromisoformat(json.loads(line)["sent_at"])
-            except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+                record = json.loads(line)
+                if record.get("channel") == "test" or record.get("repeat_override") is True:
+                    continue
+                stamp = datetime.fromisoformat(record["sent_at"])
+            except (
+                AttributeError,
+                json.JSONDecodeError,
+                KeyError,
+                TypeError,
+                ValueError,
+            ):
                 continue
             if stamp.tzinfo is None:
                 stamp = stamp.replace(tzinfo=timezone.utc)
             if latest is None or stamp > latest:
                 latest = stamp
+        for entry in self._routine_entries_since(telegram_id):
+            if entry.status != "accepted":
+                continue
+            stamp = entry.updated_at
+            if stamp.tzinfo is None:
+                stamp = stamp.replace(tzinfo=timezone.utc)
+            if latest is None or stamp > latest:
+                latest = stamp
         return latest
+
+    def purge_seen_ledgers(self, telegram_ids: set[int]) -> int:
+        """Remove daily seen/delivery gates for the requested recipients.
+
+        The per-recipient advisory locks serialize this with daily delivery
+        writes. IDs are explicit and validated so this can never broaden into
+        a directory-level deletion.
+        """
+        if any(
+            not isinstance(item, int) or isinstance(item, bool) or item <= 0
+            for item in telegram_ids
+        ):
+            raise ValueError("Telegram IDs must be positive integers")
+        removed = 0
+        for telegram_id in sorted(telegram_ids):
+            with self._locked(f"seen-{telegram_id}"):
+                path = self.seen_path(telegram_id)
+                if path.exists():
+                    path.unlink()
+                    removed += 1
+        return removed
 
     # -------------------------------------------------------------------- quota
     def quota_used(self, day: date, source: str) -> int:
@@ -518,9 +1255,9 @@ class Store:
         """Keep an unusable record for operator review instead of dropping it.
 
         One malformed record must never abort a batch, and must never vanish.
-        The hourly runner revalidates a day cache repeatedly, so the same
-        source record/reason is fingerprinted and retained once per UTC day
-        instead of being appended 24 times.
+        The delivery checker revalidates a day cache repeatedly, so the same
+        source record/reason is fingerprinted and retained once per run day
+        instead of being appended on every check.
         """
         fingerprint = self._rejected_fingerprint(source=source, reason=reason, raw=raw)
         record = {
@@ -602,14 +1339,62 @@ class Store:
         except (json.JSONDecodeError, TypeError, ValueError):
             return None
 
-    def latest_run_log(self) -> Optional[dict[str, Any]]:
+    def latest_run_log(
+        self, *, kind: Optional[str] = None, scan_limit: int = 50
+    ) -> Optional[dict[str, Any]]:
+        """Newest run record, optionally restricted to one record ``kind``.
+
+        The daily job writes a scrape record and a delivery record on every
+        tick, so an unfiltered "previous run" alternates between two different
+        shapes. Any caller comparing a failure signature across runs must
+        compare like with like, or the signature flips every tick and an alert
+        deduped against it fires forever. ``scan_limit`` bounds the walk: the
+        matching record is a tick or two back, never hundreds.
+        """
         runs = sorted((self.state_dir / "runs").glob("*.json")) if self.state_dir.exists() else []
-        for path in reversed(runs):
+        for path in reversed(runs[-scan_limit:] if scan_limit > 0 else runs):
             try:
-                return json.loads(path.read_text(encoding="utf-8"))
+                payload = json.loads(path.read_text(encoding="utf-8"))
             except (json.JSONDecodeError, TypeError, ValueError):
                 continue
+            if kind is not None and (
+                not isinstance(payload, dict) or payload.get("kind") != kind
+            ):
+                continue
+            return payload
         return None
+
+    def record_test_push(self, now_utc: datetime, payload: dict[str, Any]) -> Path:
+        """Append a receipt-only manual-push audit record.
+
+        The allowlist/preferences and message body stay in their existing
+        sources of truth.  This record intentionally retains only identifiers,
+        a preference fingerprint, outcome, and Telegram receipts.
+        """
+        stamp = now_utc.astimezone(timezone.utc)
+        path = self.test_push_path(stamp.date())
+        allowed = {
+            "attempt_id",
+            "telegram_id",
+            "display_name",
+            "preference_count",
+            "listing_count",
+            "cache_date",
+            "preference_fingerprint",
+            "parts_total",
+            "parts_accepted",
+            "status",
+            "message_ids",
+            "chat_ids",
+            "listing_keys",
+            "repeat_override",
+            "error",
+        }
+        record = {key: payload.get(key) for key in allowed}
+        record["attempted_at"] = stamp.isoformat()
+        with self._locked("test-pushes"):
+            self._atomic_append(path, json.dumps(record, ensure_ascii=False, default=str))
+        return path
 
     # -------------------------------------------------------------------- cache
     def cache_raw(
@@ -669,7 +1454,16 @@ class Store:
     # ---------------------------------------------------------------- retention
     def prune(self, *, today: date, settings: Settings) -> dict[str, int]:
         """Delete state older than the configured retention. Returns counts removed."""
-        removed = {"quota": 0, "runs": 0, "rejected": 0, "cache": 0, "backups": 0, "seen": 0}
+        removed = {
+            "quota": 0,
+            "runs": 0,
+            "rejected": 0,
+            "test_pushes": 0,
+            "cache": 0,
+            "backups": 0,
+            "seen": 0,
+            "delivery_history": 0,
+        }
 
         def _dated_cleanup(directory: Path, days: int, bucket: str, suffix: str) -> None:
             if not directory.exists():
@@ -694,6 +1488,12 @@ class Store:
         _dated_cleanup(
             self.state_dir / "rejected", settings.rejected_retention_days, "rejected", ".jsonl"
         )
+        _dated_cleanup(
+            self.state_dir / "test-pushes",
+            settings.rejected_retention_days,
+            "test_pushes",
+            ".jsonl",
+        )
         _dated_cleanup(self.state_dir / "cache", settings.cache_retention_days, "cache", "")
 
         if self.backup_dir.exists():
@@ -706,7 +1506,37 @@ class Store:
                     removed["backups"] += 1
 
         removed["seen"] = self._prune_seen(today, settings.seen_retention_days)
+        removed["delivery_history"] = self._prune_routine_journal(
+            today,
+            settings.delivery_history_retention_days,
+        )
         self._trim_daily_log()
+        return removed
+
+    def _prune_routine_journal(self, today: date, retention_days: int) -> int:
+        if retention_days <= 0:
+            return 0
+        root = self.state_dir / "delivery-journal"
+        if not root.exists():
+            return 0
+        cutoff = today - timedelta(days=retention_days)
+        removed = 0
+        for recipient_dir in root.iterdir():
+            if not recipient_dir.is_dir():
+                continue
+            try:
+                telegram_id = int(recipient_dir.name)
+            except ValueError:
+                continue
+            with self._locked(f"routine-journal-{telegram_id}"):
+                for path in recipient_dir.glob("*.jsonl"):
+                    try:
+                        local_day = date.fromisoformat(path.stem)
+                    except ValueError:
+                        continue
+                    if local_day < cutoff:
+                        path.unlink(missing_ok=True)
+                        removed += 1
         return removed
 
     def _prune_seen(self, today: date, retention_days: int) -> int:

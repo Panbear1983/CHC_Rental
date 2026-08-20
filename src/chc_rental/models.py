@@ -20,6 +20,7 @@ _DELIVERY_TIME_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
 
 DEFAULT_DELIVERY_TIME = "09:00"
 DEFAULT_TIMEZONE = "America/New_York"
+DEFAULT_LISTING_CAP = 25
 SCHEMA_VERSION = 1
 ALERT_CONFIG_SCHEMA_VERSION = 2
 
@@ -80,6 +81,36 @@ _US_STATE_NAME_TO_CODE = {
     "u.s. virgin islands": "VI", "virgin islands": "VI", "american samoa": "AS",
     "northern mariana islands": "MP",
 }
+
+
+_PROPERTY_TYPE_GROUPS: dict[PropertyType, str] = {
+    PropertyType.APARTMENT: "apartment",
+    PropertyType.STUDIO: "apartment",
+    PropertyType.ROOM: "apartment",
+    PropertyType.CONDO: "condo",
+    PropertyType.TOWNHOUSE: "townhouse",
+    PropertyType.HOUSE: "single_family",
+    PropertyType.SINGLE_FAMILY: "single_family",
+    PropertyType.MULTI_FAMILY: "multi_family",
+    PropertyType.MANUFACTURED: "manufactured",
+    PropertyType.LAND: "land",
+    PropertyType.OTHER: "other",
+}
+
+
+def property_type_group(value: PropertyType) -> str:
+    """Canonical equivalence group for both query planning AND matching.
+
+    Sources never emit ``house``/``studio``/``room`` — Zillow and RentCast label
+    those ``single_family``/``apartment``. The planner already groups this way to
+    build a scrape, so matching MUST group identically or a ``house`` search is
+    fetched single_family listings and then rejects every one of them (they are
+    typed ``single_family``, not ``house``). Keeping one map here is what stops
+    "what we fetch" and "what we match" from drifting apart. (studio/room fold
+    into apartment because no source distinguishes them by type; a studio search
+    narrows to 0-bed apartments via its bed bounds, not its property type.)
+    """
+    return _PROPERTY_TYPE_GROUPS.get(value, "other")
 
 
 def _normalize_state(value: Optional[str]) -> Optional[str]:
@@ -401,9 +432,12 @@ class Settings(BaseModel):
     zillow_incremental_interval_minutes: int = 180
     incremental_canary_telegram_ids: list[int] = []
     incremental_monthly_budget_usd: Optional[float] = None
-    # Operator alert channel; None disables alerting entirely.
-    owner_telegram_id: Optional[int] = None
+    # Optional alert channel for the local dashboard operator. This is separate
+    # from allowlist membership; None keeps operational warnings in the
+    # dashboard/logs only.
+    operator_alert_telegram_id: Optional[int] = None
     seen_retention_days: int = 90
+    delivery_history_retention_days: int = 365
     cache_retention_days: int = 7
     rejected_retention_days: int = 30
     backup_retention_days: int = 30
@@ -427,6 +461,7 @@ class Settings(BaseModel):
         "global_daily_request_budget",
         "per_source_daily_request_budget",
         "seen_retention_days",
+        "delivery_history_retention_days",
         "cache_retention_days",
         "rejected_retention_days",
         "backup_retention_days",
@@ -522,11 +557,32 @@ class Settings(BaseModel):
             source.strip().lower(), self.per_source_daily_request_budget
         )
 
-    @field_validator("owner_telegram_id")
+    @model_validator(mode="before")
     @classmethod
-    def owner_telegram_id_must_be_positive(cls, value: Optional[int]) -> Optional[int]:
+    def legacy_owner_alert_key_is_accepted(cls, value: object) -> object:
+        """Load pre-rename settings without keeping the misleading key.
+
+        The next normal settings save serializes only
+        ``operator_alert_telegram_id``.
+        """
+        if not isinstance(value, dict):
+            return value
+        migrated = dict(value)
+        if (
+            "operator_alert_telegram_id" not in migrated
+            and "owner_telegram_id" in migrated
+        ):
+            migrated["operator_alert_telegram_id"] = migrated["owner_telegram_id"]
+        migrated.pop("owner_telegram_id", None)
+        return migrated
+
+    @field_validator("operator_alert_telegram_id")
+    @classmethod
+    def operator_alert_telegram_id_must_be_positive(
+        cls, value: Optional[int]
+    ) -> Optional[int]:
         if value is not None and value <= 0:
-            raise ValueError("owner_telegram_id must be a positive integer")
+            raise ValueError("operator_alert_telegram_id must be a positive integer")
         return value
 
 

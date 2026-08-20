@@ -7,8 +7,8 @@ reservation, caching and retry policy all live in `chc_rental.fetch` — an
 adapter performs exactly one metered listing-provider request per
 `fetch_page` call, so the budget ledger can meter every paid/source request
 identically. An adapter may make a free auxiliary geography lookup needed to
-form that provider request; the daily source cache still prevents hourly
-repetition.
+form that provider request; the daily source cache still prevents repetition
+across frequent scheduler checks.
 
 Error taxonomy (the fetch loop reacts differently to each):
 

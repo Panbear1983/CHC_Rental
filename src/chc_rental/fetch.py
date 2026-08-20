@@ -1,7 +1,7 @@
 """Daily fetch orchestration: scrape-time gate, day-cache, quota, retries.
 
-The launchd job runs HOURLY while the product is a DAILY digest, and every
-source request costs money. This module is what reconciles the two:
+The launchd job checks frequently while the product is a DAILY digest, and
+every source request costs money. This module is what reconciles the two:
 
 * **Query-aware day cache.** The first sweep of a day that actually spends
   requests is written to ``state/cache/<day>/<source>.json`` with a sidecar
@@ -22,7 +22,7 @@ source request costs money. This module is what reconciles the two:
 
 Truncation/errors are preserved in cache metadata. A partial pool remains
 usable for positive matches but is never called complete, so it cannot produce
-a dishonest no-results notice on later hourly runs.
+a dishonest no-results notice on later delivery checks.
 
 ``usable`` distinguishes "the market really had nothing" from "the source was
 down": a sweep where every query failed must NOT flow onward, or people with
@@ -34,7 +34,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime, timezone
 from typing import Any, Iterable
 from zoneinfo import ZoneInfo
 
@@ -49,7 +49,7 @@ from chc_rental.sources.base import (
 from chc_rental.sources.planner import plan_queries
 from chc_rental.store import Store
 
-MAX_RATE_LIMIT_WAIT = 30.0  # seconds; an unattended hourly run must not stall long
+MAX_RATE_LIMIT_WAIT = 30.0  # seconds; an unattended source run must not stall long
 
 # How many pages (each one request) to pull per city before stopping. A dense
 # market like Brooklyn has thousands of active rentals; fetching all of them
@@ -132,6 +132,17 @@ def is_scrape_time(settings: Settings, now_utc: datetime) -> bool:
     return (local.hour, local.minute) >= (hour, minute)
 
 
+def scrape_day(settings: Settings, now_utc: datetime) -> date:
+    """Calendar day used by the daily cache and request quota.
+
+    The scrape clock is configured in ``settings.scrape_timezone``. Keying the
+    same cache by UTC used to roll the day over at 20:00 New York in summer,
+    which caused an evening scrape and made the intended 06:00 scrape a cache
+    hit. The cache, quota, and delivery-only reader must share this one day.
+    """
+    return now_utc.astimezone(ZoneInfo(settings.scrape_timezone)).date()
+
+
 def _query_scope(queries: Iterable[SourceQuery]) -> list[dict[str, str]]:
     """Stable cache identity for the cities represented by one source pool."""
     return sorted(
@@ -143,6 +154,121 @@ def _query_scope(queries: Iterable[SourceQuery]) -> list[dict[str, str]]:
     )
 
 
+def _cache_matches_scrape_day(
+    store: Store,
+    day: date,
+    source: str,
+    settings: Settings,
+    metadata: dict[str, Any],
+) -> bool:
+    """Reject snapshots filed under a UTC date by the pre-migration runner.
+
+    New snapshots carry an explicit day and timezone. For legacy snapshots we
+    use the cache file's mtime as a conservative migration check: it must have
+    been written on ``day`` in the configured scrape zone and at/after the
+    scrape clock. This preserves correctly filed historical caches while
+    rejecting, for example, a 20:01 New York scrape stored as tomorrow's UTC
+    date.
+    """
+    marked_day = metadata.get("scrape_day")
+    marked_zone = metadata.get("scrape_timezone")
+    if marked_day is not None or marked_zone is not None:
+        return marked_day == day.isoformat() and marked_zone == settings.scrape_timezone
+
+    try:
+        stamp = datetime.fromtimestamp(
+            store.cache_path(day, source).stat().st_mtime,
+            tz=timezone.utc,
+        ).astimezone(ZoneInfo(settings.scrape_timezone))
+    except (OSError, OverflowError, ValueError):
+        return False
+    hour, minute = map(int, settings.scrape_time.split(":"))
+    return stamp.date() == day and (stamp.hour, stamp.minute) >= (hour, minute)
+
+
+def _cached_report(
+    store: Store,
+    source: str,
+    *,
+    settings: Settings,
+    day: date,
+    queries: list[SourceQuery],
+    warnings: Iterable[str],
+) -> FetchReport:
+    """Load one source snapshot without constructing or calling an adapter."""
+    report = FetchReport(source=source)
+    report.warnings.extend(warnings)
+    report.queries_planned = len(queries)
+    if not queries:
+        report.warnings.append(
+            "no fetchable searches (each needs city + state); nothing to load"
+        )
+        return report
+
+    query_scope = _query_scope(queries)
+    cached = store.load_cached(day, source, expected_query_scope=query_scope)
+    metadata = store.load_cache_metadata(day, source) or {}
+    if cached is None or not _cache_matches_scrape_day(
+        store, day, source, settings, metadata
+    ):
+        report.warnings.append(
+            f"no compatible {source} cache for scrape day {day}; "
+            "delivery-only check will not fetch"
+        )
+        return report
+
+    report.records = cached
+    report.from_cache = True
+    report.queries_completed = int(metadata.get("queries_completed", len(queries)))
+    report.truncated = bool(metadata.get("truncated", False))
+    report.errors.extend(str(item) for item in metadata.get("errors", []))
+    report.warnings.extend(str(item) for item in metadata.get("warnings", []))
+    return report
+
+
+def load_daily_cached(
+    store: Store,
+    source: str,
+    *,
+    now_utc: datetime,
+) -> FetchReport:
+    """Read today's compatible pool for ``source`` with zero network access."""
+    settings = store.load_settings()
+    queries, warnings = plan_queries(store.load_allowlist())
+    return _cached_report(
+        store,
+        source,
+        settings=settings,
+        day=scrape_day(settings, now_utc),
+        queries=queries,
+        warnings=warnings,
+    )
+
+
+def load_many_daily_cached(
+    store: Store,
+    sources: Iterable[str],
+    *,
+    now_utc: datetime,
+    configuration_warnings: Iterable[str] = (),
+) -> PoolFetchReport:
+    """Combine saved source pools without loading credentials or adapters."""
+    pool = PoolFetchReport(configuration_warnings=list(configuration_warnings))
+    seen_names: set[str] = set()
+    for source in sources:
+        if source in seen_names:
+            pool.configuration_warnings.append(
+                f"duplicate cached source {source!r} was ignored"
+            )
+            continue
+        seen_names.add(source)
+        report = load_daily_cached(store, source, now_utc=now_utc)
+        pool.sources.append(report)
+        if report.usable:
+            pool.records.extend(report.records)
+    return pool
+
+
 def fetch_daily(
     store: Store,
     adapter: SourceAdapter,
@@ -151,31 +277,29 @@ def fetch_daily(
     sleeper=time.sleep,
 ) -> FetchReport:
     """Return today's listing pool, fetching from the network at most once per day."""
-    day = now_utc.date()
-    report = FetchReport(source=adapter.name)
     settings = store.load_settings()
+    day = scrape_day(settings, now_utc)
     queries, warnings = plan_queries(store.load_allowlist())
+    report = FetchReport(source=adapter.name)
     report.warnings.extend(warnings)
     report.queries_planned = len(queries)
     if not queries:
         # Deliberately NOT cached: the moment a fetchable search is saved, the
-        # next hourly run should fetch instead of replaying an empty day.
+        # next scheduler check should fetch instead of replaying an empty day.
         report.warnings.append("no fetchable searches (each needs city + state); nothing to fetch")
         return report
 
     query_scope = _query_scope(queries)
-    cached = store.load_cached(
-        day, adapter.name, expected_query_scope=query_scope
+    cached_report = _cached_report(
+        store,
+        adapter.name,
+        settings=settings,
+        day=day,
+        queries=queries,
+        warnings=warnings,
     )
-    if cached is not None:
-        report.records = cached
-        report.from_cache = True
-        metadata = store.load_cache_metadata(day, adapter.name) or {}
-        report.queries_completed = int(metadata.get("queries_completed", len(queries)))
-        report.truncated = bool(metadata.get("truncated", False))
-        report.errors.extend(str(item) for item in metadata.get("errors", []))
-        report.warnings.extend(str(item) for item in metadata.get("warnings", []))
-        return report
+    if cached_report.usable:
+        return cached_report
 
     if not is_scrape_time(settings, now_utc):
         report.warnings.append(
@@ -207,6 +331,9 @@ def fetch_daily(
             records,
             metadata={
                 "query_scope": query_scope,
+                "scrape_day": day.isoformat(),
+                "scrape_timezone": settings.scrape_timezone,
+                "scraped_at_utc": now_utc.astimezone(timezone.utc).isoformat(),
                 "queries_planned": report.queries_planned,
                 "queries_completed": report.queries_completed,
                 "truncated": report.truncated,

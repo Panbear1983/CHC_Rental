@@ -24,20 +24,24 @@ interaction of any kind.
 
 | Phase | State |
 |---|---|
-| 0 — source vetting and run policy | **decided 2026-08-11** — US only; RentCast licensed, Zillow managed route owner-approved/flagged |
+| 0 — source vetting and run policy | **decided 2026-08-11; updated 2026-08-13** — US only; **Zillow via Apify is the sole source** (RentCast removed) |
 | 1 — file store and config schema | **built** |
 | 2 — matching, dedup, seen ledger | **built** — source-independent key v3 reads legacy v2 ledgers safely |
-| 3 — source adapters and fetch budget | **built** — resilient RentCast + opt-in Zillow pool, per-source cache/budget |
+| 3 — source adapters and fetch budget | **built** — Zillow/Apify adapter, filter-aware query planner, per-source cache/budget |
 | 4 — TUI dashboard | **built** — saved-filter refresh plus per-source status/quota/cache visibility |
 | 5 — Telegram push | **built** — @Panbear_Buddy_bot, outbound only |
-| 6 — daily automation | **built** — hourly launchd job via tmux, daily prune, operator alerts |
+| 6 — daily automation | **built** — 10-minute launchd checks via tmux; scrape-only and delivery-only paths, daily prune, operator alerts |
 | Incremental 0–6 | **built, paused** — durable Apify runs, silent baselines, shadow outbox, canary delivery, dashboard, breaker/cost/backup operations |
 | Incremental 7 | **built, not activated** — readiness evidence and audited gates exist; controlled Peter message and 48-hour canary remain |
 
-`chc-rental run` combines every usable configured source into one daily pool.
-RentCast activates when `RENTCAST_API_KEY` is usable. Zillow requires both an
-`APIFY_TOKEN` and the explicit `zillow_enabled: true` setting; the token alone
-can never activate the flagged source. Each source has its own query-aware day
+The scheduled job calls `./dashboard.sh scrape` to update the daily Zillow pool
+and then `./dashboard.sh deliver --live` to consume only that saved pool. The
+two commands cannot cross responsibilities: scrape never sends Telegram, and
+deliver never constructs a source adapter or calls Apify. `./dashboard.sh run`
+remains a combined manual compatibility command. Zillow requires both an
+`APIFY_TOKEN` and the explicit
+`zillow_enabled: true` setting; the token alone can never activate the flagged
+source. The source has its own query-aware day
 cache and request ceiling: adding/removing a watched city invalidates that
 source cache, while local price/bed/filter edits reuse the city pool. One source
 failing does not discard positive matches from the other, but no-results
@@ -47,7 +51,7 @@ notices are suppressed while coverage is incomplete.
 
 ```
 config/        allowlist.yaml, settings.yaml     (gitignored: holds real Telegram IDs)
-state/         seen/, quota/, runs/, rejected/, cache/, alerts.sqlite3
+state/         seen/, delivery-journal/, quota/, runs/, rejected/, cache/, alerts.sqlite3
 backups/       timestamped copy taken before every config write
 examples/      allowlist.example.yaml, listings.sample.json
 ```
@@ -62,16 +66,16 @@ what keeps the allowlist rule from being bypassed.
 - `models.py` — `Search`, `Profile`, `AllowlistEntry`, `Allowlist`, `Settings`,
   `Listing`. Every business rule lives here.
 - `store.py` — the single gate: locking, atomic writes, backups, seen ledger,
-  request quota, run logs, rejected records, retention.
+  routine delivery journal, request quota, run logs, rejected records, retention.
 - `matching.py` — deterministic listing-to-search eligibility.
 - `dedup.py` — stable cross-source identity with legacy seen-ledger compatibility.
 - `notification_schedule.py` — per-person local-time due calculation.
 - `pipeline.py` — validate → allowlist → due → match → dedupe → cap → send.
-- `sources/` — RentCast and opt-in Zillow rental adapters plus the `(city,
+- `sources/` — the Zillow/Apify rental adapter plus the `(city,
   state)` query planner that dedupes fetches across everyone's searches.
 - `fetch.py` — daily fetch orchestration: scrape-time gate, query-aware raw
   cache, per-request budget metering, bounded 429/transient retry.
-- `cli.py` — `chc-rental init | run | prune`.
+- `cli.py` — internal implementation for `./dashboard.sh init | scrape | deliver | run | prune`.
 - `incremental.py`, `events.py`, `outbox.py`, `delivery_worker.py` — durable
   source runs, observation classification and canary-only delivery.
 - `scheduler.py`, `operations.py` — locked ticks, breaker/cost policy and health.
@@ -87,28 +91,58 @@ pip install -e ".[dev]"
 
 ## Owner dashboard
 
-```bash
-.venv/bin/chc-rental-tui                 # uses ./config and ./state
-.venv/bin/chc-rental-tui --root /path/to/data
+`dashboard.sh` is the sole public entry point. It resolves the virtual
+environment and repository root automatically and also controls the background
+jobs:
 
-# Or use the terminal wrapper (resolves the venv + root for you, and controls
-# the hourly launchd job):
-./chc.sh                 # launch the dashboard
-./chc.sh run --live      # run today's push now
-./chc.sh check           # bot reachability per person
-./chc.sh job status      # is the hourly job loaded?
-./chc.sh job stop|start  # unload / load it
-./chc.sh logs -f         # follow the daily job log
-./chc.sh alerts status   # incremental gates, health, cost and queues
-./chc.sh alerts readiness --json # first-canary and expansion blockers
-./chc.sh alerts-job status # separate job; not loaded by default
-./chc.sh help
+```bash
+./dashboard.sh                 # launch the dashboard
+./dashboard.sh scrape          # source/cache only; never Telegram
+./dashboard.sh deliver --live  # saved cache only; never Apify
+./dashboard.sh run --live      # run today's push now
+./dashboard.sh check           # bot reachability per person
+./dashboard.sh job status      # is the 10-minute job loaded?
+./dashboard.sh job stop|start  # unload / load it
+./dashboard.sh logs -f         # follow the daily job log
+./dashboard.sh alerts status   # incremental gates, health, cost and queues
+./dashboard.sh alerts readiness --json # first-canary and expansion blockers
+./dashboard.sh alerts-job status # separate job; not loaded by default
+./dashboard.sh help
 ```
 
 Manage the allowlist, each person's searches, their delivery mode/timezone, and
 view source readiness, quota, cache, health and the latest delivery run. The
 additive Alerts screen exposes real persisted gates, query health, canaries and
 outbox actions.
+
+Selecting a member and pressing `Edit` opens a full member-details page. Its
+`Routine diary` tab groups scheduled Telegram pushes by the recipient's local
+date and preserves the exact outbound content, listing facts, direct URL, and
+Telegram receipt for one year. Accepted no-results notices are included.
+Interrupted sends are shown as `UNCERTAIN` and are never claimed as delivered
+or retried automatically. Existing scheduled seen-ledger rows are imported on
+a best-effort basis and visibly marked `LEGACY` when the original message facts
+were not retained. New Test Push and immediate-alert messages do not appear
+automatically. Explicitly recovered historical Test Push evidence may be shown
+with a `TEST PUSH · LEGACY` label and never affects scheduled deduplication.
+
+The main-page `Test push` action sends the selected active recipient the newest
+matching cards from the latest compatible Zillow cache. Every card uses the
+same compact address/price/bed/bath format as the daily push and includes its
+direct Zillow link. All active saved searches are evaluated, overlapping
+results are sent once with every matching preference named, and the action
+performs no paid Zillow fetch. Each Telegram-ID has its own 90-day delivery
+bank shared by scheduled, incremental, and Test Push delivery. A successful
+Test Push therefore suppresses those same properties for that recipient, but
+does not advance their next scheduled push time. If every compatible match was
+already sent, the preview changes to an explicit red repeat confirmation; that
+repeat is audited without restarting the original 90-day clock. New searches
+default to a 25-listing safety limit, matching the current per-query Zillow
+result limit. Before
+anything is sent, the dashboard shows a scrollable plain-text preview of every
+Telegram part and direct link; confirmation sends that exact prepared payload.
+A retained cache may cover extra cities, but Test push accepts it only when it
+contains every city required by the selected recipient.
 
 The per-person preference table shows location, property types, price, bed/bath,
 square-footage and feature filters. Saving, editing, toggling or deleting a
@@ -131,7 +165,8 @@ source_daily_request_budgets:
 ```
 
 `zillow_results_limit` caps results per city/actor run; the request budget caps
-actor runs per UTC day; `zillow_max_charge_usd` is sent as the actor-run charge
+actor runs per configured scrape-timezone day; `zillow_max_charge_usd` is sent
+as the actor-run charge
 ceiling. Set `zillow_enabled: false` or its request budget to `0` for an
 immediate kill switch.
 
@@ -139,16 +174,16 @@ Before each paid city run, the adapter resolves that US city/state to the map
 bounds required by the pinned actor through OpenStreetMap Nominatim. Actor
 error markers and non-unit building summary cards are ignored; exact listing
 cards then enter the same validation, matching and cross-source dedup pipeline
-as RentCast.
+as Zillow.
 
 ## Daily run
 
 ```bash
-.venv/bin/chc-rental init
-.venv/bin/chc-rental check          # bot identity + can it reach each person
-.venv/bin/chc-rental run --fixture examples/listings.sample.json
-.venv/bin/chc-rental run --fixture examples/listings.sample.json --now 2026-01-15T05:00:00Z
-.venv/bin/chc-rental prune
+./dashboard.sh init
+./dashboard.sh check          # bot identity + can it reach each person
+./dashboard.sh run --fixture examples/listings.sample.json
+./dashboard.sh run --fixture examples/listings.sample.json --now 2026-01-15T05:00:00Z
+./dashboard.sh prune
 ```
 
 The run is a dry run unless `--live` is passed **and** `live_push_enabled: true`
@@ -186,10 +221,12 @@ pytest -q
 
 ## Scheduled runs
 
-`scripts/com.chcrental.daily.plist` fires hourly and lets each person's own
-local delivery time decide whether they are due — a fixed clock time would need
-a UTC offset that breaks at every DST transition and cannot serve two people in
-different timezones.
+`scripts/com.chcrental.daily.plist` fires at `:00, :10, ... :50` each hour. It first runs the
+scrape-only command, whose New York calendar-day cache permits at most one
+normal fetch at/after the configured scrape time, and then runs delivery-only
+against that cache. Each person's local delivery time decides whether they are
+due. Missed ticks catch up after the Mac wakes; a fixed UTC clock would break at
+DST transitions and could not serve people in different timezones.
 
 The command is wrapped in `tmux` deliberately: a launchd job invoking the repo
 venv directly is denied by TCC because the repo lives under `~/Desktop`, failing
@@ -200,9 +237,11 @@ cp scripts/com.chcrental.daily.plist ~/Library/LaunchAgents/
 launchctl load ~/Library/LaunchAgents/com.chcrental.daily.plist
 ```
 
-With no source configured the run logs "no listing source configured" and does
-nothing, rather than inventing listings. A whole-run lock also prevents a slow
-managed scrape from overlapping a scheduled or manually-started cycle.
+With no source configured the scrape logs "no listing source configured" and
+does nothing rather than inventing listings. With no compatible current
+scrape-day cache, delivery skips; it never falls back to a network call or a
+stale prior-day pool. A whole-run lock prevents a slow managed scrape from
+overlapping a scheduled or manually-started cycle.
 
 The incremental job is a separate disabled plist at
 `scripts/com.chcrental.alerts.plist`; it is not installed or loaded as part of

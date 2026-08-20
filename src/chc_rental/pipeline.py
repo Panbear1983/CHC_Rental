@@ -19,15 +19,18 @@ Three of those steps exist because the previous build got them wrong:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from typing import Any, Iterable, Optional, Protocol, Sequence
+from zoneinfo import ZoneInfo
 
 from pydantic import ValidationError
 
 from chc_rental.dedup import dedup_key, upgrade_seen_key
+from chc_rental.delivery_history import RoutineDeliveryItem
 from chc_rental.matching import matches_search
 from chc_rental.models import AllowlistEntry, Listing
 from chc_rental.notification_schedule import is_profile_due
+from chc_rental.notify.telegram import TelegramSendError
 from chc_rental.store import Store
 
 
@@ -65,6 +68,7 @@ class PipelineResult:
     no_results_for: list[int] = field(default_factory=list)
     sent: int = 0
     failed: int = 0
+    uncertain: int = 0
     summary: dict[str, Any] = field(default_factory=dict)
 
     def preview(self) -> str:
@@ -154,7 +158,8 @@ def plan_pushes(
         # read time. This avoids both a destructive ledger rewrite and a wave
         # of repeat notifications when the second source is enabled.
         already_seen = {
-            upgrade_seen_key(key) for key in store.seen_keys(person.telegram_id)
+            upgrade_seen_key(key)
+            for key in store.active_seen_keys(person.telegram_id, now_utc=now_utc)
         }
         planned_this_run: set[str] = set()
         person_items: list[PlannedPush] = []
@@ -217,25 +222,153 @@ def deliver(
         result.summary["delivery"] = "dry-run"
         return result
 
-    allowlist = store.load_allowlist()
+    delivery_now = (now_utc or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    suppressed_after_plan = 0
+    bank_repairs_needed = 0
+    by_recipient: dict[int, list[PlannedPush]] = {}
     for item in result.planned:
-        # Last-moment re-check: config may have changed since planning.
-        if not allowlist.is_allowlisted(item.telegram_id):
-            continue
-        try:
-            sender.send(telegram_id=item.telegram_id, text=item.render())
-        except Exception:
-            result.failed += 1
-            continue
-        # Only now is it safe to record the listing as delivered.
-        store.mark_seen(
-            item.telegram_id,
-            item.key,
-            search_name=item.search_name,
-            url=item.listing.url,
-            now_utc=now_utc,
-        )
-        result.sent += 1
+        by_recipient.setdefault(item.telegram_id, []).append(item)
+
+    for telegram_id, items in by_recipient.items():
+        # Test Push and every scheduled path share this lock.  A preview can be
+        # stale by the time its button is pressed, so transport always performs
+        # one final bank check inside the serialized delivery window.
+        with store.recipient_delivery_lock(telegram_id):
+            try:
+                store.reconcile_routine_seen(telegram_id, now_utc=delivery_now)
+            except Exception:
+                # Accepted journal entries remain authoritative and are also
+                # included directly by active_seen_keys. A failed projection
+                # repair must not create a duplicate Telegram send.
+                bank_repairs_needed += 1
+            for item in items:
+                allowlist = store.load_allowlist()
+                person = allowlist.get(telegram_id)
+                if person is None or not allowlist.is_allowlisted(telegram_id):
+                    continue
+                already_seen = {
+                    upgrade_seen_key(key)
+                    for key in store.active_seen_keys(
+                        telegram_id, now_utc=delivery_now
+                    )
+                }
+                if item.key in already_seen:
+                    suppressed_after_plan += 1
+                    continue
+                message = item.render()
+                try:
+                    local_day = delivery_now.astimezone(
+                        ZoneInfo(person.profile.timezone)
+                    ).date()
+                    attempt = store.prepare_routine_delivery(
+                        telegram_id,
+                        display_name=person.display_name,
+                        timezone_name=person.profile.timezone,
+                        local_day=local_day,
+                        kind="listing",
+                        message_text=message,
+                        items=[_routine_item(item)],
+                        now_utc=delivery_now,
+                    )
+                except Exception:
+                    result.failed += 1
+                    continue
+                if attempt.status == "accepted":
+                    try:
+                        store.reconcile_routine_seen(
+                            telegram_id,
+                            now_utc=delivery_now,
+                        )
+                    except Exception:
+                        bank_repairs_needed += 1
+                    suppressed_after_plan += 1
+                    continue
+                if attempt.status == "uncertain":
+                    result.uncertain += 1
+                    continue
+                try:
+                    store.transition_routine_delivery(
+                        telegram_id,
+                        local_day,
+                        attempt.attempt_id,
+                        state="sending",
+                        now_utc=delivery_now,
+                    )
+                except Exception:
+                    result.failed += 1
+                    continue
+                try:
+                    receipt = sender.send(telegram_id=telegram_id, text=message)
+                except TelegramSendError as exc:
+                    state = "uncertain" if exc.ambiguous else "failed"
+                    store.transition_routine_delivery(
+                        telegram_id,
+                        local_day,
+                        attempt.attempt_id,
+                        state=state,
+                        now_utc=delivery_now,
+                        error=str(exc),
+                    )
+                    if state == "uncertain":
+                        result.uncertain += 1
+                    else:
+                        result.failed += 1
+                    continue
+                except Exception as exc:
+                    store.transition_routine_delivery(
+                        telegram_id,
+                        local_day,
+                        attempt.attempt_id,
+                        state="uncertain",
+                        now_utc=delivery_now,
+                        error=f"{type(exc).__name__}: {exc}",
+                    )
+                    result.uncertain += 1
+                    continue
+                message_id, chat_id = _receipt_values(receipt)
+                if message_id is None or chat_id != str(telegram_id):
+                    store.transition_routine_delivery(
+                        telegram_id,
+                        local_day,
+                        attempt.attempt_id,
+                        state="uncertain",
+                        now_utc=delivery_now,
+                        error=(
+                            "Telegram accepted the request without a verifiable "
+                            "recipient receipt"
+                        ),
+                    )
+                    result.uncertain += 1
+                    continue
+                try:
+                    store.transition_routine_delivery(
+                        telegram_id,
+                        local_day,
+                        attempt.attempt_id,
+                        state="accepted",
+                        now_utc=delivery_now,
+                        telegram_message_id=message_id,
+                        chat_id=chat_id,
+                    )
+                except Exception:
+                    result.uncertain += 1
+                    continue
+                try:
+                    # The accepted journal event is authoritative; this compact
+                    # projection accelerates normal cross-run dedup.
+                    store.mark_seen(
+                        telegram_id,
+                        item.key,
+                        search_name=item.search_name,
+                        url=item.listing.url,
+                        now_utc=delivery_now,
+                        channel="scheduled",
+                        telegram_message_id=message_id,
+                        chat_id=chat_id,
+                    )
+                except Exception:
+                    bank_repairs_needed += 1
+                result.sent += 1
 
     # Notices are tallied apart from listing pushes: ``sent``/``failed`` feed
     # the status screen's push counts, and a failed courtesy notice must not
@@ -243,24 +376,158 @@ def deliver(
     notices_sent = 0
     notices_failed = 0
     for telegram_id in result.no_results_for:
-        if not allowlist.is_allowlisted(telegram_id):
-            continue
-        try:
-            sender.send(telegram_id=telegram_id, text="No new rentals matched your searches today.")
-        except Exception:
-            notices_failed += 1
-            continue
-        # Stamp the ledger so the due-gate advances: without this an hourly
-        # runner re-sends the notice every hour until local midnight.
-        store.mark_notified(telegram_id, now_utc=now_utc)
-        notices_sent += 1
+        with store.recipient_delivery_lock(telegram_id):
+            allowlist = store.load_allowlist()
+            person = allowlist.get(telegram_id)
+            if person is None or not allowlist.is_allowlisted(telegram_id):
+                continue
+            if not is_profile_due(
+                person.profile,
+                delivery_now,
+                last_sent_at_utc=store.last_sent_at(telegram_id),
+            ):
+                suppressed_after_plan += 1
+                continue
+            message = "No new rentals matched your searches today."
+            local_day = delivery_now.astimezone(
+                ZoneInfo(person.profile.timezone)
+            ).date()
+            try:
+                attempt = store.prepare_routine_delivery(
+                    telegram_id,
+                    display_name=person.display_name,
+                    timezone_name=person.profile.timezone,
+                    local_day=local_day,
+                    kind="notice",
+                    message_text=message,
+                    items=[],
+                    now_utc=delivery_now,
+                )
+            except Exception:
+                notices_failed += 1
+                continue
+            if attempt.status == "accepted":
+                suppressed_after_plan += 1
+                continue
+            if attempt.status == "uncertain":
+                result.uncertain += 1
+                continue
+            try:
+                store.transition_routine_delivery(
+                    telegram_id,
+                    local_day,
+                    attempt.attempt_id,
+                    state="sending",
+                    now_utc=delivery_now,
+                )
+            except Exception:
+                notices_failed += 1
+                continue
+            try:
+                receipt = sender.send(telegram_id=telegram_id, text=message)
+            except TelegramSendError as exc:
+                state = "uncertain" if exc.ambiguous else "failed"
+                store.transition_routine_delivery(
+                    telegram_id,
+                    local_day,
+                    attempt.attempt_id,
+                    state=state,
+                    now_utc=delivery_now,
+                    error=str(exc),
+                )
+                if state == "uncertain":
+                    result.uncertain += 1
+                else:
+                    notices_failed += 1
+                continue
+            except Exception as exc:
+                store.transition_routine_delivery(
+                    telegram_id,
+                    local_day,
+                    attempt.attempt_id,
+                    state="uncertain",
+                    now_utc=delivery_now,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+                result.uncertain += 1
+                continue
+            message_id, chat_id = _receipt_values(receipt)
+            if message_id is None or chat_id != str(telegram_id):
+                store.transition_routine_delivery(
+                    telegram_id,
+                    local_day,
+                    attempt.attempt_id,
+                    state="uncertain",
+                    now_utc=delivery_now,
+                    error=(
+                        "Telegram accepted the request without a verifiable "
+                        "recipient receipt"
+                    ),
+                )
+                result.uncertain += 1
+                continue
+            try:
+                store.transition_routine_delivery(
+                    telegram_id,
+                    local_day,
+                    attempt.attempt_id,
+                    state="accepted",
+                    now_utc=delivery_now,
+                    telegram_message_id=message_id,
+                    chat_id=chat_id,
+                )
+            except Exception:
+                result.uncertain += 1
+                continue
+            # Stamp the ledger so the due-gate advances: without this a frequent
+            # delivery checker re-sends the notice until local midnight.
+            try:
+                store.mark_notified(telegram_id, now_utc=delivery_now)
+            except Exception:
+                bank_repairs_needed += 1
+            notices_sent += 1
 
     result.summary["delivery"] = "live"
     result.summary["sent"] = result.sent
     result.summary["failed"] = result.failed
+    result.summary["uncertain"] = result.uncertain
     result.summary["no_results_sent"] = notices_sent
     result.summary["no_results_failed"] = notices_failed
+    result.summary["suppressed_after_plan"] = suppressed_after_plan
+    result.summary["bank_repairs_needed"] = bank_repairs_needed
     return result
+
+
+def _routine_item(item: PlannedPush) -> RoutineDeliveryItem:
+    listing = item.listing
+    return RoutineDeliveryItem(
+        key=item.key,
+        search_name=item.search_name,
+        url=listing.url,
+        address=listing.address,
+        unit=listing.unit,
+        city=listing.city,
+        district=listing.district,
+        price=listing.price,
+        beds=listing.beds,
+        baths=listing.baths,
+        sqft=listing.sqft,
+        source=listing.source,
+    )
+
+
+def _receipt_values(receipt: Any) -> tuple[str | None, str | None]:
+    """Extract optional Telegram identifiers without tightening sender APIs."""
+    if isinstance(receipt, dict):
+        message_id = receipt.get("message_id")
+        chat_id = receipt.get("chat_id")
+    else:
+        message_id = getattr(receipt, "message_id", None)
+        chat_id = getattr(receipt, "chat_id", None)
+    return (
+        str(message_id) if message_id is not None else None,
+        str(chat_id) if chat_id is not None else None,
+    )
 
 
 def person_summary(person: AllowlistEntry) -> str:

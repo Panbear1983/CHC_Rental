@@ -49,6 +49,6 @@ record. No adapter, login/session material or hidden feature gate for either is
 part of the Zillow build. A future owner decision must update `docs/SOURCES.md`
 before implementation begins, then pass this entire gate independently.
 
-Use `./chc.sh alerts readiness --json` for the Zillow rollout evidence. Local
+Use `./dashboard.sh alerts readiness --json` for the Zillow rollout evidence. Local
 operator attestations are intentionally explicit and audited; never put tokens,
 cookies, chat IDs or other secrets in an attestation's evidence text.

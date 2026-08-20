@@ -135,7 +135,7 @@ def resolve_map_bounds(query: SourceQuery, timeout: float = 20.0) -> dict[str, f
 
     OpenStreetMap's Nominatim endpoint is used only for geographic bounds, not
     listing collection. Results are cached in-process, while CHC's daily Zillow
-    response cache prevents repeated lookups during the hourly schedule.
+    response cache prevents repeated lookups during frequent scheduler checks.
     """
     params = urllib.parse.urlencode(
         {

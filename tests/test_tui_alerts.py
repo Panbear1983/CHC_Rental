@@ -62,7 +62,9 @@ def test_controller_runs_a_real_shadow_pipeline_without_telegram(
         "ApifyClient",
         lambda **kwargs: ImmediateClient([raw_listing("a")]),
     )
-    summary = TuiController(store).run_shadow_cycle()
+    summary = TuiController(store).run_shadow_cycle(
+        now_utc=datetime(2026, 1, 15, 15, 0, tzinfo=timezone.utc)
+    )
     assert summary["started"] == 1 and summary["records"] == 1
     assert summary["processing"]["observations"][0]["baseline_established"] is True
     assert store.event_store().outbox_records() == []
@@ -86,7 +88,9 @@ def test_dashboard_baseline_reset_requires_confirmation_and_is_audited(tmp_path)
     async def scenario():
         app = OwnerDashboardApp(root=tmp_path)
         async with app.run_test(size=(100, 40)) as pilot:
-            await pilot.click("#open-alerts")
+            await pilot.click("#open-status")
+            await pilot.pause()
+            await pilot.click("#status-open-alerts")
             await pilot.pause()
             assert isinstance(app.screen, AlertsScreen)
             table = app.screen.query_one("#query-health-table", DataTable)
@@ -117,7 +121,9 @@ def test_paid_shadow_button_stops_at_confirmation(tmp_path, monkeypatch):
             monkeypatch.setattr(
                 app.controller, "run_shadow_cycle", lambda: called.append(True)
             )
-            await pilot.click("#open-alerts")
+            await pilot.click("#open-status")
+            await pilot.pause()
+            await pilot.click("#status-open-alerts")
             await pilot.pause()
             await pilot.click("#run-shadow")
             await pilot.pause()

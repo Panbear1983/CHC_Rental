@@ -18,6 +18,7 @@ from textual.widgets import Button, DataTable, Footer, Header, Label
 
 from chc_rental.tui.controller import TuiController
 from chc_rental.tui.alert_settings import IncrementalSettingsScreen
+from chc_rental.tui.alerts import AlertsScreen
 
 
 class StatusScreen(Screen[None]):
@@ -48,6 +49,7 @@ class StatusScreen(Screen[None]):
         with Horizontal(classes="action-row"):
             yield Button("Refresh", id="refresh")
             yield Button("Alert settings", id="alert-settings")
+            yield Button("Alerts (adv)", id="status-open-alerts")
             yield Button("Back", id="back")
         yield Footer()
 
@@ -260,6 +262,12 @@ class StatusScreen(Screen[None]):
             self.refresh_status()
 
         self.app.push_screen(IncrementalSettingsScreen(settings=settings), handle)
+
+    @on(Button.Pressed, "#status-open-alerts")
+    def _open_alerts(self) -> None:
+        # The advanced near-real-time alert feature (currently inactive) lives
+        # here rather than on the main dashboard row.
+        self.app.push_screen(AlertsScreen(self._controller))
 
     @on(Button.Pressed, "#back")
     def _back(self) -> None:

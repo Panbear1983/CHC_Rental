@@ -214,7 +214,7 @@ def test_breaker_owner_alerts_once_then_reports_recovery(store):
         store,
         collector=None,
         sender=None,
-        owner_alert=lambda text: alerts.append(text) or True,
+        operator_alert=lambda text: alerts.append(text) or True,
     )
     scheduler.tick(now_utc=NOW)
     scheduler.tick(now_utc=NOW + timedelta(minutes=1))
@@ -242,7 +242,7 @@ def test_failure_streak_alerts_once_before_breaker_threshold_then_recovers(store
         store,
         collector=None,
         sender=None,
-        owner_alert=lambda text: alerts.append(text) or True,
+        operator_alert=lambda text: alerts.append(text) or True,
     )
     scheduler.tick(now_utc=NOW)
     scheduler.tick(now_utc=NOW + timedelta(minutes=1))

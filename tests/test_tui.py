@@ -3,18 +3,25 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timedelta, timezone
 
+from textual.color import Color
 from textual.errors import NoWidget
-from textual.widgets import Button, DataTable, Input, Label, Select, Switch
+from textual.widgets import Button, DataTable, Input, Label, Select, Switch, TabbedContent
 
+from chc_rental.delivery_history import RoutineDeliveryItem
 from chc_rental.models import Allowlist, DeliveryMode, Profile, Settings
 from chc_rental.store import Store
+from chc_rental.test_push import TestPushBlocked, TestPushPlan, TestPushResult
 from chc_rental.tui.app import (
     AddPersonScreen,
+    ConfigScreen,
     DeliveryFormScreen,
+    MemberDetailsScreen,
     OwnerDashboardApp,
     SearchesScreen,
     SearchFormScreen,
+    TestPushPreviewScreen,
 )
 from chc_rental.tui.controller import TuiController
 from chc_rental.tui.alert_settings import IncrementalSettingsScreen
@@ -132,11 +139,8 @@ def test_status_screen_survives_a_deactivated_person(tmp_path):
             summary = str(app.screen.query_one("#people-summary", Label).render())
             assert "1 allowlisted / 2 total" in summary
             sources = app.screen.query_one("#source-status-table", DataTable)
-            assert sources.row_count == 2
-            assert [str(sources.get_row_at(i)[0]) for i in range(2)] == [
-                "rentcast",
-                "zillow",
-            ]
+            assert sources.row_count == 1
+            assert [str(sources.get_row_at(i)[0]) for i in range(1)] == ["zillow"]
 
     run(scenario())
 
@@ -158,6 +162,209 @@ def test_toggle_allowlist_button_round_trips(tmp_path):
             await pilot.click("#toggle-person")
             await pilot.pause()
             assert app.controller.get_person(111).active is True
+
+    run(scenario())
+
+
+def test_test_push_confirms_and_sends_only_the_selected_person(tmp_path):
+    """The main-page action is selected-recipient only and visibly receipt-backed."""
+    async def scenario():
+        app = OwnerDashboardApp(root=tmp_path)
+        async with app.run_test(size=(80, 24)) as pilot:
+            app.controller.add_person(111, "First")
+            app.controller.add_person(222, "Selected")
+            app.refresh_people()
+            await pilot.pause()
+            table = app.query_one("#people-table", DataTable)
+            table.move_cursor(row=1)
+            await pilot.pause()
+
+            prepared: list[int] = []
+            sent: list[int] = []
+            first_message = (
+                "[Brooklyn 3bd 2ba] 1 Duffield St | Brooklyn | $6,800 | "
+                "3 bed | 2 bath\n"
+                "https://www.zillow.com/homedetails/1-Duffield-St/1_zpid/"
+            )
+            second_message = (
+                "[Brooklyn 3bd 2ba] 2 Preview Ave | Brooklyn | $6,200 | "
+                "3 bed | 2 bath\n"
+                "https://www.zillow.com/homedetails/2-Preview-Ave/2_zpid/"
+            )
+            plan = TestPushPlan(
+                telegram_id=222,
+                display_name="Selected",
+                preference_count=2,
+                preference_fingerprint="fingerprint",
+                messages=(first_message, second_message),
+                listing_count=2,
+                cache_date="2026-08-13",
+            )
+
+            def prepare(telegram_id):
+                prepared.append(telegram_id)
+                return plan
+
+            def send(selected_plan):
+                sent.append(selected_plan.telegram_id)
+                return TestPushResult(
+                    status="success",
+                    telegram_id=222,
+                    display_name="Selected",
+                    preference_count=2,
+                    parts_total=2,
+                    parts_accepted=2,
+                    message_ids=("987", "988"),
+                    chat_ids=("222", "222"),
+                )
+
+            app.controller.prepare_test_push = prepare
+            app.controller.send_test_push = send
+
+            await pilot.click("#test-push")
+            await asyncio.sleep(0.1)
+            await pilot.pause()
+            assert isinstance(app.screen, TestPushPreviewScreen)
+            confirmation = str(
+                app.screen.query_one("#test-push-preview-summary", Label).render()
+            )
+            assert "Selected" in confirmation and "222" in confirmation
+            assert "2 active preferences" in confirmation
+            assert "in 2 parts" in confirmation
+            assert str(
+                app.screen.query_one("#test-push-preview-part-1", Label).render()
+            ) == first_message
+            assert str(
+                app.screen.query_one("#test-push-preview-part-2", Label).render()
+            ) == second_message
+            assert "Send exactly this" in str(
+                app.screen.query_one("#confirm-action", Button).label
+            )
+            # A repeated shortcut while the modal is open cannot stage a second send.
+            await pilot.press("x")
+            await pilot.pause()
+            assert isinstance(app.screen, TestPushPreviewScreen)
+            await pilot.click("#cancel-action")
+            await pilot.pause()
+            assert sent == []
+
+            await pilot.click("#test-push")
+            await asyncio.sleep(0.1)
+            await pilot.pause()
+            await pilot.click("#confirm-action")
+            await asyncio.sleep(0.3)
+            await pilot.pause()
+            assert prepared == [222, 222]
+            assert sent == [222]
+            status = str(app.query_one("#dashboard-error", Label).render())
+            assert "receipt 987" in status
+
+            app._test_push_active = True
+            await pilot.click("#test-push")
+            await pilot.pause()
+            status = str(app.query_one("#dashboard-error", Label).render())
+            assert "already in progress" in status
+            assert sent == [222]
+
+    run(scenario())
+
+
+def test_test_push_preview_scrolls_and_keeps_send_controls_visible(tmp_path):
+    long_message = "\n\n".join(
+        f"[Filter] {index} Preview St | Brooklyn | $6,000 | 3 bed | 2 bath\n"
+        f"https://www.zillow.com/homedetails/{index}_zpid/"
+        for index in range(1, 16)
+    )
+    plan = TestPushPlan(
+        telegram_id=111,
+        display_name="Preview Recipient",
+        preference_count=1,
+        preference_fingerprint="preview",
+        messages=(long_message,),
+        listing_count=15,
+        cache_date="2026-08-13",
+    )
+
+    async def scenario(height: int):
+        app = OwnerDashboardApp(root=tmp_path)
+        async with app.run_test(size=(80, height)) as pilot:
+            app.push_screen(TestPushPreviewScreen(plan))
+            await pilot.pause()
+            assert _clipped_buttons(app, f"test-push-preview@80x{height}") == []
+            scroll = app.screen.query_one("#test-push-preview-scroll")
+            assert scroll.virtual_size.height > scroll.size.height
+            preview = str(
+                app.screen.query_one("#test-push-preview-part-1", Label).render()
+            )
+            assert preview == long_message
+            assert "https://www.zillow.com/homedetails/15_zpid/" in preview
+
+    for height in (24, 16):
+        run(scenario(height))
+
+
+def test_repeat_test_push_uses_a_distinct_warning_confirmation(tmp_path):
+    plan = TestPushPlan(
+        telegram_id=111,
+        display_name="Repeat Recipient",
+        preference_count=1,
+        preference_fingerprint="repeat",
+        messages=("[Filter] 1 Repeat St\nhttps://www.zillow.com/1_zpid/",),
+        listing_count=1,
+        cache_date="2026-08-13",
+        repeat_override=True,
+    )
+
+    async def scenario():
+        app = OwnerDashboardApp(root=tmp_path)
+        async with app.run_test(size=(80, 24)) as pilot:
+            app.push_screen(TestPushPreviewScreen(plan))
+            await pilot.pause()
+            summary = str(
+                app.screen.query_one("#test-push-preview-summary", Label).render()
+            )
+            button = app.screen.query_one("#confirm-action", Button)
+            assert "WARNING — REPEAT SEND" in summary
+            assert "Resend seen listings" in str(button.label)
+            assert button.variant == "error"
+
+    run(scenario())
+
+
+def test_test_push_preflight_failure_is_visible_and_never_opens_confirmation(tmp_path):
+    async def scenario():
+        app = OwnerDashboardApp(root=tmp_path)
+        async with app.run_test(size=(80, 24)) as pilot:
+            app.controller.add_person(111, "Peter")
+            app.refresh_people()
+
+            def blocked(telegram_id):
+                raise TestPushBlocked(
+                    "Telegram bot token is invalid or revoked (401 Unauthorized)."
+                )
+
+            app.controller.prepare_test_push = blocked
+            await pilot.click("#test-push")
+            await asyncio.sleep(0.1)
+            await pilot.pause()
+            assert app.screen is app.screen_stack[0]
+            status = str(app.query_one("#dashboard-error", Label).render())
+            assert "invalid or revoked" in status
+            assert app._test_push_preflight_active is False
+
+    run(scenario())
+
+
+def test_test_push_is_yellow_pause_is_orange_and_remove_stays_red(tmp_path):
+    async def scenario():
+        app = OwnerDashboardApp(root=tmp_path)
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            test_push = app.query_one("#test-push", Button)
+            assert test_push.styles.background == Color.parse("#FFD54F")
+            assert test_push.styles.color == Color.parse("#000000")
+            assert app.query_one("#toggle-person", Button).variant == "warning"
+            assert app.query_one("#remove-person", Button).variant == "error"
 
     run(scenario())
 
@@ -204,6 +411,7 @@ def _modal_screens() -> list[tuple[str, object]]:
             ),
         ),
         ("incremental-settings", IncrementalSettingsScreen(settings=Settings())),
+        ("config", ConfigScreen(settings=Settings())),
     ]
 
 
@@ -237,6 +445,51 @@ def test_no_action_button_is_clipped_at_80_columns(tmp_path):
             assert problems == [], problems
 
     run(scenario())
+
+
+def test_main_toolbar_has_nine_direct_controls_in_one_row(tmp_path):
+    async def scenario():
+        app = OwnerDashboardApp(root=tmp_path)
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            toolbar = app.query_one("#people-actions")
+            buttons = list(toolbar.query(Button))
+            assert [button.id for button in buttons] == [
+                "add-person",
+                "edit-person",
+                "remove-person",
+                "toggle-person",
+                "set-push-time",
+                "open-searches",
+                "test-push",
+                "open-config",
+                "open-status",
+            ]
+            assert len({button.region.y for button in buttons}) == 1
+
+    run(scenario())
+
+
+def test_main_toolbar_buttons_fill_the_screen_width(tmp_path):
+    async def scenario(width: int):
+        app = OwnerDashboardApp(root=tmp_path)
+        async with app.run_test(size=(width, 24)) as pilot:
+            await pilot.pause()
+            toolbar = app.query_one("#people-actions")
+            buttons = list(toolbar.query(Button))
+            assert toolbar.region.x == 0
+            assert toolbar.region.right == width
+            assert buttons[0].region.x == 0
+            assert buttons[-1].region.right == width
+            assert all(
+                left.region.right == right.region.x
+                for left, right in zip(buttons, buttons[1:])
+            )
+            assert len({button.region.height for button in buttons}) == 1
+            assert buttons[0].region.height == 3
+
+    for width in (80, 120, 160):
+        run(scenario(width))
 
 
 def test_modal_buttons_survive_short_terminals(tmp_path):
@@ -561,7 +814,9 @@ def test_dashboard_opens_incremental_alert_operations_screen(tmp_path):
     async def scenario():
         app = OwnerDashboardApp(root=tmp_path)
         async with app.run_test(size=(100, 40)) as pilot:
-            await pilot.click("#open-alerts")
+            await pilot.click("#open-status")
+            await pilot.pause()
+            await pilot.click("#status-open-alerts")
             await pilot.pause()
             assert isinstance(app.screen, AlertsScreen)
             state = str(app.screen.query_one("#alerts-config", Label).render())
@@ -663,6 +918,221 @@ def test_enter_submits_the_add_person_form(tmp_path):
     run(scenario())
 
 
+def test_edit_person_prefills_and_id_change_keeps_preferences_but_resets_state(tmp_path):
+    async def scenario():
+        app = OwnerDashboardApp(root=tmp_path)
+        async with app.run_test(size=(80, 24)) as pilot:
+            app.controller.add_person(111, "Before")
+            app.controller.add_search(111, SEARCH_FORM)
+            before_profile = app.controller.get_person(111).profile.model_dump()
+            app.store.mark_seen(111, "v3:old", search_name="Old", url="https://old")
+            app.store.mark_seen(222, "v3:stale", search_name="Stale", url="https://stale")
+            with app.store.edit_settings() as settings:
+                settings.incremental_canary_telegram_ids = [111]
+                settings.operator_alert_telegram_id = 111
+            app.refresh_people()
+            await pilot.pause()
+
+            await pilot.click("#edit-person")
+            await pilot.pause()
+            assert isinstance(app.screen, MemberDetailsScreen)
+            assert app.screen.query_one("#member-telegram-id", Input).value == "111"
+            assert app.screen.query_one("#member-display-name", Input).value == "Before"
+            app.screen.query_one("#member-telegram-id", Input).value = "222"
+            app.screen.query_one("#member-display-name", Input).value = "After"
+            await pilot.click("#save-member")
+            await pilot.pause()
+
+            people = app.controller.list_people()
+            assert [(person.telegram_id, person.display_name) for person in people] == [
+                (222, "After")
+            ]
+            assert people[0].profile.model_dump() == before_profile
+            assert not app.store.seen_path(111).exists()
+            assert not app.store.seen_path(222).exists()
+            settings = app.controller.settings()
+            assert settings.incremental_canary_telegram_ids == [222]
+            assert settings.operator_alert_telegram_id == 111
+            assert app.store.routine_journal_dir(111).exists()
+            assert app.controller.routine_delivery_diary(222) == []
+            status = str(app.query_one("#dashboard-error", Label).render())
+            assert "empty routine diary" in status
+
+    run(scenario())
+
+
+def test_edit_person_rejects_duplicate_id_in_the_open_form(tmp_path):
+    async def scenario():
+        app = OwnerDashboardApp(root=tmp_path)
+        async with app.run_test(size=(80, 24)) as pilot:
+            app.controller.add_person(111, "First")
+            app.controller.add_person(222, "Second")
+            app.refresh_people()
+            await pilot.pause()
+            await pilot.click("#edit-person")
+            await pilot.pause()
+            form = app.screen
+            assert isinstance(form, MemberDetailsScreen)
+            form.query_one("#member-telegram-id", Input).value = "222"
+            await pilot.click("#save-member")
+            await pilot.pause()
+            assert app.screen is form
+            error = str(form.query_one("#member-details-error", Label).render())
+            assert "already on the allowlist" in error
+            assert [person.telegram_id for person in app.controller.list_people()] == [111, 222]
+
+    run(scenario())
+
+
+def test_member_edit_page_shows_grouped_routine_diary_and_exact_links(tmp_path):
+    now = datetime(2026, 1, 15, 15, 0, tzinfo=timezone.utc)
+
+    async def scenario():
+        app = OwnerDashboardApp(root=tmp_path)
+        async with app.run_test(size=(80, 24)) as pilot:
+            app.controller.add_person(111, "Diary Person")
+            item = RoutineDeliveryItem(
+                key="v3:ny:brooklyn::1%20duffield%20st:418",
+                search_name="Brooklyn 3bd 2ba",
+                url="https://www.zillow.com/homedetails/1-Duffield/1_zpid/",
+                address="1 Duffield St",
+                unit="418",
+                city="Brooklyn",
+                price=6800,
+                beds=3,
+                baths=2,
+                source="zillow",
+            )
+            accepted = app.store.prepare_routine_delivery(
+                111,
+                display_name="Diary Person",
+                timezone_name="UTC",
+                local_day=now.date(),
+                kind="listing",
+                message_text=(
+                    "[Brooklyn 3bd 2ba] 1 Duffield St | Brooklyn | $6,800 | "
+                    "3 bed | 2 bath\n"
+                    "https://www.zillow.com/homedetails/1-Duffield/1_zpid/"
+                ),
+                items=[item],
+                now_utc=now,
+            )
+            app.store.transition_routine_delivery(
+                111,
+                now.date(),
+                accepted.attempt_id,
+                state="sending",
+                now_utc=now,
+            )
+            app.store.transition_routine_delivery(
+                111,
+                now.date(),
+                accepted.attempt_id,
+                state="accepted",
+                now_utc=now,
+                telegram_message_id="801",
+                chat_id="111",
+            )
+            uncertain = app.store.prepare_routine_delivery(
+                111,
+                display_name="Diary Person",
+                timezone_name="UTC",
+                local_day=now.date(),
+                kind="notice",
+                message_text="No new rentals matched your searches today.",
+                items=[],
+                now_utc=now + timedelta(minutes=1),
+            )
+            app.store.transition_routine_delivery(
+                111,
+                now.date(),
+                uncertain.attempt_id,
+                state="sending",
+                now_utc=now + timedelta(minutes=1),
+            )
+            app.store.transition_routine_delivery(
+                111,
+                now.date(),
+                uncertain.attempt_id,
+                state="uncertain",
+                now_utc=now + timedelta(minutes=1),
+                error="response lost",
+            )
+            app.refresh_people()
+            await pilot.pause()
+
+            await pilot.click("#edit-person")
+            await pilot.pause()
+            assert isinstance(app.screen, MemberDetailsScreen)
+            assert _clipped_buttons(app, "member-profile@80x24") == []
+            tabs = app.screen.query_one("#member-details-tabs", TabbedContent)
+            tabs.active = "member-diary-pane"
+            await pilot.pause()
+
+            days = app.screen.query_one("#routine-diary-days", DataTable)
+            entries = app.screen.query_one("#routine-diary-entries", DataTable)
+            assert days.row_count == 1
+            assert [str(value) for value in days.get_row_at(0)] == [
+                "2026-01-15",
+                "1",
+                "0",
+                "1",
+            ]
+            assert entries.row_count == 2
+            detail = str(
+                app.screen.query_one("#routine-diary-detail", Label).render()
+            )
+            assert "Telegram receipt: 801" in detail
+            assert "1 Duffield St" in detail
+            assert "https://www.zillow.com/homedetails/1-Duffield/1_zpid/" in detail
+
+            entries.move_cursor(row=1)
+            await pilot.pause()
+            warning = str(
+                app.screen.query_one("#routine-diary-detail", Label).render()
+            )
+            assert "UNCERTAIN" in warning
+            assert "may or may not have arrived" in warning
+            back = app.screen.query_one("#member-details-back", Button)
+            assert back.region.width > 0 and back.region.height == 3
+
+    run(scenario())
+
+
+def test_edit_and_remove_are_blocked_during_a_test_push(tmp_path):
+    async def scenario():
+        app = OwnerDashboardApp(root=tmp_path)
+        async with app.run_test(size=(80, 24)) as pilot:
+            app.controller.add_person(111, "Busy")
+            app.refresh_people()
+            app._test_push_active = True
+            await pilot.pause()
+            await pilot.click("#edit-person")
+            await pilot.pause()
+            assert app.screen is app.screen_stack[0]
+            assert "blocked" in str(app.query_one("#dashboard-error", Label).render())
+            await asyncio.sleep(0.6)
+            await pilot.click("#remove-person")
+            await pilot.pause()
+            assert app.controller.get_person(111).display_name == "Busy"
+            assert "blocked" in str(app.query_one("#dashboard-error", Label).render())
+
+    run(scenario())
+
+
+def test_name_only_edit_preserves_seen_state(tmp_path):
+    store = Store(tmp_path)
+    store.initialize()
+    controller = TuiController(store)
+    controller.add_person(111, "Before")
+    store.mark_seen(111, "v3:keep", search_name="Keep", url="https://keep")
+    outcome = controller.update_person(111, 111, "After")
+    assert outcome.id_changed is False
+    assert controller.get_person(111).display_name == "After"
+    assert store.seen_keys(111) == {"v3:keep"}
+    assert store.alert_db_path.exists() is False
+
+
 def test_controller_rejects_a_duplicate_search_name(tmp_path):
     store = Store(tmp_path)
     store.initialize()
@@ -686,3 +1156,254 @@ def test_controller_edits_persist_to_disk(tmp_path):
 
     reopened = TuiController(Store(tmp_path))
     assert len(reopened.list_searches(111)) == 1
+
+
+def test_push_time_is_editable_from_the_main_page(tmp_path):
+    """The push time now has a dedicated control on the people list, so owners
+    no longer dig through Open searches -> Delivery to change when pushes go out."""
+    from chc_rental.tui.app import PushTimeScreen
+
+    async def scenario():
+        app = OwnerDashboardApp(root=tmp_path)
+        async with app.run_test(size=(80, 24)) as pilot:
+            app.controller.add_person(111, "Peter")
+            app.refresh_people()
+            await pilot.pause()
+            before = app.controller.get_person(111).profile
+            await pilot.click("#set-push-time")
+            await pilot.pause()
+            assert isinstance(app.screen, PushTimeScreen), "main-page push-time control must open"
+            app.screen.query_one("#delivery_time", Input).value = "07:45"
+            app.screen.query_one("#timezone", Input).value = "America/Los_Angeles"
+            await pilot.click("#submit")
+            await pilot.pause()
+            after = app.controller.get_person(111).profile
+            assert after.delivery_time == "07:45"
+            assert after.timezone == "America/Los_Angeles"
+            # nothing else about delivery was disturbed
+            assert after.delivery_mode == before.delivery_mode
+            assert after.notify_on_no_results == before.notify_on_no_results
+            status = str(app.screen.query_one("#dashboard-error", Label).render())
+            assert "Push time" in status
+
+    run(scenario())
+
+
+def test_push_time_control_rejects_a_bad_time_in_place(tmp_path):
+    from chc_rental.tui.app import PushTimeScreen
+
+    async def scenario():
+        app = OwnerDashboardApp(root=tmp_path)
+        async with app.run_test(size=(80, 24)) as pilot:
+            app.controller.add_person(111, "Peter")
+            app.refresh_people()
+            await pilot.pause()
+            await pilot.click("#set-push-time")
+            await pilot.pause()
+            form = app.screen
+            form.query_one("#delivery_time", Input).value = "7am"  # not HH:MM
+            await pilot.click("#submit")
+            await pilot.pause()
+            assert app.screen is form, "a bad time must keep the dialog open"
+            error = str(form.query_one("#push-time-error", Label).render())
+            assert "HH:MM" in error or "24-hour" in error
+
+    run(scenario())
+
+
+# --- Config screen + hard-delete + before-scrape guardrail (2026-08-13) -------
+
+
+def _config_env(tmp_path):
+    (tmp_path / ".env").write_text("APIFY_TOKEN=faketoken1234567890\n", encoding="utf-8")
+
+
+def test_config_screen_writes_daily_gates_and_round_trips(tmp_path):
+    _config_env(tmp_path)
+
+    async def scenario():
+        app = OwnerDashboardApp(root=tmp_path)
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            await pilot.click("#open-config")
+            await pilot.pause()
+            assert isinstance(app.screen, ConfigScreen)
+            form = app.screen
+            form.query_one("#live_push_enabled", Switch).value = True
+            form.query_one("#scrape_time", Input).value = "06:45"
+            form.query_one("#scrape_timezone", Input).value = "America/Los_Angeles"
+            form.query_one("#global_daily_request_budget", Input).value = "175"
+            form.query_one("#operator_alert_telegram_id", Input).value = "424242"
+            form.query_one("#zillow_enabled", Switch).value = True
+            form.query_one("#zillow_terms_confirmed", Switch).value = True
+            form.query_one("#zillow_daily_request_budget", Input).value = "9"
+            await pilot.click("#submit")
+            await pilot.pause()
+            assert not isinstance(app.screen, ConfigScreen), "valid save closes the modal"
+            s = app.controller.settings()
+            assert s.live_push_enabled is True
+            assert s.scrape_time == "06:45" and s.scrape_timezone == "America/Los_Angeles"
+            assert s.global_daily_request_budget == 175
+            assert s.operator_alert_telegram_id == 424242
+            assert s.zillow_enabled is True
+            assert s.source_request_budget("zillow") == 9
+            # persists to disk for a fresh process
+            reopened = TuiController(Store(tmp_path))
+            assert reopened.settings().scrape_time == "06:45"
+
+    run(scenario())
+
+
+def test_config_first_zillow_enable_requires_terms(tmp_path):
+    _config_env(tmp_path)
+    store = Store(tmp_path)
+    store.initialize()
+    controller = TuiController(store)
+    try:
+        controller.update_run_settings(
+            live_push_enabled=False, scrape_time="08:00", scrape_timezone="America/New_York",
+            global_daily_request_budget=100, per_source_daily_request_budget=50,
+            operator_alert_telegram_id=None,
+            zillow_enabled=True, zillow_terms_confirmed=False,
+            zillow_actor="maxcopell~zillow-scraper", zillow_daily_request_budget=5,
+            zillow_results_limit=25, zillow_max_charge_usd=0.25, zillow_timeout_seconds=300,
+        )
+    except Exception as exc:
+        assert "confirm" in str(exc).lower()
+    else:
+        raise AssertionError("enabling Zillow without confirming terms must fail")
+    assert controller.settings().zillow_enabled is False
+
+
+def test_config_bad_scrape_time_keeps_modal_open(tmp_path):
+    _config_env(tmp_path)
+
+    async def scenario():
+        app = OwnerDashboardApp(root=tmp_path)
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            await pilot.click("#open-config")
+            await pilot.pause()
+            form = app.screen
+            form.query_one("#scrape_time", Input).value = "7am"
+            await pilot.click("#submit")
+            await pilot.pause()
+            assert app.screen is form, "an invalid scrape time must keep the modal open"
+            error = str(form.query_one("#config-error", Label).render())
+            assert "HH:MM" in error or "24-hour" in error
+            assert app.controller.settings().scrape_time != "7am"
+
+    run(scenario())
+
+
+def test_config_blank_operator_id_disables_alerts_negative_rejected(tmp_path):
+    _config_env(tmp_path)
+
+    async def scenario():
+        app = OwnerDashboardApp(root=tmp_path)
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            await pilot.click("#open-config")
+            await pilot.pause()
+            form = app.screen
+            form.query_one("#operator_alert_telegram_id", Input).value = ""
+            await pilot.click("#submit")
+            await pilot.pause()
+            assert app.controller.settings().operator_alert_telegram_id is None
+            # negative id rejected in place
+            await asyncio.sleep(0.6)
+            await pilot.click("#open-config")
+            await pilot.pause()
+            form = app.screen
+            form.query_one("#operator_alert_telegram_id", Input).value = "-5"
+            await pilot.click("#submit")
+            await pilot.pause()
+            assert isinstance(app.screen, ConfigScreen), "negative id must keep the modal open"
+
+    run(scenario())
+
+
+def test_remove_person_button_purges_operational_state_after_confirm(tmp_path):
+    from chc_rental.tui.alerts import ConfirmActionScreen
+
+    async def scenario():
+        app = OwnerDashboardApp(root=tmp_path)
+        async with app.run_test(size=(80, 24)) as pilot:
+            app.controller.add_person(111, "Gone")
+            app.controller.add_search(111, SEARCH_FORM)
+            app.store.mark_seen(111, "v3:gone", search_name="Gone", url="https://gone")
+            with app.store.edit_settings() as settings:
+                settings.incremental_canary_telegram_ids = [111]
+                settings.operator_alert_telegram_id = 111
+            app.refresh_people()
+            await pilot.pause()
+            app.query_one("#people-table", DataTable).move_cursor(row=0)
+            await pilot.pause()
+            await pilot.click("#remove-person")
+            await pilot.pause()
+            assert isinstance(app.screen, ConfirmActionScreen)
+            # cancel keeps the person
+            await pilot.click("#cancel-action")
+            await pilot.pause()
+            assert any(p.telegram_id == 111 for p in app.controller.list_people())
+            # confirm deletes them
+            app.query_one("#people-table", DataTable).move_cursor(row=0)
+            await asyncio.sleep(0.6)
+            await pilot.click("#remove-person")
+            await pilot.pause()
+            await pilot.click("#confirm-action")
+            await pilot.pause()
+            assert app.controller.list_people() == []
+            assert not app.store.seen_path(111).exists()
+            settings = app.controller.settings()
+            assert settings.incremental_canary_telegram_ids == []
+            assert settings.operator_alert_telegram_id == 111
+            assert app.store.alert_db_path.exists() is False
+
+    run(scenario())
+
+
+def test_delivery_form_sections_daily_and_incremental(tmp_path):
+    async def scenario():
+        app = OwnerDashboardApp(root=tmp_path)
+        async with app.run_test(size=(100, 40)) as pilot:
+            app.controller.add_person(111, "Peter")
+            app.refresh_people()
+            await pilot.pause()
+            await pilot.click("#open-searches")
+            await pilot.pause()
+            await pilot.click("#delivery-settings")
+            await pilot.pause()
+            form = app.screen
+            labels = [str(w.render()) for w in form.query(Label)]
+            assert any("Daily push" in t for t in labels)
+            assert any("Incremental alerts (inactive" in t for t in labels)
+            # the daily-relevant no-match toggle is still present and reachable
+            assert form.query_one("#notify_on_no_results", Switch) is not None
+
+    run(scenario())
+
+
+def test_config_warns_when_a_person_pushes_before_scrape(tmp_path):
+    _config_env(tmp_path)
+
+    async def scenario():
+        app = OwnerDashboardApp(root=tmp_path)
+        async with app.run_test(size=(80, 24)) as pilot:
+            app.controller.add_person(111, "EarlyBird")
+            app.controller.update_delivery(
+                111, delivery_time="06:00", timezone_name="America/New_York",
+                delivery_mode="daily", quiet_hours_start=None, quiet_hours_end=None,
+                notify_on_no_results=False,
+            )
+            app.refresh_people()
+            await pilot.pause()
+            await pilot.click("#open-config")
+            await pilot.pause()
+            app.screen.query_one("#scrape_time", Input).value = "10:00"
+            await pilot.click("#submit")
+            await pilot.pause()
+            msg = str(app.screen.query_one("#dashboard-error", Label).render())
+            assert "⚠" in msg and "EarlyBird" in msg
+
+    run(scenario())

@@ -159,3 +159,19 @@ def test_local_day_cap_window_tracks_dst_length():
     now = datetime(2026, 3, 8, 16, 0, tzinfo=timezone.utc)
     start, end = local_day_window_utc(profile, now)
     assert end - start == timedelta(hours=23)
+
+
+def test_push_precedes_scrape_flags_early_delivery():
+    from datetime import date
+    from chc_rental.models import Profile, Settings
+    from chc_rental.notification_schedule import push_precedes_scrape
+
+    settings = Settings(scrape_time="08:00", scrape_timezone="America/New_York")
+    early = Profile(delivery_time="06:30", timezone="America/New_York")
+    late = Profile(delivery_time="19:00", timezone="America/New_York")
+    ref = date(2026, 8, 13)
+    assert push_precedes_scrape(early, settings, ref_date=ref) is True
+    assert push_precedes_scrape(late, settings, ref_date=ref) is False
+    # timezone-aware: a Los Angeles 06:00 push is 09:00 NY, after an 08:00 NY scrape
+    la = Profile(delivery_time="06:00", timezone="America/Los_Angeles")
+    assert push_precedes_scrape(la, settings, ref_date=ref) is False

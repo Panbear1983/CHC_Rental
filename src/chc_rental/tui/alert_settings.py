@@ -52,7 +52,7 @@ class IncrementalSettingsScreen(ModalScreen[Optional[dict]]):
                     value=str(settings.zillow_incremental_interval_minutes),
                     id="zillow_interval",
                 )
-                yield Label("Zillow paid starts per UTC day")
+                yield Label("Zillow paid starts per scrape-timezone day")
                 yield Input(
                     value=str(settings.source_request_budget("zillow")),
                     id="zillow_daily_budget",

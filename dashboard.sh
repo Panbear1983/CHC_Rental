@@ -1,30 +1,24 @@
 #!/usr/bin/env bash
 #
-# chc.sh — one terminal entry point for the CHC Rental dashboard and daily job.
+# dashboard.sh — the single public entry point for CHC Rental.
 #
-# Wraps the venv binaries so you never have to remember the venv path or the
-# --root flag, and gives the terminal direct control over the background
-# launchd job. Run it from anywhere; it resolves its own repo location.
-#
-#   ./chc.sh                 launch the owner dashboard (TUI)   [default]
-#   ./chc.sh run [--live]    plan today's push (add --live to send)
-#   ./chc.sh check           verify the bot can reach each allowlisted person
-#   ./chc.sh prune           delete state past its retention window
-#   ./chc.sh logs [-f]       show the daily job log (-f to follow)
-#   ./chc.sh alerts ...       incremental migrate/status/tick/deliver/backup
-#   ./chc.sh alerts-logs [-f] show the incremental job log
-#   ./chc.sh job status      is the hourly launchd job loaded?
-#   ./chc.sh job start|stop  load / unload the hourly job
-#   ./chc.sh job run         run the hourly job once, right now
-#   ./chc.sh alerts-job ...   control the separate incremental LaunchAgent
-#   ./chc.sh help            this message
+#   ./dashboard.sh                         launch the local operator dashboard (default)
+#   ./dashboard.sh scrape                  update today's source cache; never send
+#   ./dashboard.sh deliver [--live]        use today's cache; never scrape
+#   ./dashboard.sh run [--live]            plan or send today's push
+#   ./dashboard.sh check                   verify Telegram reachability
+#   ./dashboard.sh prune                   prune expired state
+#   ./dashboard.sh logs [-f]               show or follow the daily log
+#   ./dashboard.sh alerts ...              incremental alert operations
+#   ./dashboard.sh alerts-logs [-f]        show or follow the alerts log
+#   ./dashboard.sh job status|start|stop|run
+#   ./dashboard.sh alerts-job status|start|stop|run
+#   ./dashboard.sh help
 #
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PY="$REPO/.venv/bin/python"
-TUI="$REPO/.venv/bin/chc-rental-tui"
-CLI="$REPO/.venv/bin/chc-rental"
 
 LAUNCHD_LABEL="com.chcrental.daily"
 LAUNCHD_PLIST="$HOME/Library/LaunchAgents/${LAUNCHD_LABEL}.plist"
@@ -32,24 +26,28 @@ ALERTS_LAUNCHD_LABEL="com.chcrental.alerts"
 ALERTS_LAUNCHD_PLIST="$HOME/Library/LaunchAgents/${ALERTS_LAUNCHD_LABEL}.plist"
 DOMAIN="gui/$(id -u)"
 
-die() { echo "chc: $*" >&2; exit 1; }
+die() { echo "dashboard: $*" >&2; exit 1; }
 
-usage() { sed -n '2,21p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,14p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 [[ -x "$PY" ]] || die "venv not found at $REPO/.venv — create it, then: $PY -m pip install -e ."
 
-cmd="${1:-dashboard}"
-[[ $# -gt 0 ]] && shift || true
+if [[ $# -eq 0 ]]; then
+  exec "$PY" -m chc_rental.tui.app --root "$REPO"
+fi
+
+cmd="$1"
+shift
 
 case "$cmd" in
-  dashboard|dash|tui)
-    exec "$TUI" --root "$REPO" "$@"
+  run|scrape|deliver|check)
+    exec "$PY" -m chc_rental.cli --root "$REPO" "$cmd" --env-file "$REPO/.env" "$@"
     ;;
-  run|check|prune|init)
-    exec "$CLI" --root "$REPO" "$cmd" "$@"
+  prune|init)
+    exec "$PY" -m chc_rental.cli --root "$REPO" "$cmd" "$@"
     ;;
   alerts)
-    exec "$CLI" --root "$REPO" alerts "$@"
+    exec "$PY" -m chc_rental.cli --root "$REPO" alerts "$@"
     ;;
   logs)
     log="$REPO/state/daily.log"
@@ -62,11 +60,12 @@ case "$cmd" in
     if [[ "${1:-}" == "-f" ]]; then exec tail -f "$log"; else exec tail -n 60 "$log"; fi
     ;;
   job)
-    action="${1:-status}"; [[ $# -gt 0 ]] && shift || true
+    action="${1:-status}"
+    [[ $# -gt 0 ]] && shift || true
     case "$action" in
       status)
         if launchctl print "${DOMAIN}/${LAUNCHD_LABEL}" >/dev/null 2>&1; then
-          echo "job ${LAUNCHD_LABEL}: LOADED (runs hourly)"
+          echo "job ${LAUNCHD_LABEL}: LOADED (10-minute checks; scrape and delivery separated)"
         else
           echo "job ${LAUNCHD_LABEL}: not loaded"
         fi
@@ -79,7 +78,7 @@ case "$cmd" in
         launchctl bootout "${DOMAIN}/${LAUNCHD_LABEL}" 2>/dev/null && echo "job stopped (unloaded)" || echo "job was not loaded"
         ;;
       run|kick)
-        launchctl kickstart -k "${DOMAIN}/${LAUNCHD_LABEL}" && echo "job kicked off once (see: ./chc.sh logs)"
+        launchctl kickstart -k "${DOMAIN}/${LAUNCHD_LABEL}" && echo "job kicked off once (see: ./dashboard.sh logs)"
         ;;
       *)
         die "unknown job action '$action' (status|start|stop|run)"
@@ -87,7 +86,8 @@ case "$cmd" in
     esac
     ;;
   alerts-job)
-    action="${1:-status}"; [[ $# -gt 0 ]] && shift || true
+    action="${1:-status}"
+    [[ $# -gt 0 ]] && shift || true
     case "$action" in
       status)
         if launchctl print "${DOMAIN}/${ALERTS_LAUNCHD_LABEL}" >/dev/null 2>&1; then
@@ -107,7 +107,7 @@ case "$cmd" in
         echo "incremental alerts job stopped and disabled"
         ;;
       run|kick)
-        launchctl kickstart -k "${DOMAIN}/${ALERTS_LAUNCHD_LABEL}" && echo "incremental alerts tick requested (see: ./chc.sh alerts-logs)"
+        launchctl kickstart -k "${DOMAIN}/${ALERTS_LAUNCHD_LABEL}" && echo "incremental alerts tick requested (see: ./dashboard.sh alerts-logs)"
         ;;
       *)
         die "unknown alerts-job action '$action' (status|start|stop|run)"
@@ -118,8 +118,6 @@ case "$cmd" in
     usage
     ;;
   *)
-    echo "chc: unknown command '$cmd'" >&2
-    usage
-    exit 2
+    die "unknown command '$cmd' (run ./dashboard.sh help)"
     ;;
 esac

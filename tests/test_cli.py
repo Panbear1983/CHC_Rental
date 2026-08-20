@@ -4,11 +4,12 @@ from datetime import datetime, timezone
 import json
 
 import chc_rental.cli as cli
-from chc_rental.models import Allowlist, Profile
+from chc_rental.fetch import scrape_day
+from chc_rental.models import Allowlist, Profile, Settings
 from chc_rental.pipeline import PipelineResult
 from chc_rental.store import Store
 
-from tests.conftest import make_person, make_search
+from tests.conftest import make_listing, make_person, make_search
 
 
 def truncated_fetch():
@@ -36,7 +37,9 @@ def test_problem_messages_include_incomplete_source_and_delivery_failures():
 
 def test_replayed_cached_problem_alerts_once_per_streak(store, monkeypatch):
     sent = []
-    monkeypatch.setattr(cli, "_alert_owner", lambda store, env_file, text: sent.append(text))
+    monkeypatch.setattr(
+        cli, "_alert_operator", lambda store, env_file, text: sent.append(text)
+    )
     result = PipelineResult(summary={"delivery": "live", "failed": 0})
 
     cli._alert_on_problems(store, ".env", result, truncated_fetch())
@@ -52,6 +55,102 @@ def test_replayed_cached_problem_alerts_once_per_streak(store, monkeypatch):
     changed = {"sources": [{"source": "rentcast", "errors": ["HTTP 500"]}]}
     cli._alert_on_problems(store, ".env", result, changed)
     assert sent[-1] == "rentcast fetch errors: HTTP 500"
+
+
+def test_daily_delivery_uses_saved_cache_without_constructing_source_adapter(
+    store, monkeypatch, capsys
+):
+    person = make_person(
+        111,
+        profile=Profile(
+            delivery_time="09:00",
+            timezone="America/New_York",
+            searches=[make_search(state="TX")],
+        ),
+    )
+    store.save_allowlist(Allowlist(people=[person]))
+    settings = Settings(
+        scrape_time="08:00",
+        scrape_timezone="America/New_York",
+        zillow_enabled=True,
+    )
+    store.save_settings(settings)
+    now = datetime(2026, 1, 15, 20, tzinfo=timezone.utc)
+    day = scrape_day(settings, now)
+    store.cache_raw(
+        day,
+        "zillow",
+        [make_listing(source="zillow", state="TX")],
+        metadata={
+            "query_scope": [{"city": "austin", "state": "TX"}],
+            "scrape_day": day.isoformat(),
+            "scrape_timezone": settings.scrape_timezone,
+            "queries_planned": 1,
+            "queries_completed": 1,
+        },
+    )
+    monkeypatch.setattr(
+        cli,
+        "configured_adapters",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("delivery-only path must not construct an adapter")
+        ),
+    )
+    monkeypatch.setattr(
+        cli,
+        "build_sender",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("dry delivery check must not construct Telegram sender")
+        ),
+    )
+
+    code = cli.main(
+        [
+            "--root",
+            str(store.root),
+            "deliver",
+            "--now",
+            now.isoformat(),
+        ]
+    )
+    output = capsys.readouterr().out
+    assert code == 0
+    assert "planned_pushes\": 1" in output
+
+
+def test_daily_scrape_never_constructs_telegram_sender(store, monkeypatch, capsys):
+    store.save_allowlist(
+        Allowlist(
+            people=[
+                make_person(111, profile=Profile(searches=[make_search(state="TX")]))
+            ]
+        )
+    )
+    adapter = type(
+        "OnePage",
+        (),
+        {
+            "name": "zillow",
+            "fetch_page": lambda self, query, offset: (
+                [make_listing(source="zillow", state="TX")],
+                False,
+            ),
+        },
+    )()
+    monkeypatch.setattr(cli, "configured_adapters", lambda *args, **kwargs: ([adapter], []))
+    monkeypatch.setattr(
+        cli,
+        "build_sender",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("scrape-only path must never construct Telegram sender")
+        ),
+    )
+    now = datetime(2026, 1, 15, 20, tzinfo=timezone.utc)
+    code = cli.main(
+        ["--root", str(store.root), "scrape", "--now", now.isoformat()]
+    )
+    assert code == 0
+    assert '"scrape": "fetched"' in capsys.readouterr().out
 
 
 def test_alert_status_is_read_only_and_reports_pending_migrations(tmp_path, capsys):

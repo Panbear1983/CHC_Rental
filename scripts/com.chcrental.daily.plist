@@ -3,22 +3,32 @@
 <plist version="1.0">
 <dict>
   <key>Label</key><string>com.chcrental.daily</string>
-  <!-- Fires hourly; each person's own local delivery time decides whether they
-       are due. A fixed clock time would need a UTC offset that breaks at every
-       DST transition and cannot serve two people in different timezones.
+  <!-- Fires every ten minutes. The scrape command may update one New-York-day
+       cache at/after the configured scrape time and can never send Telegram.
+       The delivery command reads only that saved cache and can never call a
+       listing source. Each person's own local delivery time decides whether
+       they are due, with normal catch-up after sleep.
 
        The command is wrapped in tmux on purpose. A launchd job invoking the
        repo venv directly is denied by TCC because the repo lives under
        ~/Desktop, and fails with PermissionError on pyvenv.cfg. tmux already
        holds the necessary grant on this machine. -->
-  <key>StartInterval</key><integer>3600</integer>
+  <key>StartCalendarInterval</key>
+  <array>
+    <dict><key>Minute</key><integer>0</integer></dict>
+    <dict><key>Minute</key><integer>10</integer></dict>
+    <dict><key>Minute</key><integer>20</integer></dict>
+    <dict><key>Minute</key><integer>30</integer></dict>
+    <dict><key>Minute</key><integer>40</integer></dict>
+    <dict><key>Minute</key><integer>50</integer></dict>
+  </array>
   <key>RunAtLoad</key><false/>
   <key>ProgramArguments</key>
   <array>
     <string>/opt/homebrew/bin/tmux</string>
     <string>new-session</string><string>-d</string>
     <string>-s</string><string>chcrental-daily</string>
-    <string>cd /Users/peter/Desktop/Old_Projects/GitHub/CHC_Rental &amp;&amp; .venv/bin/chc-rental --root /Users/peter/Desktop/Old_Projects/GitHub/CHC_Rental run --live &gt;&gt; state/daily.log 2&gt;&amp;1; .venv/bin/chc-rental --root /Users/peter/Desktop/Old_Projects/GitHub/CHC_Rental prune &gt;&gt; state/daily.log 2&gt;&amp;1</string>
+    <string>cd /Users/peter/Desktop/Old_Projects/GitHub/CHC_Rental &amp;&amp; ./dashboard.sh scrape &gt;&gt; state/daily.log 2&gt;&amp;1; ./dashboard.sh deliver --live &gt;&gt; state/daily.log 2&gt;&amp;1</string>
   </array>
   <key>StandardOutPath</key><string>/Users/peter/Desktop/Old_Projects/GitHub/CHC_Rental/state/launchd.out.log</string>
   <key>StandardErrorPath</key><string>/Users/peter/Desktop/Old_Projects/GitHub/CHC_Rental/state/launchd.err.log</string>

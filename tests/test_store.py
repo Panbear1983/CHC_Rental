@@ -40,6 +40,18 @@ def test_initialize_creates_config_with_defaults(tmp_path):
     assert store.load_settings().zillow_enabled is False
 
 
+def test_legacy_owner_alert_key_loads_and_saves_under_operator_name(tmp_path):
+    store = Store(tmp_path)
+    store.initialize()
+    store.settings_path.write_text("owner_telegram_id: 424242\n", encoding="utf-8")
+    loaded = store.load_settings()
+    assert loaded.operator_alert_telegram_id == 424242
+    store.save_settings(loaded)
+    saved = store.settings_path.read_text(encoding="utf-8")
+    assert "operator_alert_telegram_id: 424242" in saved
+    assert "owner_telegram_id" not in saved
+
+
 def test_whole_run_lock_refuses_an_overlapping_cycle(store):
     other = Store(store.root)
     with store.try_run_lock() as first:
@@ -121,6 +133,59 @@ def test_last_sent_at_returns_the_most_recent_entry(store):
     store.mark_seen(111, "k2", search_name="s", url="https://example.com/2")
     stamp = store.last_sent_at(111)
     assert stamp is not None and stamp.tzinfo is not None
+
+
+def test_test_delivery_suppresses_only_its_recipient_without_advancing_due_gate(store):
+    stamp = datetime(2026, 1, 15, 15, 0, tzinfo=timezone.utc)
+    store.mark_seen(
+        111,
+        "v3:ny:brooklyn::1%20main%20st:",
+        search_name="Brooklyn",
+        url="https://www.zillow.com/1_zpid/",
+        now_utc=stamp,
+        channel="test",
+        telegram_message_id="700",
+        chat_id="111",
+    )
+
+    assert store.active_seen_keys(111, now_utc=stamp) == {
+        "v3:ny:brooklyn::1%20main%20st:"
+    }
+    assert store.active_seen_keys(222, now_utc=stamp) == set()
+    assert store.last_sent_at(111) is None
+
+
+def test_repeat_delivery_is_audited_without_restarting_original_retention(store):
+    original = datetime(2026, 1, 1, 15, 0, tzinfo=timezone.utc)
+    repeated = original + timedelta(days=80)
+    after_window = original + timedelta(days=91)
+    key = "v3:ny:brooklyn::1%20main%20st:"
+    store.mark_seen(
+        111,
+        key,
+        search_name="Brooklyn",
+        url="https://www.zillow.com/1_zpid/",
+        now_utc=original,
+        channel="test",
+    )
+    store.mark_seen(
+        111,
+        key,
+        search_name="Brooklyn",
+        url="https://www.zillow.com/1_zpid/",
+        now_utc=repeated,
+        channel="test",
+        repeat_override=True,
+    )
+
+    records = [
+        json.loads(line)
+        for line in store.seen_path(111).read_text(encoding="utf-8").splitlines()
+    ]
+    assert [record["repeat_override"] for record in records] == [False, True]
+    assert store.active_seen_keys(111, now_utc=repeated) == {key}
+    assert store.active_seen_keys(111, now_utc=after_window) == set()
+    assert store.last_sent_at(111) is None
 
 
 def test_a_corrupt_ledger_line_does_not_hide_the_rest(store):

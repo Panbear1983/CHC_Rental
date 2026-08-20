@@ -19,6 +19,7 @@ from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 from chc_rental.event_store import QueryScopeRecord, SourceRunRecord
+from chc_rental.fetch import scrape_day
 from chc_rental.models import Settings
 from chc_rental.sources.apify import ApifyClient, ApifyRunState
 from chc_rental.sources.base import SourceAuthError, SourceError, SourceRateLimitError
@@ -259,7 +260,7 @@ class IncrementalCollector:
             )
 
         if self.meter_requests and not self.store.reserve_request(
-            now.date(),
+            scrape_day(self.settings, now),
             "zillow",
             per_source_limit=self.settings.source_request_budget("zillow"),
             global_limit=self.settings.global_daily_request_budget,

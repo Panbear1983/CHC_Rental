@@ -132,6 +132,24 @@ def test_can_reach_is_true_for_a_known_chat(monkeypatch):
     assert TelegramSender(token=FAKE).can_reach(111) is True
 
 
+def test_get_chat_returns_verified_destination_without_sending(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        TelegramSender,
+        "_post",
+        lambda self, method, payload: calls.append((method, payload))
+        or {"id": payload["chat_id"]},
+    )
+    assert TelegramSender(token=FAKE).get_chat(111)["id"] == 111
+    assert calls == [("getChat", {"chat_id": 111})]
+
+
+def test_whoami_requires_a_usable_bot_identity(monkeypatch):
+    monkeypatch.setattr(TelegramSender, "_post", lambda self, method, payload: {})
+    with pytest.raises(TelegramSendError, match="usable bot identity"):
+        TelegramSender(token=FAKE).whoami()
+
+
 def test_module_never_polls():
     """Outbound only: no receiving endpoint is ever called.
 

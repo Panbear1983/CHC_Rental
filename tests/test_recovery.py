@@ -44,7 +44,13 @@ def test_incremental_launchagent_is_separate_and_disabled_by_default():
     assert alerts["StartInterval"] == 900
     assert "alerts tick --live" in alerts["ProgramArguments"][-1]
     assert daily["Label"] == "com.chcrental.daily"
-    assert " run --live " in daily["ProgramArguments"][-1]
+    assert "StartInterval" not in daily
+    assert [
+        item["Minute"] for item in daily["StartCalendarInterval"]
+    ] == [0, 10, 20, 30, 40, 50]
+    assert "./dashboard.sh scrape " in daily["ProgramArguments"][-1]
+    assert "./dashboard.sh deliver --live " in daily["ProgramArguments"][-1]
+    assert " run --live " not in daily["ProgramArguments"][-1]
 
 
 def test_cli_tick_without_live_or_fixture_is_read_only(tmp_path, capsys):
@@ -111,7 +117,7 @@ def test_offline_fixture_tick_disables_owner_alert_transport(
     fixture.write_text("[]")
     monkeypatch.setattr(
         cli,
-        "_alert_owner",
+        "_alert_operator",
         lambda *args, **kwargs: (_ for _ in ()).throw(
             AssertionError("fixture tick must not call operator Telegram")
         ),

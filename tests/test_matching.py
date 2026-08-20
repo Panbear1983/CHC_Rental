@@ -108,3 +108,32 @@ def test_state_accepts_full_name_or_code():
             pass
         else:
             raise AssertionError(f"{bad!r} should have been rejected")
+
+
+def test_house_search_matches_single_family_listing():
+    """Regression for the 2026-08-13 vocabulary bug: sources emit 'single_family',
+    never 'house', so a 'house' search matched nothing until grouping was shared."""
+    assert matches_search(listing(property_type="single_family"), make_search(property_types=["house"])) is True
+    assert matches_search(listing(property_type="single_family"), make_search(property_types=["single_family"])) is True
+
+
+def test_studio_and_room_searches_match_apartment_listings():
+    assert matches_search(listing(property_type="apartment"), make_search(property_types=["studio"])) is True
+    assert matches_search(listing(property_type="apartment"), make_search(property_types=["room"])) is True
+
+
+def test_type_grouping_does_not_over_match_across_groups():
+    assert matches_search(listing(property_type="condo"), make_search(property_types=["house"])) is False
+    assert matches_search(listing(property_type="single_family"), make_search(property_types=["apartment"])) is False
+
+
+def test_planner_and_matching_share_one_type_grouping():
+    """The scrape and the matcher must group property types identically, or a
+    'house' search is fetched single_family listings it then rejects."""
+    from chc_rental.models import PropertyType, property_type_group
+    from chc_rental.sources.planner import _ZILLOW_FILTERABLE_GROUPS
+    # house and single_family collapse to one group on both sides
+    assert property_type_group(PropertyType.HOUSE) == property_type_group(PropertyType.SINGLE_FAMILY)
+    assert property_type_group(PropertyType.STUDIO) == property_type_group(PropertyType.APARTMENT)
+    # every group the planner filters Zillow on is a real canonical group
+    assert _ZILLOW_FILTERABLE_GROUPS <= set(property_type_group(t) for t in PropertyType)

@@ -110,7 +110,13 @@ class DeliveryWorker:
             )
         return set(requested_telegram_ids)
 
-    def _eligibility(self, row: OutboxRecord, settings: Settings) -> Eligibility:
+    def _eligibility(
+        self,
+        row: OutboxRecord,
+        settings: Settings,
+        *,
+        now_utc: datetime,
+    ) -> Eligibility:
         gate = self._global_gate(settings)
         if gate:
             return Eligibility(False, False, gate)
@@ -136,15 +142,31 @@ class DeliveryWorker:
         ]
         if not searches or not any(matches_search(listing, search) for search in searches):
             return Eligibility(False, True, "no current active search still matches")
-        seen = {upgrade_seen_key(key) for key in self.store.seen_keys(row.telegram_id)}
+        seen = {
+            upgrade_seen_key(key)
+            for key in self.store.active_seen_keys(
+                row.telegram_id,
+                now_utc=now_utc,
+            )
+        }
         if row.identity_key in seen:
             return Eligibility(False, True, "listing was already sent by the daily path")
         return Eligibility(True, False, "eligible")
 
     def _reconcile_seen(self, targets: set[int], now: datetime) -> int:
         reconciled = 0
+        retention_days = self.store.load_settings().seen_retention_days
+        cutoff = now - timedelta(days=retention_days) if retention_days > 0 else None
         for row in self.events.outbox_records(status="sent"):
             if row.telegram_id not in targets:
+                continue
+            if row.sent_at is None:
+                continue
+            try:
+                sent_at = datetime.fromisoformat(row.sent_at).astimezone(timezone.utc)
+            except (TypeError, ValueError):
+                continue
+            if cutoff is not None and sent_at < cutoff:
                 continue
             seen = {
                 upgrade_seen_key(key) for key in self.store.seen_keys(row.telegram_id)
@@ -160,7 +182,8 @@ class DeliveryWorker:
                     row.identity_key,
                     search_name=row.primary_search_name,
                     url=listing.url,
-                    now_utc=now,
+                    now_utc=sent_at,
+                    channel="incremental",
                 )
             except Exception:
                 continue
@@ -187,7 +210,7 @@ class DeliveryWorker:
                 continue
             if outbox_id is not None and row.outbox_id != outbox_id:
                 continue
-            eligibility = self._eligibility(row, settings)
+            eligibility = self._eligibility(row, settings, now_utc=now)
             if eligibility.eligible:
                 report.promoted += int(
                     self.events.promote_shadow(row.outbox_id, now_utc=now)
@@ -234,7 +257,7 @@ class DeliveryWorker:
                 continue
             if outbox_id is not None and row.outbox_id != outbox_id:
                 continue
-            eligibility = self._eligibility(row, settings)
+            eligibility = self._eligibility(row, settings, now_utc=now)
             if eligibility.permanent:
                 report.cancelled += int(
                     self.events.cancel_outbox(
@@ -248,112 +271,130 @@ class DeliveryWorker:
             )
             if row is None:
                 break
-            fresh_settings = self.store.load_settings()
-            eligibility = self._eligibility(row, fresh_settings)
-            if not eligibility.eligible:
-                if eligibility.permanent:
-                    report.cancelled += int(
-                        self.events.cancel_outbox(
-                            row.outbox_id, now_utc=now, reason=eligibility.reason
-                        )
-                    )
-                else:
-                    self.events.return_outbox_to_pending(
+            # The row is claimed before waiting on the recipient lock, then
+            # eligibility and delivery history are re-checked inside it.  This
+            # closes the daily/Test/incremental race without serializing sends
+            # to different Telegram IDs.
+            with self.store.recipient_delivery_lock(row.telegram_id):
+                self._deliver_claimed(row=row, now=now, report=report)
+        return report
+
+    def _deliver_claimed(
+        self,
+        *,
+        row: OutboxRecord,
+        now: datetime,
+        report: DeliveryReport,
+    ) -> None:
+        fresh_settings = self.store.load_settings()
+        eligibility = self._eligibility(row, fresh_settings, now_utc=now)
+        if not eligibility.eligible:
+            if eligibility.permanent:
+                report.cancelled += int(
+                    self.events.cancel_outbox(
                         row.outbox_id, now_utc=now, reason=eligibility.reason
                     )
-                    if eligibility.reason not in report.blocked:
-                        report.blocked.append(eligibility.reason)
-                continue
-            current_person = self.store.load_allowlist().get(row.telegram_id)
-            if current_person is None:  # eligibility already guards this
-                self.events.cancel_outbox(
-                    row.outbox_id,
-                    now_utc=now,
-                    reason="recipient disappeared before transport",
                 )
-                report.cancelled += 1
-                continue
-            current_due = notification_not_before(current_person.profile, now)
-            if current_due > now:
+            else:
                 self.events.return_outbox_to_pending(
+                    row.outbox_id, now_utc=now, reason=eligibility.reason
+                )
+                if eligibility.reason not in report.blocked:
+                    report.blocked.append(eligibility.reason)
+            return
+        current_person = self.store.load_allowlist().get(row.telegram_id)
+        if current_person is None:  # eligibility already guards this
+            self.events.cancel_outbox(
+                row.outbox_id,
+                now_utc=now,
+                reason="recipient disappeared before transport",
+            )
+            report.cancelled += 1
+            return
+        current_due = notification_not_before(current_person.profile, now)
+        if current_due > now:
+            self.events.return_outbox_to_pending(
+                row.outbox_id,
+                now_utc=now,
+                not_before_utc=current_due,
+                reason="recipient is currently in quiet hours",
+            )
+            if "recipient is currently in quiet hours" not in report.blocked:
+                report.blocked.append("recipient is currently in quiet hours")
+            return
+        try:
+            receipt = self.sender.send(
+                telegram_id=row.telegram_id, text=row.message_text
+            )
+        except TelegramSendError as exc:
+            if exc.ambiguous:
+                status = self.events.mark_outbox_failure(
                     row.outbox_id,
                     now_utc=now,
-                    not_before_utc=current_due,
-                    reason="recipient is currently in quiet hours",
-                )
-                if "recipient is currently in quiet hours" not in report.blocked:
-                    report.blocked.append("recipient is currently in quiet hours")
-                continue
-            try:
-                receipt = self.sender.send(
-                    telegram_id=row.telegram_id, text=row.message_text
-                )
-            except TelegramSendError as exc:
-                if exc.ambiguous:
-                    status = self.events.mark_outbox_failure(
-                        row.outbox_id,
-                        now_utc=now,
-                        error_class="telegram_ambiguous",
-                        error_message=str(exc),
-                        retry_at_utc=None,
-                        uncertain=True,
-                    )
-                elif exc.terminal or row.attempts >= self.max_attempts:
-                    status = self.events.mark_outbox_failure(
-                        row.outbox_id,
-                        now_utc=now,
-                        error_class="telegram_terminal",
-                        error_message=str(exc),
-                        retry_at_utc=None,
-                    )
-                else:
-                    delay = exc.retry_after or min(
-                        3600, self.retry_base_seconds * (2 ** (row.attempts - 1))
-                    )
-                    status = self.events.mark_outbox_failure(
-                        row.outbox_id,
-                        now_utc=now,
-                        error_class="telegram_retryable",
-                        error_message=str(exc),
-                        retry_at_utc=now + timedelta(seconds=delay),
-                    )
-                setattr(report, status, getattr(report, status) + 1)
-                continue
-            except Exception as exc:
-                self.events.mark_outbox_failure(
-                    row.outbox_id,
-                    now_utc=now,
-                    error_class="transport_unknown",
-                    error_message=f"{type(exc).__name__}: {exc}",
+                    error_class="telegram_ambiguous",
+                    error_message=str(exc),
                     retry_at_utc=None,
                     uncertain=True,
                 )
-                report.uncertain += 1
-                continue
-
-            self.events.mark_outbox_sent(
+            elif exc.terminal or row.attempts >= self.max_attempts:
+                status = self.events.mark_outbox_failure(
+                    row.outbox_id,
+                    now_utc=now,
+                    error_class="telegram_terminal",
+                    error_message=str(exc),
+                    retry_at_utc=None,
+                )
+            else:
+                delay = exc.retry_after or min(
+                    3600, self.retry_base_seconds * (2 ** (row.attempts - 1))
+                )
+                status = self.events.mark_outbox_failure(
+                    row.outbox_id,
+                    now_utc=now,
+                    error_class="telegram_retryable",
+                    error_message=str(exc),
+                    retry_at_utc=now + timedelta(seconds=delay),
+                )
+            setattr(report, status, getattr(report, status) + 1)
+            return
+        except Exception as exc:
+            self.events.mark_outbox_failure(
                 row.outbox_id,
                 now_utc=now,
-                telegram_message_id=_receipt_message_id(receipt),
+                error_class="transport_unknown",
+                error_message=f"{type(exc).__name__}: {exc}",
+                retry_at_utc=None,
+                uncertain=True,
             )
-            try:
-                listing = Listing.model_validate_json(
-                    self.events.outbox_listing_json(row.outbox_id)
-                )
-                self.store.mark_seen(
-                    row.telegram_id,
-                    row.identity_key,
-                    search_name=row.primary_search_name,
-                    url=listing.url,
-                    now_utc=now,
-                )
-            except Exception:
-                # The durable receipt is authoritative. Reconciliation on the
-                # next worker pass repairs the legacy daily seen ledger.
-                pass
-            report.sent += 1
-            report.sent_outbox_ids.append(row.outbox_id)
-        return report
+            report.uncertain += 1
+            return
+
+        message_id = _receipt_message_id(receipt)
+        self.events.mark_outbox_sent(
+            row.outbox_id,
+            now_utc=now,
+            telegram_message_id=message_id,
+        )
+        try:
+            listing = Listing.model_validate_json(
+                self.events.outbox_listing_json(row.outbox_id)
+            )
+            self.store.mark_seen(
+                row.telegram_id,
+                row.identity_key,
+                search_name=row.primary_search_name,
+                url=listing.url,
+                now_utc=now,
+                channel="incremental",
+                telegram_message_id=message_id,
+                chat_id=str(row.telegram_id),
+            )
+        except Exception:
+            # The durable receipt is authoritative. Reconciliation on the next
+            # worker pass repairs the unified per-recipient delivery bank.
+            pass
+        report.sent += 1
+        report.sent_outbox_ids.append(row.outbox_id)
 
     def run(
         self,

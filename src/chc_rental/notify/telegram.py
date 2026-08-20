@@ -147,13 +147,27 @@ class TelegramSender:
     def can_reach(self, telegram_id: int) -> bool:
         """True if the bot may message this chat. False means they never /started it."""
         try:
-            self._post("getChat", {"chat_id": telegram_id})
+            self.get_chat(telegram_id)
             return True
         except TelegramSendError:
             return False
 
+    def get_chat(self, telegram_id: int) -> dict:
+        """Validate one destination without sending it a message."""
+        result = self._post("getChat", {"chat_id": telegram_id})
+        if not isinstance(result, dict) or result.get("id") is None:
+            raise TelegramSendError(
+                "getChat succeeded without a usable chat identity", ambiguous=True
+            )
+        return result
+
     def whoami(self) -> dict:
-        return self._post("getMe", {})
+        result = self._post("getMe", {})
+        if not isinstance(result, dict) or result.get("id") is None:
+            raise TelegramSendError(
+                "getMe succeeded without a usable bot identity", ambiguous=True
+            )
+        return result
 
     def send(self, *, telegram_id: int, text: str) -> TelegramReceipt:
         result = self._post(

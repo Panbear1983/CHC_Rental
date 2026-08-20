@@ -8,8 +8,9 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import urllib.error
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -20,6 +21,8 @@ from chc_rental.fetch import (
     fetch_daily,
     fetch_many_daily,
     is_scrape_time,
+    load_daily_cached,
+    scrape_day,
 )
 from chc_rental.models import Allowlist, Listing, Profile, Settings
 from chc_rental.sources.base import (
@@ -30,7 +33,6 @@ from chc_rental.sources.base import (
 )
 from chc_rental.sources import configured_adapters
 from chc_rental.sources.planner import plan_incremental_queries, plan_queries
-from chc_rental.sources.rentcast import RentCastAdapter, _parse_retry_after
 from chc_rental.sources.zillow import (
     ZillowRentalAdapter,
     rental_search_url,
@@ -42,24 +44,6 @@ from tests.conftest import make_person, make_search
 # 12:00 UTC = 08:00 America/New_York in January — exactly the default scrape time.
 FETCH_NOW = datetime(2026, 1, 15, 13, 5, tzinfo=timezone.utc)
 BEFORE_SCRAPE = datetime(2026, 1, 15, 11, 0, tzinfo=timezone.utc)  # 06:00 New York
-
-RAW_RENTCAST = {
-    "id": "3821-Hargis-St,-Austin,-TX-78723",
-    "formattedAddress": "3821 Hargis St, Austin, TX 78723",
-    "addressLine1": "3821 Hargis St",
-    "addressLine2": "Apt 12",
-    "city": "Austin",
-    "state": "TX",
-    "zipCode": "78723",
-    "county": "Travis",
-    "propertyType": "Single Family",
-    "bedrooms": 3,
-    "bathrooms": 2,
-    "squareFootage": 1428,
-    "status": "Active",
-    "price": 2100,
-    "listedDate": "2026-01-10T00:00:00.000Z",
-}
 
 RAW_ZILLOW_RENTAL = {
     "zpid": "123456",
@@ -90,8 +74,46 @@ def test_two_people_watching_one_city_produce_one_query():
     a = make_person(111, profile=Profile(searches=[make_search(state="TX")]))
     b = make_person(222, profile=Profile(searches=[make_search(name="Other", state="tx")]))
     queries, warnings = plan_queries(Allowlist(people=[a, b]))
-    assert queries == [SourceQuery(city="Austin", state="TX")]
+    assert len(queries) == 1
+    assert (queries[0].city, queries[0].state) == ("Austin", "TX")
     assert warnings == []
+
+
+def test_query_carries_the_search_filter_envelope():
+    """Regression for the 2026-08-13 report: the daily Zillow scrape ignored
+    the dashboard filters, so scraped listings did not fit the search."""
+    person = make_person(
+        111,
+        profile=Profile(searches=[make_search(
+            state="TX", price_min=2000, price_max=4000, bed_min=2, bed_max=3,
+            bath_min=2.0, property_types=["apartment", "condo"],
+        )]),
+    )
+    (query,), _ = plan_queries(Allowlist(people=[person]))
+    assert (query.price_min, query.price_max) == (2000, 4000)
+    assert (query.beds_min, query.beds_max) == (2, 3)
+    assert query.baths_min == 2.0
+    assert query.property_types == ("apartment", "condo")
+
+
+def test_envelope_is_a_superset_of_every_search_in_the_city():
+    """Two different searches in one city must yield one query wide enough to
+    include what either would match — precise narrowing happens locally."""
+    narrow = make_search(
+        name="narrow", state="TX", price_min=2000, price_max=3000,
+        bed_min=2, bed_max=2, bath_min=2.0, property_types=["apartment"],
+    )
+    wide = make_search(
+        name="wide", state="TX", price_min=1000, price_max=5000,
+        bed_min=1, bed_max=4, bath_min=1.0, property_types=["condo", "house"],
+    )
+    person = make_person(111, profile=Profile(searches=[narrow, wide]))
+    (query,), _ = plan_queries(Allowlist(people=[person]))
+    assert (query.price_min, query.price_max) == (1000, 5000)
+    assert (query.beds_min, query.beds_max) == (1, 4)
+    assert query.baths_min == 1.0  # smallest floor, so neither search is fetched out
+    # "house" maps to the Zillow single_family group; union across both searches
+    assert set(query.property_types) == {"apartment", "condo", "single_family"}
 
 
 def test_inactive_people_and_searches_are_not_fetched_for():
@@ -187,89 +209,13 @@ def test_local_only_feature_difference_does_not_duplicate_actor_scope():
     assert len(planned) == 1
 
 
-# --- RentCast adapter -------------------------------------------------------
-
-
-def test_rentcast_record_maps_to_a_valid_listing():
-    adapter = RentCastAdapter(api_key="k")
-    listing = Listing.model_validate(adapter._canonical(RAW_RENTCAST))
-    assert listing.source == "rentcast"
-    assert listing.address == "3821 Hargis St"
-    assert listing.unit == "Apt 12"
-    assert listing.city == "Austin" and listing.state == "TX"
-    assert listing.price == 2100
-    assert listing.property_type.value == "single_family"
-    assert listing.beds == 3 and listing.baths == 2.0 and listing.sqft == 1428
-    assert listing.url.startswith("https://www.google.com/maps/search/")
-    assert "Hargis" in listing.url
-
-
-def test_rentcast_missing_property_type_becomes_other_not_a_reject():
-    raw = dict(RAW_RENTCAST)
-    del raw["propertyType"]
-    listing = Listing.model_validate(RentCastAdapter(api_key="k")._canonical(raw))
-    assert listing.property_type.value == "other"
-
-
-def test_api_key_never_appears_in_repr():
-    assert "SECRET" not in repr(RentCastAdapter(api_key="SECRET"))
+# --- shared HTTP-error helper (used by the Zillow adapter tests) -----------
 
 
 def _http_error(code: int, headers: dict | None = None) -> urllib.error.HTTPError:
     return urllib.error.HTTPError(
-        "https://api.rentcast.io/v1/x", code, "boom", headers or {}, io.BytesIO(b"{}")
+        "https://api.example.com/v1/x", code, "boom", headers or {}, io.BytesIO(b"{}")
     )
-
-
-def _patch_urlopen(monkeypatch, side_effect):
-    import chc_rental.sources.rentcast as mod
-
-    monkeypatch.setattr(mod.urllib.request, "urlopen", side_effect)
-
-
-@pytest.mark.parametrize(
-    "code,expected",
-    [(401, SourceAuthError), (403, SourceAuthError), (500, SourceUnavailableError)],
-)
-def test_http_errors_map_to_the_right_source_error(monkeypatch, code, expected):
-    def boom(request, timeout, context):
-        raise _http_error(code)
-
-    _patch_urlopen(monkeypatch, boom)
-    with pytest.raises(expected):
-        RentCastAdapter(api_key="k").fetch_page(SourceQuery("Austin", "TX"), offset=0)
-
-
-def test_429_carries_retry_after(monkeypatch):
-    def boom(request, timeout, context):
-        raise _http_error(429, {"Retry-After": "7"})
-
-    _patch_urlopen(monkeypatch, boom)
-    with pytest.raises(SourceRateLimitError) as excinfo:
-        RentCastAdapter(api_key="k").fetch_page(SourceQuery("Austin", "TX"), offset=0)
-    assert excinfo.value.retry_after == 7.0
-
-
-def test_a_successful_page_returns_records_and_has_more(monkeypatch):
-    class FakeResponse(io.BytesIO):
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *args):
-            return False
-
-    payload = json.dumps([RAW_RENTCAST]).encode("utf-8")
-    _patch_urlopen(monkeypatch, lambda request, timeout, context: FakeResponse(payload))
-    adapter = RentCastAdapter(api_key="k", page_size=1)
-    records, has_more = adapter.fetch_page(SourceQuery("Austin", "TX"), offset=0)
-    assert len(records) == 1 and records[0]["city"] == "Austin"
-    assert has_more is True  # a full page means there may be another
-
-
-def test_parse_retry_after_tolerates_garbage():
-    assert _parse_retry_after(None) is None
-    assert _parse_retry_after("nonsense") is None
-    assert _parse_retry_after("12") == 12.0
 
 
 # --- Zillow managed rental adapter -----------------------------------------
@@ -283,6 +229,7 @@ def test_zillow_search_url_is_city_scoped_and_rental_only():
     encoded = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)["searchQueryState"][0]
     state = json.loads(encoded)
     assert state["usersSearchTerm"] == "Austin, TX"
+    assert state["filterState"]["sortSelection"] == {"value": "days"}
     assert state["filterState"]["fr"]["value"] is True
     assert state["filterState"]["fsba"]["value"] is False
 
@@ -388,17 +335,6 @@ def test_checked_in_malformed_zillow_fixture_is_rejected_not_fabricated():
         Listing.model_validate(adapter._canonical(raw))
     message = str(excinfo.value)
     assert "address" in message and "price" in message
-
-
-def test_checked_in_rentcast_fixture_matches_the_source_contract():
-    raw = source_fixture("rentcast", "active-rental.json")
-    listing = Listing.model_validate(RentCastAdapter(api_key="k")._canonical(raw))
-    assert listing.source_listing_id == raw["id"]
-    assert (listing.address, listing.unit, listing.price) == (
-        "3821 Hargis St",
-        "Apt 12",
-        2100,
-    )
 
 
 def test_zillow_adapter_filters_an_explicit_sale_record(monkeypatch):
@@ -777,3 +713,69 @@ def test_is_scrape_time_uses_the_configured_zone():
     settings = Settings()  # 08:00 America/New_York
     assert is_scrape_time(settings, BEFORE_SCRAPE) is False
     assert is_scrape_time(settings, FETCH_NOW) is True
+
+
+def test_scrape_day_rolls_over_at_local_midnight_not_utc_midnight():
+    settings = Settings(scrape_timezone="America/New_York")
+    assert scrape_day(
+        settings, datetime(2026, 8, 14, 3, 59, tzinfo=timezone.utc)
+    ) == date(2026, 8, 13)
+    assert scrape_day(
+        settings, datetime(2026, 8, 14, 4, 0, tzinfo=timezone.utc)
+    ) == date(2026, 8, 14)
+
+
+def test_legacy_utc_dated_evening_cache_cannot_block_morning_scrape(store):
+    _store_with_search(store)
+    store.save_settings(
+        Settings(scrape_time="06:00", scrape_timezone="America/New_York")
+    )
+    day = date(2026, 8, 14)
+    path = store.cache_raw(
+        day,
+        "rentcast",
+        [rec(99)],
+        metadata={
+            "query_scope": [{"city": "austin", "state": "TX"}],
+            "queries_planned": 1,
+            "queries_completed": 1,
+        },
+    )
+    # This file was written at 20:01 New York on August 13 but filed under the
+    # already-rolled UTC date August 14 by the old runner.
+    old_utc = datetime(2026, 8, 14, 0, 1, tzinfo=timezone.utc).timestamp()
+    os.utime(path, (old_utc, old_utc))
+
+    before = datetime(2026, 8, 14, 9, 59, tzinfo=timezone.utc)  # 05:59 NY
+    waiting = fetch_daily(store, FakeAdapter({}), now_utc=before)
+    assert waiting.usable is False
+
+    at_scrape = datetime(2026, 8, 14, 10, 0, tzinfo=timezone.utc)  # 06:00 NY
+    adapter = FakeAdapter({("Austin", 0): ([rec(1)], False)})
+    fetched = fetch_daily(store, adapter, now_utc=at_scrape)
+    assert fetched.fetched is True and fetched.records == [rec(1)]
+    metadata = store.load_cache_metadata(day, "rentcast")
+    assert metadata["scrape_day"] == "2026-08-14"
+    assert metadata["scrape_timezone"] == "America/New_York"
+
+
+def test_delivery_cache_loader_never_needs_an_adapter(store):
+    _store_with_search(store)
+    settings = Settings(scrape_timezone="America/New_York")
+    store.save_settings(settings)
+    now = datetime(2026, 1, 15, 20, tzinfo=timezone.utc)
+    day = scrape_day(settings, now)
+    store.cache_raw(
+        day,
+        "zillow",
+        [rec(1)],
+        metadata={
+            "query_scope": [{"city": "austin", "state": "TX"}],
+            "scrape_day": day.isoformat(),
+            "scrape_timezone": settings.scrape_timezone,
+            "queries_planned": 1,
+            "queries_completed": 1,
+        },
+    )
+    report = load_daily_cached(store, "zillow", now_utc=now)
+    assert report.from_cache is True and report.records == [rec(1)]

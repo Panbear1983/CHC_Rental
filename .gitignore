@@ -9,3 +9,6 @@ logs/
 config/
 state/
 backups/
+
+# Session working files, backups and recovery copies.
+scratchpad/
