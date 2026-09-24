@@ -24,10 +24,12 @@ from pathlib import Path
 from typing import Any, Optional, Sequence
 from uuid import uuid4
 
+from chc_rental.cost import ResultBudget, plan_result_budget, read_result_budget
 from chc_rental.event_store import AlertStoreError
 from chc_rental.delivery_worker import DeliveryWorker
 from chc_rental.fetch import fetch_many_daily, load_many_daily_cached, scrape_day
 from chc_rental.incremental import IncrementalCollector
+from chc_rental.models import Settings
 from chc_rental.notify.telegram import TelegramSendError, build_sender
 from chc_rental.outbox import process_incremental_report
 from chc_rental.operations import (
@@ -164,6 +166,27 @@ def _pool_reason(pool, fallback: str = "no listing pool") -> str:
     return "; ".join(notes) or fallback
 
 
+def _scrape_result_budget(
+    settings: Settings, args: argparse.Namespace, now_utc: datetime
+) -> ResultBudget:
+    """How many paid results this scrape may buy, per ``chc_rental.cost``.
+
+    Never raises and never blocks on an unreadable ceiling: an Apify outage
+    must not take the daily scrape down. It degrades to the configured limit,
+    which is itself bounded and chosen to fit a cycle.
+    """
+    token = load_apify_token(args.env_file)
+    if token is None:
+        return ResultBudget(
+            settings.zillow_results_limit,
+            "no APIFY_TOKEN to price the run with; using the configured limit",
+            metered=False,
+        )
+    return read_result_budget(
+        settings, token=token, today=scrape_day(settings, now_utc)
+    )
+
+
 def _cmd_scrape(args: argparse.Namespace) -> int:
     """Update the daily source snapshot; never construct a Telegram sender."""
     store = Store(args.root)
@@ -175,11 +198,17 @@ def _cmd_scrape(args: argparse.Namespace) -> int:
             return 0
 
         settings = store.load_settings()
+        # Price the run BEFORE building the adapter. The actor bills per RESULT,
+        # so the results limit IS the bill; the request ledger never was.
+        budget = _scrape_result_budget(settings, args, now_utc)
+        print(f"result budget: {budget.reason}")
         adapters, configuration_warnings = configured_adapters(
-            settings, env_path=args.env_file
+            settings, env_path=args.env_file, results_limit_override=budget.allowed
         )
         if not adapters:
             reason = "no listing source configured"
+            if budget.blocked and budget.metered:
+                reason = f"Apify result budget exhausted: {budget.reason}"
             if configuration_warnings:
                 reason += ": " + "; ".join(configuration_warnings)
             print(f"{reason}; scrape skipped")
@@ -343,8 +372,9 @@ def _run_once(store: Store, args: argparse.Namespace, now_utc: datetime) -> int:
         pool_complete = True
     else:
         settings = store.load_settings()
+        budget = _scrape_result_budget(settings, args, now_utc)
         adapters, configuration_warnings = configured_adapters(
-            settings, env_path=args.env_file
+            settings, env_path=args.env_file, results_limit_override=budget.allowed
         )
         if not adapters:
             reason = "no listing source configured"
@@ -627,8 +657,26 @@ def _cmd_usage(args: argparse.Namespace) -> int:
     queries, _ = plan_queries(store.load_allowlist())
     print(
         f"planned queries/day: {len(queries)} (zillow budget {budget}/day) — "
-        f"one query is one paid actor run"
+        f"one query is one actor run"
     )
+    # The actor bills per RESULT, so the run count is not the bill. Report the
+    # number that is: what today's scrape is actually authorised to buy.
+    result_budget = plan_result_budget(
+        settings,
+        usage_usd=used,
+        cap_usd=cap,
+        cycle_end=limits["cycle_end"],
+        today=day,
+    )
+    per_result = settings.zillow_price_per_result_usd
+    print(
+        f"result budget/day:   {result_budget.allowed} results "
+        f"x ${per_result:g} = ${result_budget.allowed * per_result:.3f}/day"
+    )
+    print(f"  {result_budget.reason}")
+    if result_budget.blocked:
+        print("WARNING: no paid results affordable today; the scrape will buy nothing")
+        return 1
     if len(queries) > budget:
         print(
             f"WARNING: {len(queries)} planned queries cannot fit a budget of "

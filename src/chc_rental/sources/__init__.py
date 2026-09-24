@@ -26,7 +26,10 @@ def enabled_cache_sources(settings: Settings) -> list[str]:
 
 
 def configured_adapters(
-    settings: Settings, *, env_path: str = ".env"
+    settings: Settings,
+    *,
+    env_path: str = ".env",
+    results_limit_override: int | None = None,
 ) -> tuple[list[SourceAdapter], list[str]]:
     """Build every enabled adapter without ever returning source credentials.
 
@@ -34,6 +37,12 @@ def configured_adapters(
     (missing token, zero budget). Those warnings make the fetch pool
     "incomplete", which suppresses dishonest "nothing matched" notices. A
     healthy enabled Zillow yields no warnings, so no-results notices flow.
+
+    ``results_limit_override`` is the spend gate's answer for today (see
+    ``chc_rental.cost``). Because the actor bills per RESULT, this — not the
+    request ledger — is what bounds the bill. None keeps the configured limit,
+    which is what every non-scrape caller (TUI status, diagnostics) wants,
+    since none of them should make a network call to price a run.
     """
     adapters: list[SourceAdapter] = []
     warnings: list[str] = []
@@ -53,14 +62,29 @@ def configured_adapters(
         warnings.append("Zillow is enabled but disabled by its zero request budget")
     elif settings.zillow_results_limit <= 0:
         warnings.append("Zillow is enabled but zillow_results_limit is zero")
+    elif results_limit_override is not None and results_limit_override <= 0:
+        warnings.append(
+            "Zillow is enabled but today's result budget allows no paid results"
+        )
     else:
+        limit = (
+            settings.zillow_results_limit
+            if results_limit_override is None
+            else min(settings.zillow_results_limit, results_limit_override)
+        )
         adapters.append(
             ZillowRentalAdapter(
                 token=token,
                 actor=settings.zillow_actor,
-                results_limit=settings.zillow_results_limit,
+                results_limit=limit,
                 timeout=float(settings.zillow_timeout_seconds),
-                max_charge_usd=settings.zillow_max_charge_usd,
+                # Per-run belt to the budget's braces: even a runaway actor
+                # cannot bill past what this run was authorised to buy.
+                max_charge_usd=min(
+                    settings.zillow_max_charge_usd,
+                    limit * settings.zillow_price_per_result_usd * 1.5,
+                ),
+                days_on_zillow=settings.zillow_days_on_zillow,
             )
         )
 

@@ -24,6 +24,11 @@ DEFAULT_LISTING_CAP = 25
 SCHEMA_VERSION = 1
 ALERT_CONFIG_SCHEMA_VERSION = 2
 
+# Day windows Zillow's "days on Zillow" filter actually accepts. Anything else
+# is not an error on their side — the filter is silently dropped, which widens
+# the result window and the per-result bill without saying so.
+_ZILLOW_DAYS_ON_ZILLOW_CHOICES = frozenset({1, 7, 14, 30, 90})
+
 
 def _validate_delivery_time(value: str) -> str:
     if not _DELIVERY_TIME_RE.match(value):
@@ -417,6 +422,28 @@ class Settings(BaseModel):
     zillow_results_limit: int = 25
     zillow_timeout_seconds: int = 300
     zillow_max_charge_usd: float = 0.25
+    # The actor bills PER RESULT (PAY_PER_EVENT / apify-default-dataset-item),
+    # not per run. The daily request ledger therefore does not measure spend at
+    # all: one "request" cost anywhere from $0.012 to $0.138 depending on how
+    # many rows came back. These three settings are the meter that does.
+    #
+    # Price is the FREE-plan tier rate confirmed against billed runs on
+    # 2026-08-29 (25 results billed exactly $0.0575). Paid plans are cheaper
+    # per result (BRONZE $0.002, SILVER $0.0017); update this when the plan
+    # changes or the gate will simply under-spend, which is the safe direction.
+    zillow_price_per_result_usd: float = 0.0023
+    # Share of the Apify monthly cap this project may consume. The remainder is
+    # untouched headroom: reaching the real cap returns HTTP 403
+    # platform-feature-disabled on EVERY run and stops the product outright.
+    zillow_budget_target_share: float = 0.85
+    # Below this many affordable results, buy nothing: a handful of rows is not
+    # worth a run, and stopping early leaves the reserve intact.
+    zillow_min_results_floor: int = 10
+    # Zillow's "days on Zillow" filter. None leaves the window unbounded, which
+    # is right while backfilling a pool this project has never fully seen. Once
+    # caught up, bounding it to the last N days is what stops a large
+    # resultsLimit from re-buying listings the seen ledger already holds.
+    zillow_days_on_zillow: Optional[int] = None
     live_push_enabled: bool = False
     # The incremental path is additive and inert until this independent global
     # gate is enabled after shadow-mode verification.
@@ -474,6 +501,7 @@ class Settings(BaseModel):
         "zillow_incremental_interval_minutes",
         "zillow_results_limit",
         "zillow_timeout_seconds",
+        "zillow_min_results_floor",
     )
     @classmethod
     def must_be_non_negative_int(cls, value: int) -> int:
@@ -549,6 +577,42 @@ class Settings(BaseModel):
     def zillow_charge_cap_must_be_non_negative(cls, value: float) -> float:
         if value < 0:
             raise ValueError("zillow_max_charge_usd must not be negative")
+        return value
+
+    @field_validator("zillow_price_per_result_usd")
+    @classmethod
+    def zillow_result_price_must_be_positive(cls, value: float) -> float:
+        # Zero or negative would make the affordable-result count infinite and
+        # turn the spend gate into a no-op, which is the one thing it exists to
+        # prevent.
+        if value <= 0:
+            raise ValueError("zillow_price_per_result_usd must be greater than zero")
+        return value
+
+    @field_validator("zillow_budget_target_share")
+    @classmethod
+    def zillow_target_share_must_be_a_fraction(cls, value: float) -> float:
+        if not 0 < value <= 1:
+            raise ValueError("zillow_budget_target_share must be within (0, 1]")
+        return value
+
+    @field_validator("zillow_days_on_zillow")
+    @classmethod
+    def zillow_days_on_zillow_must_be_supported(
+        cls, value: Optional[int]
+    ) -> Optional[int]:
+        """Zillow accepts only a fixed set of day windows for this filter.
+
+        An unsupported number is not rejected by Zillow — the filter is simply
+        dropped, silently widening the window and the bill. Fail here instead.
+        """
+        if value is None:
+            return value
+        if value not in _ZILLOW_DAYS_ON_ZILLOW_CHOICES:
+            raise ValueError(
+                "zillow_days_on_zillow must be one of "
+                f"{sorted(_ZILLOW_DAYS_ON_ZILLOW_CHOICES)} or null"
+            )
         return value
 
     def source_request_budget(self, source: str) -> int:

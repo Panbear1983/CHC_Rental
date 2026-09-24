@@ -3,8 +3,16 @@
 This adapter never talks to Zillow directly. It submits one rental search URL
 for one ``(city, state)`` query to a pinned managed actor and maps the returned
 search cards into CHC_Rental's canonical listing shape. One ``fetch_page`` call
-is one actor run and therefore one locally metered request; the actor returns a
-bounded batch, so ``has_more`` is always false.
+is one actor run; the actor returns a bounded batch, so ``has_more`` is always
+false.
+
+The run is started ASYNCHRONOUSLY and polled, rather than held open on
+``run-sync-get-dataset-items``. The sync endpoint keeps one HTTP connection
+open for the whole run, and when that connection dropped the retry bought a
+SECOND run while the first went on to finish and bill anyway: 2026-08-23 and
+2026-08-28 each show two billed 25-result runs for one day's data. The actor
+bills per result, so that mistake scales with ``results_limit``. Polling costs
+nothing and a dropped poll simply polls again.
 
 The integration is opt-in in ``Settings.zillow_enabled``. Merely placing an
 Apify token in ``.env`` cannot activate it.
@@ -14,6 +22,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -23,14 +32,12 @@ from typing import Any, Callable, Optional
 
 from chc_rental.envfile import read_env_key
 from chc_rental.net import ssl_context
+from chc_rental.sources.apify import ApifyClient
 from chc_rental.sources.base import (
-    SourceAuthError,
     SourceQuery,
-    SourceRateLimitError,
     SourceUnavailableError,
 )
 
-APIFY_RUN_URL = "https://api.apify.com/v2/acts/{actor}/run-sync-get-dataset-items"
 NOMINATIM_SEARCH_URL = "https://nominatim.openstreetmap.org/search"
 ZILLOW = "https://www.zillow.com"
 SOURCE_NAME = "zillow"
@@ -41,6 +48,11 @@ _RENTAL_STATUSES = {
     "FOR_RENT_BY_AGENT",
     "FOR_RENT_BY_OWNER",
 }
+
+# Same set, underscores/spaces stripped, so both the older ``statusType``
+# shape (``FOR_RENT``) and the newer ``listingStatus`` shape (``forRent``)
+# match without keeping two literal tables in sync by hand.
+_RENTAL_STATUSES_NORMALIZED = {s.replace("_", "").replace(" ", "") for s in _RENTAL_STATUSES}
 
 _PROPERTY_TYPES = {
     "APARTMENT": "apartment",
@@ -73,7 +85,10 @@ def load_apify_token(env_path: str = ".env") -> Optional[str]:
 
 
 def rental_search_url(
-    query: SourceQuery, *, map_bounds: Optional[dict[str, float]] = None
+    query: SourceQuery,
+    *,
+    map_bounds: Optional[dict[str, float]] = None,
+    days_on_zillow: Optional[int] = None,
 ) -> str:
     """Build one stable, rental-only Zillow search URL for the actor.
 
@@ -95,12 +110,28 @@ def rental_search_url(
         "auc": {"value": False},
     }
     if query.price_min is not None or query.price_max is not None:
-        price: dict[str, int] = {}
+        # RENT goes in `mp` (monthly payment), NOT `price`. On a /rentals/ URL
+        # Zillow reads `price` as the for-sale HOME VALUE band and ignores it,
+        # so a rent envelope sent as `price` never reaches the search at all.
+        #
+        # Measured 2026-08-29, same city/moment/sort, 10 results each:
+        #   price -> 4/7 priced results inside a $5,000-$10,000 envelope (57%),
+        #            leaking $3,970 / $4,500 / $4,695
+        #   mp    -> 7/7 (100%), floor exactly $5,000
+        # The `mp` run also surfaced $8,000 and $9,000 listings the `price` run
+        # never reached: the slots wasted on sub-envelope rents were clipping
+        # real candidates off the end of a newest-first window.
+        #
+        # `price` is deliberately NOT also sent. It is not harmlessly ignored in
+        # every case: were Zillow to honor it as home value on a rentals URL, a
+        # $5,000-$10,000 home-value band would match nothing and the daily pool
+        # would silently go empty.
+        rent: dict[str, int] = {}
         if query.price_min is not None:
-            price["min"] = int(query.price_min)
+            rent["min"] = int(query.price_min)
         if query.price_max is not None:
-            price["max"] = int(query.price_max)
-        filter_state["price"] = price
+            rent["max"] = int(query.price_max)
+        filter_state["mp"] = rent
     if query.beds_min is not None or query.beds_max is not None:
         beds: dict[str, int] = {}
         if query.beds_min is not None:
@@ -117,6 +148,15 @@ def rental_search_url(
         selected = set(query.property_types)
         for property_type, filter_name in _QUERY_TYPE_FILTERS.items():
             filter_state[filter_name] = {"value": property_type in selected}
+    if days_on_zillow is not None:
+        # Bounds the window by RECENCY instead of by our own resultsLimit. Under
+        # per-result billing that is what stops a large limit from re-buying
+        # listings the seen ledger already holds: if only twelve in-band rentals
+        # were listed in the window, the run returns twelve and bills for twelve.
+        # INTEGER, not a string. Verified against the actor 2026-08-29:
+        # {"value": 1} is accepted and filters; {"value": "1"} makes the actor
+        # reject the whole URL with "No valid search URLs found on input".
+        filter_state["doz"] = {"value": int(days_on_zillow)}
     state = {
         "usersSearchTerm": f"{query.city}, {query.state}",
         "filterState": filter_state,
@@ -212,16 +252,34 @@ class ZillowRentalAdapter:
     results_limit: int = 25
     timeout: float = 300.0
     max_charge_usd: float = 0.25
+    days_on_zillow: Optional[int] = None
     bounds_resolver: Callable[[SourceQuery], dict[str, float]] = field(
         default=resolve_map_bounds, repr=False
     )
+    client: Optional[ApifyClient] = field(default=None, repr=False)
+    poll_seconds: float = 5.0
+    sleeper: Callable[[float], Any] = field(default=time.sleep, repr=False)
 
     name = SOURCE_NAME
+
+    def __post_init__(self) -> None:
+        if self.client is None:
+            # Poll requests are short; the long wait is the run itself, which
+            # this adapter times out on its own terms below.
+            self.client = ApifyClient(token=self.token, timeout=min(self.timeout, 60.0))
 
     def actor_input(self, query: SourceQuery) -> dict[str, Any]:
         map_bounds = self.bounds_resolver(query)
         return {
-            "searchUrls": [{"url": rental_search_url(query, map_bounds=map_bounds)}],
+            "searchUrls": [
+                {
+                    "url": rental_search_url(
+                        query,
+                        map_bounds=map_bounds,
+                        days_on_zillow=self.days_on_zillow,
+                    )
+                }
+            ],
             "extractionMethod": "PAGINATION_WITH_ZOOM_IN",
             "resultsLimit": self.results_limit,
         }
@@ -237,51 +295,44 @@ class ZillowRentalAdapter:
     def fetch_page(
         self, query: SourceQuery, *, offset: int
     ) -> tuple[list[dict[str, Any]], bool]:
+        """Start one actor run, wait for it, and map its dataset.
+
+        ``ApifyClient`` already raises the shared taxonomy (auth / rate limit /
+        unavailable), so the fetch loop reacts to an Apify failure here exactly
+        as it does to any other source.
+        """
         if offset != 0:
             return [], False
-        payload = self.actor_input(query)
-        actor = urllib.parse.quote(self.actor, safe="~")
-        params = {"token": self.token}
-        if self.max_charge_usd > 0:
-            params["maxTotalChargeUsd"] = f"{self.max_charge_usd:g}"
-        url = APIFY_RUN_URL.format(actor=actor) + "?" + urllib.parse.urlencode(params)
-        request = urllib.request.Request(
-            url,
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Accept": "application/json", "Content-Type": "application/json"},
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(
-                request, timeout=self.timeout, context=ssl_context()
-            ) as response:
-                body = json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            detail = _error_detail(exc)
-            if exc.code in (401, 403):
-                raise SourceAuthError(
-                    f"apify rejected the Zillow source token (HTTP {exc.code}{detail})"
-                ) from None
-            if exc.code == 429:
-                raise SourceRateLimitError(
-                    "apify Zillow source rate limit (HTTP 429)",
-                    retry_after=_parse_retry_after(exc.headers.get("Retry-After")),
-                ) from None
-            raise SourceUnavailableError(
-                f"apify Zillow source HTTP {exc.code}{detail}"
-            ) from None
-        except urllib.error.URLError as exc:
-            raise SourceUnavailableError(
-                f"apify Zillow source unreachable: {exc.reason}"
-            ) from None
-        except (OSError, ValueError) as exc:
-            raise SourceUnavailableError(
-                f"apify Zillow source bad response: {type(exc).__name__}"
-            ) from None
 
-        if not isinstance(body, list):
-            raise SourceUnavailableError("apify Zillow source returned a non-list payload")
-        return self.normalize_dataset(body), False
+        state = self.client.start_actor(
+            self.actor,
+            self.actor_input(query),
+            max_total_charge_usd=self.max_charge_usd if self.max_charge_usd > 0 else None,
+        )
+        waited = 0.0
+        while not state.terminal and waited < self.timeout:
+            self.sleeper(self.poll_seconds)
+            waited += self.poll_seconds
+            state = self.client.get_run(state.run_id)
+
+        if not state.terminal:
+            # Abandon the WAIT, not the run. It keeps going on Apify and will
+            # bill for what it collects either way; re-buying it would just pay
+            # twice for the same listings.
+            raise SourceUnavailableError(
+                f"apify Zillow run {state.run_id} still {state.status} "
+                f"after {waited:g}s"
+            )
+        if not state.succeeded:
+            detail = state.status_message or "no detail given"
+            raise SourceUnavailableError(
+                f"apify Zillow run {state.run_id} {state.status}: {detail}"
+            )
+        if not state.default_dataset_id:
+            raise SourceUnavailableError(
+                f"apify Zillow run {state.run_id} succeeded with no dataset"
+            )
+        return self.normalize_dataset(self.client.get_dataset(state.default_dataset_id)), False
 
     @staticmethod
     def _is_rental(item: dict[str, Any]) -> bool:
@@ -290,41 +341,62 @@ class ZillowRentalAdapter:
         # control record into an empty listing.
         if item.get("error"):
             return False
-        # Building-summary cards contain ranges such as ``1 bed, $3,000+`` but
-        # no unit-level baths or stable unit URL. They cannot satisfy CHC's
-        # exact rental schema without inventing data, so leave them out.
+        # Building-summary cards contain per-bedroom price RANGES (a ``units``
+        # list, e.g. ``{"beds": "1", "price": "$3,100+"}``) instead of one price
+        # and bed count for one unit, and no unit-level baths or stable
+        # unit-detail URL. They cannot satisfy CHC's exact rental schema
+        # without inventing data, so leave them out. The actor has shipped two
+        # shapes for this: an older ``isBuilding: true`` flag, and a newer one
+        # (seen starting 2026-09-02) with no flag at all, identified instead by
+        # a non-empty ``units`` array and a ``/b/`` (not ``/homedetails/``)
+        # ``propertyUrl``.
         if item.get("isBuilding") is True:
             return False
+        if isinstance(item.get("units"), list) and item["units"]:
+            return False
         home = _home_info(item)
+        address_info = _address_info(item)
         if not any(
             (
                 item.get("zpid"),
                 item.get("id"),
                 item.get("detailUrl"),
+                item.get("propertyUrl"),
                 item.get("addressStreet"),
                 item.get("address"),
+                address_info.get("street"),
                 home.get("zpid"),
                 home.get("streetAddress"),
             )
         ):
             return False
-        raw = item.get("statusType") or home.get("homeStatus")
+        raw = item.get("statusType") or item.get("listingStatus") or home.get("homeStatus")
         # The actor sometimes omits status on cards produced by a rental-only
         # URL. Reject only an explicit non-rental value; absence is validated by
         # the URL contract and the canonical required fields downstream.
-        return raw is None or str(raw).strip().upper() in _RENTAL_STATUSES
+        # Compared with underscores/spaces stripped so both the older
+        # ``FOR_RENT`` shape and the newer camelCase ``forRent`` shape match the
+        # same table without needing two copies of it.
+        return raw is None or _normalize_status(raw) in _RENTAL_STATUSES_NORMALIZED
 
     def _canonical(self, item: dict[str, Any]) -> dict[str, Any]:
         home = _home_info(item)
+        address_info = _address_info(item)
+        price_info = item.get("listingPrice")
+        if not isinstance(price_info, dict):
+            price_info = {}
         address = (
             item.get("addressStreet")
             or home.get("streetAddress")
             or item.get("address")
+            or address_info.get("street")
             or ""
         )
-        explicit_unit = item.get("unit") or home.get("unit")
+        explicit_unit = item.get("unit") or home.get("unit") or address_info.get("unit")
         address, unit = _address_and_unit(str(address), explicit_unit)
-        detail = str(item.get("detailUrl") or home.get("hdpUrl") or "")
+        detail = str(
+            item.get("detailUrl") or home.get("hdpUrl") or item.get("propertyUrl") or ""
+        )
         if detail.startswith("/"):
             detail = ZILLOW + detail
         home_type = item.get("homeType") or home.get("homeType")
@@ -336,21 +408,35 @@ class ZillowRentalAdapter:
             "url": detail,
             "address": address,
             "unit": unit,
-            "city": item.get("addressCity") or home.get("city"),
-            "state": item.get("addressState") or home.get("state"),
-            "postal_code": _text(item.get("addressZipcode") or home.get("zipcode")),
+            "city": item.get("addressCity") or home.get("city") or address_info.get("city"),
+            "state": item.get("addressState") or home.get("state") or address_info.get("state"),
+            "postal_code": _text(
+                item.get("addressZipcode") or home.get("zipcode") or address_info.get("zipCode")
+            ),
             "district": None,
-            "price": _whole_number(item.get("unformattedPrice") or home.get("price")),
+            "price": _whole_number(
+                item.get("unformattedPrice") or home.get("price") or price_info.get("amount")
+            ),
             "property_type": _PROPERTY_TYPES.get(
                 str(home_type or "").upper(), "other"
             ),
             "beds": _beds(
-                item.get("beds") if item.get("beds") is not None else home.get("bedrooms")
+                item.get("beds")
+                if item.get("beds") is not None
+                else item.get("bedrooms")
+                if item.get("bedrooms") is not None
+                else home.get("bedrooms")
             ),
             "baths": _number(
-                item.get("baths") if item.get("baths") is not None else home.get("bathrooms")
+                item.get("baths")
+                if item.get("baths") is not None
+                else item.get("bathrooms")
+                if item.get("bathrooms") is not None
+                else home.get("bathrooms")
             ),
-            "sqft": _whole_number(item.get("area") or home.get("livingArea")),
+            "sqft": _whole_number(
+                item.get("area") or item.get("livingArea") or home.get("livingArea")
+            ),
             "features": [],
             "first_seen_at": item.get("datePostedString") or home.get("datePostedString"),
         }
@@ -362,6 +448,15 @@ def _home_info(item: dict[str, Any]) -> dict[str, Any]:
         return {}
     home = hdp.get("homeInfo")
     return home if isinstance(home, dict) else {}
+
+
+def _address_info(item: dict[str, Any]) -> dict[str, Any]:
+    address = item.get("listingAddress")
+    return address if isinstance(address, dict) else {}
+
+
+def _normalize_status(raw: Any) -> str:
+    return str(raw).strip().upper().replace("_", "").replace(" ", "")
 
 
 def _address_and_unit(address: str, explicit_unit: Any) -> tuple[str, Optional[str]]:
@@ -403,15 +498,6 @@ def _beds(value: Any) -> Any:
     if isinstance(value, str) and value.strip().lower() == "studio":
         return 0
     return _whole_number(value)
-
-
-def _error_detail(exc: urllib.error.HTTPError) -> str:
-    try:
-        body = json.loads(exc.read().decode("utf-8"))
-        message = body.get("error") or body.get("message")
-        return f": {str(message)[:200]}" if message else ""
-    except Exception:
-        return ""
 
 
 def _parse_retry_after(raw: Optional[str]) -> Optional[float]:

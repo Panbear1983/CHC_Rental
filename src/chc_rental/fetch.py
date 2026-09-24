@@ -60,6 +60,14 @@ MAX_RATE_LIMIT_WAIT = 30.0  # seconds; an unattended source run must not stall l
 # bed/bath filtering) if a city's newest listings don't fit in this slice.
 MAX_PAGES_PER_QUERY = 5
 
+# Share of IN-CITY priced results allowed outside their rent/bed envelope before
+# the run warns. A correctly applied source filter leaves only Zillow's own
+# rounding and range cards outside, well under this; anything above it means the
+# filter is not reaching the search and paid slots are being spent on listings
+# no watcher asked for. Out-of-city results are deliberately NOT counted here —
+# see _envelope_audit.
+ENVELOPE_MISS_ALERT_SHARE = 0.20
+
 
 @dataclass
 class FetchReport:
@@ -152,6 +160,69 @@ def _query_scope(queries: Iterable[SourceQuery]) -> list[dict[str, str]]:
         ),
         key=lambda item: (item["city"], item["state"]),
     )
+
+
+def _envelope_audit(
+    queries: Iterable[SourceQuery], records: Iterable[Any]
+) -> dict[str, int]:
+    """Split paid results into the two DIFFERENT ways a slot gets wasted.
+
+    ``outside_filters`` — the record's city was asked for, but its rent or bed
+    count was not. This is the regression signal: a source-side filter that
+    stops applying produces no error anywhere, local matching just rejects more
+    quietly, and the only symptom is fewer pushes. That is how the rent
+    envelope went unapplied from the first Zillow run through 2026-08-28,
+    spending 64% of every paid result on listings outside the band.
+
+    ``outside_city`` — the record is in a city nobody watches. This is
+    STRUCTURAL, not a regression: the actor needs a rectangular map bound, and
+    Nominatim's rectangle for Brooklyn also covers Lower Manhattan, part of
+    Jersey City and western Queens. Measured 2026-08-29, it is ~27% of a run.
+
+    They are counted apart on purpose. Folded together, the known structural
+    27% sits permanently above any sane threshold and drowns the regression
+    signal the warning exists to carry.
+    """
+    planned = list(queries)
+    audit = {"comparable": 0, "outside_city": 0, "outside_filters": 0}
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        price = record.get("price")
+        if not isinstance(price, int) or isinstance(price, bool):
+            continue
+        audit["comparable"] += 1
+        in_scope = [query for query in planned if _matches_place(record, query)]
+        if not in_scope:
+            audit["outside_city"] += 1
+        elif not any(_within_filters(record, query) for query in in_scope):
+            audit["outside_filters"] += 1
+    return audit
+
+
+def _matches_place(record: dict[str, Any], query: SourceQuery) -> bool:
+    """City and state agreement, the same way ``matching.py`` decides it."""
+    return (
+        str(record.get("city") or "").strip().casefold()
+        == query.city.strip().casefold()
+        and str(record.get("state") or "").strip().upper() == query.state.strip().upper()
+    )
+
+
+def _within_filters(record: dict[str, Any], query: SourceQuery) -> bool:
+    """Rent and bed agreement for a record already known to be in-city."""
+    price = record.get("price")
+    if query.price_min is not None and price < query.price_min:
+        return False
+    if query.price_max is not None and price > query.price_max:
+        return False
+    beds = record.get("beds")
+    if isinstance(beds, int) and not isinstance(beds, bool):
+        if query.beds_min is not None and beds < query.beds_min:
+            return False
+        if query.beds_max is not None and beds > query.beds_max:
+            return False
+    return True
 
 
 def _cache_matches_scrape_day(
@@ -344,6 +415,15 @@ def fetch_daily(
 
     report.fetched = True
     report.records = records
+    audit = _envelope_audit(queries, records)
+    comparable = audit["comparable"]
+    miss_share = (audit["outside_filters"] / comparable) if comparable else None
+    if miss_share is not None and miss_share > ENVELOPE_MISS_ALERT_SHARE:
+        report.warnings.append(
+            f"{audit['outside_filters']}/{comparable} priced results ({miss_share:.0%}) "
+            "were in a watched city but outside its rent/bed envelope; the "
+            "source-side filter may not be applying"
+        )
     if report.requests_used > 0:
         # Cache whatever the sweep produced — even partial. A partial sweep
         # means budget or source trouble, and re-fetching the same pages every
@@ -359,6 +439,8 @@ def fetch_daily(
                 "scraped_at_utc": now_utc.astimezone(timezone.utc).isoformat(),
                 "queries_planned": report.queries_planned,
                 "queries_completed": report.queries_completed,
+                "envelope_miss_share": miss_share,
+                "envelope_audit": audit,
                 "truncated": report.truncated,
                 "errors": report.errors,
                 "warnings": report.warnings,

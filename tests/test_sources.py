@@ -40,6 +40,7 @@ from chc_rental.sources.zillow import (
 )
 
 from tests.conftest import make_person, make_search
+from tests.test_apify_run_lifecycle import FakeClient
 
 # 12:00 UTC = 08:00 America/New_York in January — exactly the default scrape time.
 FETCH_NOW = datetime(2026, 1, 15, 13, 5, tzinfo=timezone.utc)
@@ -58,6 +59,31 @@ RAW_ZILLOW_RENTAL = {
     "baths": 1.5,
     "area": 900,
     "homeType": "APARTMENT",
+}
+
+# The actor switched to this shape on 2026-09-02 with no announcement: address
+# and price moved into nested objects, beds/baths gained full-word field
+# names, the detail link moved to `propertyUrl`, and status became camelCase
+# (`forRent` instead of `FOR_RENT`). The old shape above kept validating fine
+# against the adapter's own field names while every real run silently mapped
+# to blanks, so both shapes are pinned here.
+RAW_ZILLOW_RENTAL_NEW_SCHEMA = {
+    "zpid": "2066340055",
+    "propertyUrl": "https://www.zillow.com/homedetails/6631-Duryea-Ct-2F-Brooklyn-NY-11219/2066340055_zpid/",
+    "listingStatus": "forRent",
+    "listingAddress": {
+        "street": "6631 Duryea Ct #2F",
+        "unit": "# 2F",
+        "city": "Brooklyn",
+        "state": "NY",
+        "zipCode": "11219",
+        "full": "6631 Duryea Ct #2F, Brooklyn, NY 11219",
+    },
+    "listingPrice": {"amount": 2850, "currency": "USD", "formatted": "$2,850/mo"},
+    "homeType": "APARTMENT",
+    "bedrooms": 2,
+    "bathrooms": 2,
+    "livingArea": 1200,
 }
 
 FIXTURE_ROOT = Path(__file__).parent / "fixtures" / "sources"
@@ -326,12 +352,32 @@ def test_incremental_zillow_url_pushes_supported_filters_to_the_actor():
         urllib.parse.urlparse(rental_search_url(query)).query
     )["searchQueryState"][0]
     filters = json.loads(encoded)["filterState"]
-    assert filters["price"] == {"min": 1500, "max": 3000}
+    assert filters["mp"] == {"min": 1500, "max": 3000}
     assert filters["beds"] == {"min": 2, "max": 3}
     assert filters["baths"] == {"min": 1.5}
     assert filters["isApartment"] == {"value": True}
     assert filters["isCondo"] == {"value": True}
     assert filters["isSingleFamily"] == {"value": False}
+
+
+def test_rent_envelope_uses_mp_and_never_the_sale_price_filter():
+    """Rent must be sent as `mp`; `price` is Zillow's for-sale home-value band.
+
+    Sending the rent envelope as `price` on a /rentals/ URL is silently ignored,
+    which is how 64% of every paid result slot went to listings outside the
+    envelope through 2026-08-28. Re-adding `price` is worse than a no-op: if
+    Zillow honored it as home value, a $5k-$10k band would match no property at
+    all and the daily pool would go quietly empty rather than loudly fail.
+    """
+    import urllib.parse
+
+    query = SourceQuery("Brooklyn", "NY", price_min=5000, price_max=10000)
+    encoded = urllib.parse.parse_qs(
+        urllib.parse.urlparse(rental_search_url(query)).query
+    )["searchQueryState"][0]
+    filters = json.loads(encoded)["filterState"]
+    assert filters["mp"] == {"min": 5000, "max": 10000}
+    assert "price" not in filters
 
 
 def test_bounds_are_geocoded_once_per_city_not_once_per_query(monkeypatch):
@@ -411,6 +457,45 @@ def test_zillow_rental_maps_to_a_valid_canonical_listing():
     assert listing.url.startswith("https://www.zillow.com/homedetails/")
 
 
+def test_zillow_rental_new_schema_maps_to_a_valid_canonical_listing():
+    """Pins the 2026-09-02 actor schema switch.
+
+    Verified live against the actor on 2026-09-07: `_is_rental` accepted every
+    result on both old and new field names, but `_canonical` only knew the old
+    ones, so every real listing mapped to blanks and failed `Listing`
+    validation. Five straight days of zero deliveries, all silently paid for.
+    """
+    adapter = ZillowRentalAdapter(token="secret")
+    assert adapter._is_rental(RAW_ZILLOW_RENTAL_NEW_SCHEMA) is True
+    listing = Listing.model_validate(adapter._canonical(RAW_ZILLOW_RENTAL_NEW_SCHEMA))
+    assert listing.source == "zillow"
+    assert listing.source_listing_id == "2066340055"
+    assert listing.address == "6631 Duryea Ct" and listing.unit == "# 2F"
+    assert listing.city == "Brooklyn" and listing.state == "NY"
+    assert listing.postal_code == "11219"
+    assert listing.price == 2850 and listing.property_type.value == "apartment"
+    assert listing.beds == 2 and listing.baths == 2 and listing.sqft == 1200
+    assert listing.url.startswith("https://www.zillow.com/homedetails/")
+
+
+def test_zillow_adapter_drops_new_schema_building_summary_without_isbuilding_flag():
+    """The new building-card shape carries no `isBuilding` flag at all — only a
+    non-empty `units` price-range list and a `/b/` (not `/homedetails/`)
+    `propertyUrl`. Must still be excluded, same as the old-shape card below.
+    """
+    building = {
+        "zpid": "40.65784--73.95526",
+        "listingStatus": "forRent",
+        "propertyUrl": "https://www.zillow.com/b/151-hawthorne-st-brooklyn-ny-97cvPT/",
+        "listingAddress": {"street": "151 Hawthorne St", "city": "Brooklyn", "state": "NY"},
+        "units": [{"price": "$3,000+", "beds": "0", "roomForRent": False}],
+    }
+    records, _ = zillow_adapter(FakeClient(raw=[building])).fetch_page(
+        SourceQuery("Brooklyn", "NY"), offset=0
+    )
+    assert records == []
+
+
 def test_checked_in_zillow_unit_fixture_matches_the_source_contract():
     adapter = ZillowRentalAdapter(token="secret")
     raw = source_fixture("zillow", "unit-rental.json")
@@ -439,65 +524,44 @@ def test_checked_in_malformed_zillow_fixture_is_rejected_not_fabricated():
     assert "address" in message and "price" in message
 
 
-def test_zillow_adapter_filters_an_explicit_sale_record(monkeypatch):
-    class FakeResponse(io.BytesIO):
-        def __enter__(self):
-            return self
+BOUNDS_AUSTIN = {"west": -98.0, "east": -97.0, "south": 30.0, "north": 31.0}
 
-        def __exit__(self, *args):
-            return False
 
-    payload = json.dumps([RAW_ZILLOW_RENTAL, dict(RAW_ZILLOW_RENTAL, statusType="FOR_SALE")])
-    import chc_rental.sources.zillow as mod
+def zillow_adapter(client, **overrides):
+    """Adapter wired to a fake Apify client and a no-op sleeper.
 
-    monkeypatch.setattr(
-        mod.urllib.request,
-        "urlopen",
-        lambda request, timeout, context: FakeResponse(payload.encode("utf-8")),
+    Every adapter test MUST pass a client. Without one the adapter builds a real
+    ApifyClient and the run reaches api.apify.com for real — which is exactly
+    what these tests started doing when the adapter moved off the monkeypatched
+    sync endpoint.
+    """
+    return ZillowRentalAdapter(
+        token="secret",
+        bounds_resolver=lambda query: BOUNDS_AUSTIN,
+        client=client,
+        sleeper=lambda seconds: None,
+        **overrides,
     )
-    records, has_more = ZillowRentalAdapter(
-        token="secret", bounds_resolver=lambda query: {
-            "west": -98.0, "east": -97.0, "south": 30.0, "north": 31.0
-        }
-    ).fetch_page(
+
+
+def test_zillow_adapter_filters_an_explicit_sale_record():
+    client = FakeClient(raw=[RAW_ZILLOW_RENTAL, dict(RAW_ZILLOW_RENTAL, statusType="FOR_SALE")])
+    records, has_more = zillow_adapter(client).fetch_page(
         SourceQuery("Austin", "TX"), offset=0
     )
     assert len(records) == 1 and records[0]["source"] == "zillow"
     assert has_more is False
 
 
-def test_zillow_adapter_drops_actor_no_results_control_item(monkeypatch):
-    class FakeResponse(io.BytesIO):
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *args):
-            return False
-
-    import chc_rental.sources.zillow as mod
-
-    monkeypatch.setattr(
-        mod.urllib.request,
-        "urlopen",
-        lambda request, timeout, context: FakeResponse(b'[{"error":"No results found."}]'),
+def test_zillow_adapter_drops_actor_no_results_control_item():
+    client = FakeClient(raw=[{"error": "No results found."}])
+    records, has_more = zillow_adapter(client).fetch_page(
+        SourceQuery("Austin", "TX"), offset=0
     )
-    adapter = ZillowRentalAdapter(
-        token="secret", bounds_resolver=lambda query: {
-            "west": -98.0, "east": -97.0, "south": 30.0, "north": 31.0
-        }
-    )
-    records, has_more = adapter.fetch_page(SourceQuery("Austin", "TX"), offset=0)
     assert records == [] and has_more is False
 
 
-def test_zillow_adapter_drops_building_summary_without_unit_level_baths(monkeypatch):
-    class FakeResponse(io.BytesIO):
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *args):
-            return False
-
+def test_zillow_adapter_drops_building_summary_without_unit_level_baths():
     building = {
         "id": "building-1",
         "statusType": "FOR_RENT",
@@ -506,20 +570,78 @@ def test_zillow_adapter_drops_building_summary_without_unit_level_baths(monkeypa
         "detailUrl": "https://www.zillow.com/apartments/brooklyn-ny/example/",
         "units": [{"price": "$3,000+", "beds": "1"}],
     }
-    import chc_rental.sources.zillow as mod
-
-    monkeypatch.setattr(
-        mod.urllib.request,
-        "urlopen",
-        lambda request, timeout, context: FakeResponse(json.dumps([building]).encode()),
+    records, _ = zillow_adapter(FakeClient(raw=[building])).fetch_page(
+        SourceQuery("Brooklyn", "NY"), offset=0
     )
-    adapter = ZillowRentalAdapter(
-        token="secret", bounds_resolver=lambda query: {
-            "west": -74.1, "east": -73.8, "south": 40.5, "north": 40.8
-        }
-    )
-    records, _ = adapter.fetch_page(SourceQuery("Brooklyn", "NY"), offset=0)
     assert records == []
+
+
+def test_waiting_for_a_run_never_starts_a_second_one():
+    """The double-billing regression, pinned.
+
+    Holding the run open on run-sync-get-dataset-items meant a dropped
+    connection made the fetch loop buy a SECOND run while the first finished
+    and billed anyway: 2026-08-23 and 2026-08-28 each show two billed
+    25-result runs for one day's listings. Polling must never re-start.
+    """
+    client = FakeClient(start_status="RUNNING", poll_status="SUCCEEDED")
+    zillow_adapter(client).fetch_page(SourceQuery("Austin", "TX"), offset=0)
+    assert client.start_calls == 1, "polling a run must never start another paid run"
+    assert client.poll_calls >= 1
+
+
+def test_a_run_that_never_finishes_abandons_the_wait_not_the_run():
+    """Giving up on the wait must not buy the listings a second time."""
+    client = FakeClient(start_status="RUNNING", poll_status="RUNNING")
+    with pytest.raises(SourceUnavailableError, match="still RUNNING"):
+        zillow_adapter(client, timeout=10.0).fetch_page(
+            SourceQuery("Austin", "TX"), offset=0
+        )
+    assert client.start_calls == 1
+
+
+def test_a_failed_run_reports_the_actors_own_reason():
+    """The actor rejects a URL it cannot parse, and says why. Surfacing that
+    verbatim is what identified `doz` needing an integer value on 2026-08-29
+    ("No valid search URLs found on input")."""
+    client = FakeClient(start_status="RUNNING", poll_status="FAILED")
+    with pytest.raises(SourceUnavailableError, match="FAILED"):
+        zillow_adapter(client).fetch_page(SourceQuery("Austin", "TX"), offset=0)
+
+
+@pytest.mark.parametrize(
+    "error", [SourceAuthError("bad token"), SourceRateLimitError("slow down")]
+)
+def test_apify_client_errors_reach_the_fetch_loop_unchanged(error):
+    """The fetch loop reacts differently to each taxonomy member — auth aborts
+    the sweep, rate limit retries once — so the adapter must not flatten them."""
+
+    class Raising:
+        def start_actor(self, actor, payload, *, max_total_charge_usd):
+            raise error
+
+    with pytest.raises(type(error)):
+        zillow_adapter(Raising()).fetch_page(SourceQuery("Austin", "TX"), offset=0)
+
+
+def test_the_run_is_started_with_the_configured_charge_ceiling():
+    """Last line of defence on a per-result actor: even if the results limit is
+    somehow ignored, the run cannot bill past this."""
+
+    class Recording(FakeClient):
+        charge = None
+
+        def start_actor(self, actor, payload, *, max_total_charge_usd):
+            Recording.charge = max_total_charge_usd
+            return super().start_actor(actor, payload, max_total_charge_usd=max_total_charge_usd)
+
+    zillow_adapter(Recording()).fetch_page(SourceQuery("Austin", "TX"), offset=0)
+    assert Recording.charge == 0.25
+
+    zillow_adapter(Recording(), max_charge_usd=0.0).fetch_page(
+        SourceQuery("Austin", "TX"), offset=0
+    )
+    assert Recording.charge is None, "a zero ceiling means unset, not free"
 
 
 def test_zillow_token_never_appears_in_repr():
@@ -541,22 +663,6 @@ def test_explicit_zillow_enable_builds_the_adapter(tmp_path):
     )
     assert [adapter.name for adapter in adapters] == ["zillow"]
     assert warnings == []
-
-
-@pytest.mark.parametrize("code,expected", [(401, SourceAuthError), (429, SourceRateLimitError)])
-def test_zillow_http_errors_use_the_shared_taxonomy(monkeypatch, code, expected):
-    import chc_rental.sources.zillow as mod
-
-    def boom(request, timeout, context):
-        raise _http_error(code, {"Retry-After": "2"})
-
-    monkeypatch.setattr(mod.urllib.request, "urlopen", boom)
-    with pytest.raises(expected):
-        ZillowRentalAdapter(
-            token="secret", bounds_resolver=lambda query: {
-                "west": -98.0, "east": -97.0, "south": 30.0, "north": 31.0
-            }
-        ).fetch_page(SourceQuery("Austin", "TX"), offset=0)
 
 
 # --- fetch orchestration ----------------------------------------------------
@@ -950,3 +1056,83 @@ def test_delivery_cache_loader_never_needs_an_adapter(store):
     )
     report = load_daily_cached(store, "zillow", now_utc=now)
     assert report.from_cache is True and report.records == [rec(1)]
+
+
+def _priced(price, *, city="Austin", state="TX", beds=2):
+    return {"address": f"{price} Main St", "city": city, "state": state,
+            "price": price, "beds": beds}
+
+
+def test_in_city_results_outside_the_rent_envelope_are_counted_and_warned(store):
+    """A source filter that stops applying must not fail silently.
+
+    Nothing downstream errors when the provider ignores our filter — local
+    matching just rejects more listings, quietly, while every rejected record
+    was still paid for. This is the tripwire: the share is recorded on the run
+    and in the cache metadata, and crossing the threshold warns.
+    """
+    _store_with_search(store)  # envelope: Austin TX, $1,000-$3,000, 1-3 beds
+    adapter = FakeAdapter(
+        {("Austin", 0): ([_priced(1500), _priced(500), _priced(9000)], False)}
+    )
+    report = fetch_daily(store, adapter, now_utc=FETCH_NOW)
+
+    assert any("outside its rent/bed envelope" in w for w in report.warnings)
+    metadata = store.load_cache_metadata(FETCH_NOW.date(), "rentcast")
+    assert metadata["envelope_audit"] == {
+        "comparable": 3, "outside_city": 0, "outside_filters": 2,
+    }
+    assert metadata["envelope_miss_share"] == pytest.approx(2 / 3)
+
+
+def test_out_of_city_results_are_counted_apart_and_do_not_trip_the_warning(store):
+    """The actor needs a RECTANGULAR map bound and cities are not rectangles, so
+    a known share of every run is in a city nobody watches — 27% of a Brooklyn
+    run measured 2026-08-29 (Lower Manhattan, Jersey City, western Queens).
+
+    That is a standing cost, not a regression. Folded into the same number it
+    would sit permanently above the threshold and drown the signal the warning
+    exists to carry.
+    """
+    _store_with_search(store)
+    adapter = FakeAdapter(
+        {("Austin", 0): ([_priced(1500), _priced(2000, city="Round Rock")], False)}
+    )
+    report = fetch_daily(store, adapter, now_utc=FETCH_NOW)
+
+    assert not any("rent/bed envelope" in w for w in report.warnings)
+    metadata = store.load_cache_metadata(FETCH_NOW.date(), "rentcast")
+    assert metadata["envelope_audit"] == {
+        "comparable": 2, "outside_city": 1, "outside_filters": 0,
+    }
+
+
+def test_a_correctly_filtered_pool_raises_no_envelope_warning(store):
+    _store_with_search(store)
+    adapter = FakeAdapter(
+        {("Austin", 0): ([_priced(1500), _priced(2000), _priced(2900)], False)}
+    )
+    report = fetch_daily(store, adapter, now_utc=FETCH_NOW)
+
+    assert not any("rent/bed envelope" in w for w in report.warnings)
+    metadata = store.load_cache_metadata(FETCH_NOW.date(), "rentcast")
+    assert metadata["envelope_miss_share"] == 0.0
+
+
+def test_unpriced_results_are_excluded_from_the_envelope_measure(store):
+    """Building cards and error markers carry no rent; they are a separate leak.
+
+    Counting them as envelope misses would blame the price filter for records
+    it never had a chance to exclude, and mask a real filter regression behind
+    a number that never drops.
+    """
+    _store_with_search(store)
+    adapter = FakeAdapter(
+        {("Austin", 0): ([_priced(1500), {"address": "No price St"}], False)}
+    )
+    fetch_daily(store, adapter, now_utc=FETCH_NOW)
+
+    metadata = store.load_cache_metadata(FETCH_NOW.date(), "rentcast")
+    assert metadata["envelope_audit"] == {
+        "comparable": 1, "outside_city": 0, "outside_filters": 0,
+    }

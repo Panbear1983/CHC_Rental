@@ -23,8 +23,11 @@ removed from `.env` at will.
 | Actor/API docs | https://apify.com/maxcopell/zillow-scraper and https://apify.com/maxcopell/zillow-scraper/api |
 | Bounds lookup | OpenStreetMap Nominatim search API; city/state to map rectangle only; no listing data or credentials |
 | Zillow terms checked | 2026-08-11; https://www.zillow.com/corporate/terms-of-use/ prohibits automated queries and encouraging third parties to perform them |
-| Local ceilings | Disabled by default; one actor run per watched city per day (budget 5/day); 25 results/run; USD 0.25 maximum charge/run; 100 requests/day global |
-| Subscription ceiling | The Apify plan's own monthly cap sits ABOVE all of these and is not enforced locally. Reaching it returns HTTP 403 `platform-feature-disabled` on every run and stops the product outright. Check it with `./dashboard.sh usage`. |
+| Billing | **Per RESULT**, not per run: `PAY_PER_EVENT` / `apify-default-dataset-item`, $0.0023/result on the FREE plan (confirmed against billed runs 2026-08-29). The request ledger counts runs and is NOT a spend control — see DECISIONS #15 |
+| Local ceilings | Disabled by default; one actor run per watched city per day (budget 5/day); result count set per run by the spend gate in `chc_rental.cost` up to `zillow_results_limit` (60), never past 85% of the Apify cycle cap; per-run charge ceiling derived from the authorised result count; 100 requests/day global |
+| Rent filter | The rent envelope goes in `filterState.mp` (monthly payment). `price` is Zillow's for-sale home-value band and is silently ignored on a `/rentals/` URL |
+| Geographic precision | The actor needs a RECTANGULAR map bound, so ~27% of a Brooklyn run is out-of-city (Lower Manhattan, Jersey City, western Queens) and is rejected locally after being paid for. Accepted cost; see DECISIONS #15 |
+| Subscription ceiling | The Apify plan's monthly cap sits above all of these. It IS now enforced locally: every scrape prices itself against Apify's reported cycle usage before starting and stops at 85% of the cap. Reaching the real cap returns HTTP 403 `platform-feature-disabled` on every run and stops the product outright. Check it with `./dashboard.sh usage`. |
 | Kill switch | `zillow_enabled: false`, missing token, zero results, or zero request budget |
 
 Implementation boundaries:

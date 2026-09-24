@@ -203,3 +203,76 @@ quarterly terms/source review cadence and own it.
   basis. Missing historical facts stay unknown and are visibly labeled legacy.
 - A Telegram ID change starts the new ID with an empty visible diary. The old
   ID's immutable journal remains on disk until normal retention expiry.
+
+## 15. The Zillow actor bills per RESULT — DECIDED 2026-08-29
+
+Supersedes the request-count ceilings in decisions #4 and #8 as the *spend*
+control. Those ceilings remain, but they were never a budget.
+
+**The finding.** `maxcopell/zillow-scraper` is `PAY_PER_EVENT` on
+`apify-default-dataset-item` — **$0.0023 per result** on the FREE plan
+(cheaper on paid tiers: BRONZE $0.002, SILVER $0.0017). Confirmed against
+billed runs: every 25-result run billed exactly $0.0575. So one "request" in
+`store.reserve_request` cost anywhere from $0.012 to $0.138 depending on how
+many rows came back. The request ledger counts runs; the bill counts rows.
+
+**The rent filter was never applied.** `rental_search_url` sent the rent
+envelope as `filterState.price`. On a `/rentals/` URL Zillow reads `price` as
+the for-sale **home value** band and ignores it; the rent filter key is `mp`
+(monthly payment). Measured over 2026-08-21..28, only **36%** of paid results
+were inside the requested envelope, and only 31% were both in-envelope and
+new. Probe on 2026-08-29, same city and moment, 10 results each:
+`price` → 4/7 in-band (leaking $3,970 / $4,500 / $4,695); `mp` → 7/7, floor
+exactly $5,000. `price` is not sent alongside `mp`: if Zillow ever honored it
+as home value the daily pool would silently go empty.
+
+**Measurements that set the ceilings** (2026-08-29, Brooklyn 3-5bd, $5k-$10k,
+2+ baths):
+
+| | |
+|---|---|
+| in-band share, before / after | 36% / 100% |
+| in-band listings in a 60-slot window | 54, of which 45 had never been seen |
+| daily in-band arrivals (`doz=1`) | ~26 |
+| out-of-city share of every run | ~27% (structural, see below) |
+
+**Decisions.**
+
+- Spend is metered in RESULTS, by `chc_rental.cost`, against Apify's own
+  reported cycle usage — not a local ledger. A local count cannot see anything
+  else spending the same token, and something else was: a second project ran
+  `zillow-detail-scraper` on this account daily until 2026-08-27, taking ~40%
+  of the cap. The usage read is free.
+- `zillow_budget_target_share: 0.85`. The remaining 15% is never spent.
+  Reaching the real cap returns HTTP 403 `platform-feature-disabled` on every
+  run and stops the whole product, as it did on 2026-08-20.
+- `zillow_results_limit: 60`, throttled down by the gate when the cycle is
+  tight and refused entirely below `zillow_min_results_floor: 10`.
+- An unreadable usage endpoint falls back to the configured limit rather than
+  blocking the scrape. The configured limit is itself bounded to fit a cycle.
+- `zillow_days_on_zillow` (`doz`) bounds the window by recency instead of by
+  our own slot count, so a large limit cannot re-buy listings the seen ledger
+  already holds. It must be an **integer** in the URL: `{"value": 1}` works,
+  `{"value": "1"}` makes the actor reject the whole URL. Set to `null` while
+  backfilling; `1` in steady state (~$0.064/day vs ~$0.138/day).
+- The daily adapter starts runs ASYNCHRONOUSLY and polls. Holding the run open
+  on `run-sync-get-dataset-items` meant a dropped connection bought a second
+  run while the first finished and billed anyway — 2026-08-23 and 2026-08-28
+  each show two billed 25-result runs for one day's listings.
+
+**Known, accepted cost: ~27% of every run is out-of-city.** The actor requires
+a rectangular map bound and cities are not rectangles. Nominatim's rectangle
+for Brooklyn also covers Lower Manhattan, part of Jersey City and western
+Queens; `matching.py` rejects those locally, but they were paid for. Measured
+2026-08-29: 13 of 49 results (7 Manhattan, 3 Jersey City NJ, 3 Queens). No
+rectangle can isolate Brooklyn, so this is not fixable by tightening bounds.
+The available fix is Zillow `regionSelection` region IDs, which would have to
+be hand-configured per city — resolving them automatically would mean querying
+Zillow directly, which SOURCES.md forbids. Not taken now; recorded so the cost
+is visible and the option is not rediscovered from scratch.
+
+`fetch.py` records `envelope_audit` per run and counts these two leaks
+SEPARATELY: `outside_filters` (a filter regression — warns above 20%) and
+`outside_city` (the structural cost above — recorded, never warned). Folded
+together, the known 27% would sit permanently above any threshold and drown
+the signal the warning exists to carry.
